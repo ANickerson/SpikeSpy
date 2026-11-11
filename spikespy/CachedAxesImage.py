@@ -2,7 +2,7 @@ import matplotlib.transforms as mtransforms
 from matplotlib.transforms import TransformedBbox, Bbox
 from matplotlib.image import AxesImage
 import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
+import scipy.ndimage
 
 
 class CachedAxesImage(AxesImage):
@@ -22,7 +22,17 @@ class CachedAxesImage(AxesImage):
         self._cached_transform = None
         self.rolling_max = rolling_max
 
+    def update_data_fast(self, new_data, extent=None):
+        """Update image data and extent in-place, invalidating the cache."""
+        self.set_data(new_data)
+        if extent is not None:
+            self._extent = extent
+        self.stale = True
+        self._cached_image = None
+
     def make_image(self, renderer, magnification=1.0, unsampled=False):
+        if self._A is None or self._A.size == 0 or self._A.shape[0] == 0 or self._A.shape[1] == 0:
+            return None, 0, 0, None
         current_extent = self.get_extent()
         current_figure_size = self.axes.figure.get_size_inches()
         current_xlim = self.axes.get_xlim()
@@ -90,31 +100,63 @@ class CachedAxesImage(AxesImage):
         # Cache the new larger cut of the data
         fig = self.get_figure()
         fac = renderer.dpi / fig.dpi
-        # hack for ax if there are too many points is too big do a rolling max interpolation on X axis
-        A = self._A.copy()
+        if self._A is None or self._A.size == 0 or self._A.shape[0] == 0 or self._A.shape[1] == 0:
+            return None, 0, 0, None
+
+        img_bbox = bbox
+        img_transformed_bbox = transformed_bbox
+
+        x_scale = (abs(bbox.width) / abs(transformed_bbox.width)) / 2 if transformed_bbox.width != 0 else 0
+        y_scale = (abs(bbox.height) / abs(transformed_bbox.height)) / 2 if transformed_bbox.height != 0 else 0
+
+        # Viewport slicing when array has many rows
+        if self._A.shape[0] > 200:
+            data_clip = Bbox.intersection(transformed_bbox, clip2)
+            if data_clip is not None:
+                data_clip = data_clip.transformed(trans.inverted())
+                pad_x = int(x_scale) + 2 if int(x_scale) > 1 else 0
+                pad_y = int(y_scale) + 2 if int(y_scale) > 1 else 0
+
+                x_min = max(0, int(np.floor(min(data_clip.x0, data_clip.x1))) - pad_x)
+                x_max = min(self._A.shape[1], int(np.ceil(max(data_clip.x0, data_clip.x1))) + pad_x)
+                y_min = max(0, int(np.floor(min(data_clip.y0, data_clip.y1))) - pad_y)
+                y_max = min(self._A.shape[0], int(np.ceil(max(data_clip.y0, data_clip.y1))) + pad_y)
+
+                if x_max > x_min and y_max > y_min:
+                    A = self._A[y_min:y_max, x_min:x_max]
+                    if y1 > y2:
+                        img_bbox = Bbox(np.array([[x_min, y_max], [x_max, y_min]]))
+                    else:
+                        img_bbox = Bbox(np.array([[x_min, y_min], [x_max, y_max]]))
+                    img_transformed_bbox = TransformedBbox(img_bbox, trans)
+                else:
+                    A = self._A
+            else:
+                A = self._A
+        else:
+            A = self._A
+
         if self.rolling_max:
-            x_scale = (bbox.width / transformed_bbox.width) / 2
-            if x_scale > 1:
+            # Safe conversion for NaNs / MaskedArrays
+            if np.ma.isMaskedArray(A):
+                A_arr = np.nan_to_num(A.filled(0.0), nan=0.0)
+            elif np.isnan(A).any():
+                A_arr = np.nan_to_num(A, nan=0.0)
+            else:
+                A_arr = np.array(A, copy=True)
 
-                # rolling window on X axis of x_scale points
+            if int(x_scale) > 1:
+                A_arr = scipy.ndimage.maximum_filter1d(A_arr, size=int(x_scale), axis=1, mode="nearest")
+            if int(y_scale) > 1:
+                A_arr = scipy.ndimage.maximum_filter1d(A_arr, size=int(y_scale), axis=0, mode="nearest")
+            A = A_arr
 
-                pad_width = int(x_scale) - 1
-                A = np.pad(A, ((0, 0), (0, pad_width)), mode="edge")
-                A = sliding_window_view(A, int(x_scale), axis=1)
-                A = np.nanmax(A, axis=2)
-
-            y_scale = (bbox.height / transformed_bbox.height) / 2
-            if y_scale > 1:
-                # rolling window on Y axis of y_scale points
-                pad_width = int(y_scale) - 1
-                A = np.pad(A, ((0, pad_width), (0, 0)), mode="edge")
-                A = sliding_window_view(A, int(y_scale), axis=0)
-                A = np.nanmax(A, axis=2)
+        A_to_pass = np.ma.asarray(A)
 
         self._cached_image = self._make_image(
-            A,
-            bbox,
-            transformed_bbox,
+            A_to_pass,
+            img_bbox,
+            img_transformed_bbox,
             clip2,
             magnification=magnification / fac,
             unsampled=unsampled,
@@ -128,8 +170,5 @@ class CachedAxesImage(AxesImage):
         self._cached_magnification = magnification
         self._cached_lims = (current_xlim, current_ylim)
         self._cached_clim = current_clim
-        print("update cached image")
-        # print(f"ORIGINAL: transformed_bbox:{transformed_bbox.extents}; cached_clip:{self._cached_clip.extents};  x0:{self._cached_clip.x0}; y0:{self._cached_clip.y0}")
-        # print(f"ORIGINAL: clip orignal : {self._cached_clip.transformed(trans.inverted()).extents};")
 
         return self._cached_image

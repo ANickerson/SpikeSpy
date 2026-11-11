@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 import neo
 import numpy as np
@@ -64,6 +65,76 @@ def track_basic(
             break
 
     return neo.Event(np.array(traced_times) * pq.s)
+
+
+def track_single_sweep(
+    raw_data,
+    stim_time: pq.Quantity,
+    prev_latency: pq.Quantity,
+    threshold: pq.Quantity,
+    window: pq.Quantity,
+) -> Optional[pq.Quantity]:
+    """
+    Given a single stimulus time stim_time and prev_latency (offset from stimulus),
+    slices raw_data.time_slice(stim_time + prev_latency - window/2, stim_time + prev_latency + window/2),
+    checks for threshold crossing (handling negative thresholds with flip = True just like track_basic),
+    and returns the absolute spike timestamp max_ts.rescale("s") if max_val >= abs(threshold),
+    or None if no spike crossed threshold.
+    """
+    if not hasattr(stim_time, "rescale"):
+        stim_time = stim_time * pq.s
+    if not hasattr(prev_latency, "rescale"):
+        prev_latency = prev_latency * pq.s
+    if not hasattr(window, "rescale"):
+        window = window * pq.s
+
+    flip = False
+    thresh = threshold
+    if thresh < 0:
+        flip = True
+        thresh = -thresh
+
+    start_time = stim_time + prev_latency - (window / 2)
+    end_time = stim_time + prev_latency + (window / 2)
+
+    try:
+        timeslice = raw_data.time_slice(start_time, end_time)
+    except Exception as e:
+        logger.warning(
+            f"Error slicing raw_data between {start_time} and {end_time}: {e}"
+        )
+        return None
+
+    if timeslice is None or len(timeslice) == 0:
+        return None
+
+    ts_data = timeslice
+    if flip:
+        ts_data = ts_data * -1
+
+    if hasattr(ts_data, "as_array"):
+        arr = ts_data.as_array()
+    else:
+        arr = np.asarray(ts_data)
+
+    max_idx = np.argmax(arr[:, 0] if arr.ndim > 1 else arr)
+    max_val = ts_data[max_idx]
+    if hasattr(max_val, "__len__") and len(max_val) == 1:
+        max_val = max_val[0]
+
+    if hasattr(thresh, "units") and not hasattr(max_val, "units"):
+        thresh_comp = thresh.magnitude
+    elif not hasattr(thresh, "units") and hasattr(max_val, "units"):
+        thresh_comp = thresh * max_val.units
+    else:
+        thresh_comp = thresh
+
+    if max_val >= thresh_comp:
+        max_ts = timeslice.times[max_idx]
+        return max_ts.rescale("s")
+
+    return None
+
 
 
 # TODO: use peak finding first then windowing. this will (hopefully) prevent runaways

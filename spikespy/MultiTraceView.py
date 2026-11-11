@@ -49,7 +49,7 @@ import time
 # mplstyle.use("fast")
 
 from matplotlib.axes import Axes
-from .helpers import qsignal_throttle_wrapper
+from .helpers import qsignal_throttle_wrapper, qsignal_throttle
 from matplotlib.image import AxesImage
 from .CachedAxesImage import CachedAxesImage
 
@@ -66,9 +66,14 @@ class falling_leaf_plotter:
         self.hline = None
 
     def setup(self, ax: Axes, erp, sampling_rate=1000, mode="heatmap"):
-        self.percentiles = (
-            np.arange(0, 100) * 2 * np.sqrt(np.mean(erp**2))
-        )  # np.percentile(erp, np.arange(100))
+        if erp is not None and hasattr(erp, "magnitude"):
+            erp = erp.magnitude
+        if erp is None or erp.size == 0 or erp.shape[0] == 0:
+            self.percentiles = np.zeros(100)
+        else:
+            self.percentiles = (
+                np.arange(0, 100) * 2 * float(np.sqrt(np.mean(erp**2)))
+            )  # np.percentile(erp, np.arange(100))
         self.mode = mode
 
         # self.cb2 = ax.callbacks.connect("ylim_changed", self.setup)
@@ -85,6 +90,11 @@ class falling_leaf_plotter:
     def plot_main(self, mode, ax: Axes, erp, partial=True, clim=None):
         self.mode = mode
 
+        if erp is not None and hasattr(erp, "magnitude"):
+            erp = erp.magnitude
+        if erp is None or erp.size == 0 or erp.shape[0] == 0:
+            return
+
         ylim = ax.get_ylim()
         ylim = [max(int(np.floor(ylim[0])), 0), int(np.ceil(ylim[1]))]
         xlim = ax.get_xlim()
@@ -95,7 +105,8 @@ class falling_leaf_plotter:
             im_data = erp
             xlim = [0, erp.shape[1]]
             ylim = [0, erp.shape[0]]
-        im_data = im_data
+        if hasattr(im_data, "magnitude"):
+            im_data = im_data.magnitude
         if mode == "heatmap":
             if self.ax_track_leaf is not None:
                 try:
@@ -120,7 +131,7 @@ class falling_leaf_plotter:
                 rolling_max=True,
             )
 
-            self.ax_track_cmap.set_data(np.clip(im_data, 0, np.max(im_data)))
+            self.ax_track_cmap.set_data(np.clip(im_data, 0, float(np.max(im_data)) if im_data.size else 1.0))
             self.ax_track_cmap.set_extent((xlim[0], xlim[1], ylim[1], ylim[0]))
             if clim is None:
                 clim = (self.percentiles[40], self.percentiles[95])
@@ -134,7 +145,7 @@ class falling_leaf_plotter:
             if self.ax_track_cmap is not None:
                 self.ax_track_cmap.set_visible(False)
 
-            p90 = np.std(self.im_data) * 10  # self.percentiles[95] * 4
+            p90 = (float(np.std(im_data)) if im_data.size else 1.0) * 10  # self.percentiles[95] * 4
             analog_signal_erp_norm = np.clip(
                 im_data,
                 -p90,
@@ -206,12 +217,28 @@ class falling_leaf_plotter:
             # ax.draw_artist(self.hline)
             return self.hline
 
-    def plot_spikegroup(self, ax, sg, **kwargs):
+    def plot_spikegroup(self, ax, sg, event_signal=None, sampling_rate=10000, **kwargs):
         kwargs = {"alpha": 0.5, **kwargs}
 
-        points = np.array(
-            [(x[0], i) for i, x in enumerate(sg.idx_arr) if x is not None]
-        )
+        if event_signal is not None and hasattr(sg, "get_latencies"):
+            lats = sg.get_latencies(event_signal)
+            valid = ~np.isnan(lats)
+            sweeps = np.where(valid)[0]
+            lat_vals = [(float(lats[i].rescale(pq.s).magnitude) if hasattr(lats[i], "rescale") else float(lats[i])) for i in sweeps]
+            sr = (
+                float(sampling_rate.rescale(pq.Hz).magnitude)
+                if hasattr(sampling_rate, "magnitude")
+                else float(sampling_rate)
+            )
+            samples = [int(round(lv * sr)) for lv in lat_vals]
+            points = np.column_stack([samples, sweeps]) if len(samples) > 0 else np.empty((0, 2))
+        elif getattr(sg, "idx_arr", None) is not None:
+            points = np.array(
+                [(x[0], i) for i, x in enumerate(sg.idx_arr) if x is not None]
+            )
+        else:
+            points = np.empty((0, 2))
+
         if len(points) == 0:
             return
         scat = ax.scatter(points[:, 0], points[:, 1], s=4, **kwargs)
@@ -239,6 +266,8 @@ class MultiTraceView(QMainWindow):
         self.hline = None
         self.figcache = None
         self.references = []
+        self.Patches = {}
+        self._last_settings_segment = None
         self.messages = None
         self.legend = None
 
@@ -297,7 +326,7 @@ class MultiTraceView(QMainWindow):
         self.upperSpinBox.valueChanged.connect(self.lowerSpinBox.setMaximum)
         self.upperSpinBox.valueChanged.connect(lambda x: self.update_timer.start())
 
-        self.referneces = []
+        self.references = []
         self.lock_to_stimCheckBox = QCheckBox("lock")
 
         def set_lock(*args):
@@ -565,7 +594,11 @@ class MultiTraceView(QMainWindow):
     def remove_references(self, *args, **kwargs):
         if self.state is not None:
             for ref in self.references:
-                self.state.disconnect(ref)
+                try:
+                    self.state.disconnect(ref)
+                except Exception:
+                    pass
+            self.references = []
 
     def set_state(self, state):
         self.state = state
@@ -603,46 +636,130 @@ class MultiTraceView(QMainWindow):
             self.state.onUnitChange.connect(lambda x: self.reset_right_axes_data())
         )
 
+        if hasattr(self.state, "onNewSweep"):
+            self.on_new_sweep_throttled = qsignal_throttle(lambda: self.on_new_sweep(self.state.stimno), 40)
+            self.references.append(self.state.onNewSweep.connect(self.on_new_sweep_throttled))
+        if hasattr(self.state, "onNewSpikeEvents"):
+            self.references.append(self.state.onNewSpikeEvents.connect(lambda *args: self.render()))
+
         self.update_axis()
         # self.state.onUnitChange.connect(lambda x:self.reset_right_axes_data())
         self.reset_right_axes_data()
+
+    def on_new_sweep(self, stimno: int):
+        if self.state is None:
+            return
+        erp = self.state.get_erp()
+        if erp is not None and hasattr(erp, "magnitude"):
+            erp = erp.magnitude
+        if erp is None or erp.shape[0] == 0:
+            return
+
+        live_buf = getattr(self.state, "_live_erp_buffer", None)
+        has_buf_match = live_buf is not None and len(live_buf) == erp.shape[0]
+
+        if not hasattr(self, "std") or self.std == 0 or self.std is None or erp.shape[0] <= 5:
+            self.std = float(np.std(erp)) or 1.0
+        else:
+            if has_buf_match:
+                last_std = float(live_buf.row_std[-1]) or 1.0
+            else:
+                last_std = float(np.std(erp[-1])) or 1.0
+            self.std = 0.95 * float(self.std) + 0.05 * last_std
+
+        if self.mode == "heatmap" and self.plotter.ax_track_cmap is not None:
+            if has_buf_match:
+                clipped_data = live_buf.clipped_data
+            else:
+                max_val = float(np.max(erp)) if erp.size else 1.0
+                clipped_data = np.clip(erp, 0, max_val)
+
+            extent = (0, erp.shape[1], erp.shape[0], 0)
+            if hasattr(self.plotter.ax_track_cmap, "update_data_fast"):
+                self.plotter.ax_track_cmap.update_data_fast(clipped_data, extent)
+            else:
+                self.plotter.ax_track_cmap.set_data(clipped_data)
+                self.plotter.ax_track_cmap.set_extent(extent)
+            clim = (
+                self.std * self.lowerSpinBox.value(),
+                max(
+                    self.std * self.lowerSpinBox.value() + 0.001,
+                    self.std * self.upperSpinBox.value(),
+                ),
+            )
+            self.plotter.ax_track_cmap.set_clim(*clim)
+        else:
+            self.setup_figure()
+
+        if self.lock_to_stim:
+            self.update_ylim(self.state.stimno)
+        else:
+            current_ylim = self.ax.get_ylim()
+            if abs(current_ylim[0] - (erp.shape[0] - 1)) <= 2 and erp.shape[0] != current_ylim[1]:
+                self.ax.set_ylim(erp.shape[0], current_ylim[1])
+
+        self.plotter.highlight_stim(self.ax, self.state.stimno, partial=False)
+        self.plot_spikegroups()
+        self.reset_right_axes_data()
+        self.view.draw_idle()
 
     # @qsignal_throttle_wrapper(1000)
     def reset_right_axes_data(self):
         if self.state is None:
             return
-        if self.state.event_signal is None:
+        if self.state.event_signal is None or len(self.state.event_signal) == 0:
             return
 
-        stimFreq_data = (
-            1 / np.diff(self.state.event_signal.times).rescale(pq.second),
-            np.arange(1, len(self.state.event_signal.times)),
-        )
+        if len(self.state.event_signal.times) > 1:
+            stimFreq_data = (
+                1 / np.diff(self.state.event_signal.times).rescale(pq.second),
+                np.arange(1, len(self.state.event_signal.times)),
+            )
+        else:
+            stimFreq_data = (np.array([]), np.array([]))
         ug = self.state.getUnitGroup()
+        if ug is not None:
+            latencies = ug.get_latencies(self.state.event_signal)
+            idx_na = np.isnan(latencies)
 
-        latencies = ug.get_latencies(self.state.event_signal)
-        idx_na = np.isnan(latencies)
-
-        current_spike_diffs = np.diff(latencies[~idx_na])
-        out = np.ones(latencies.shape) * np.nan * pq.ms
-        out[np.where(~idx_na)[0][1:]] = current_spike_diffs
-        # out[np.isnan(out)] = 0 * pq.ms
-        self.right_ax_data = {
-            "Stim. Freq. (Hz)": stimFreq_data,
-            "Latency Diff.": (out, np.arange(len(latencies))),
-        }
+            current_spike_diffs = np.diff(latencies[~idx_na])
+            out = np.ones(latencies.shape) * np.nan * pq.ms
+            out[np.where(~idx_na)[0][1:]] = current_spike_diffs
+            # out[np.isnan(out)] = 0 * pq.ms
+            self.right_ax_data = {
+                "Stim. Freq. (Hz)": stimFreq_data,
+                "Latency Diff.": (out, np.arange(len(latencies))),
+            }
+        else:
+            self.right_ax_data = {
+                "Stim. Freq. (Hz)": stimFreq_data,
+            }
         for x in self.state.segment.analogsignals:
             try:
-                if self.toggleMaxMeanButton.isChecked():
+                if (
+                    getattr(self.state, "is_streaming", False)
+                    and x.name in getattr(self.state, "_live_aux_erp_buffers", {})
+                ):
+                    buf = self.state._live_aux_erp_buffers[x.name]
+                    if self.toggleMaxMeanButton.isChecked():
+                        vals = buf.row_max
+                    else:
+                        vals = buf.row_mean
                     self.right_ax_data[x.name] = (
-                        np.max(self.state.get_erp(x, self.state.event_signal), axis=1),
-                        np.arange(0, len(self.state.event_signal.times)),
+                        vals,
+                        np.arange(0, len(vals)),
                     )
                 else:
-                    self.right_ax_data[x.name] = (
-                        np.mean(self.state.get_erp(x, self.state.event_signal), axis=1),
-                        np.arange(0, len(self.state.event_signal.times)),
-                    )
+                    if self.toggleMaxMeanButton.isChecked():
+                        self.right_ax_data[x.name] = (
+                            np.max(self.state.get_erp(x, self.state.event_signal), axis=1),
+                            np.arange(0, len(self.state.event_signal.times)),
+                        )
+                    else:
+                        self.right_ax_data[x.name] = (
+                            np.mean(self.state.get_erp(x, self.state.event_signal), axis=1),
+                            np.arange(0, len(self.state.event_signal.times)),
+                        )
 
             except:
                 pass
@@ -650,17 +767,23 @@ class MultiTraceView(QMainWindow):
         if not self.rightPlots:
             self.rightPlots = {k: True for k, v in self.right_ax_data.items()}
 
-        if self.settingsDialog is not None:
-            self.settingsDialog.destroy()
+        cur_seg = getattr(self.state, "segment", None)
+        if self.settingsDialog is None or self._last_settings_segment != cur_seg:
+            if self.settingsDialog is not None:
+                try:
+                    self.settingsDialog.destroy()
+                except Exception:
+                    pass
+            self.settingsDialog = DialogSignalSelect(options=self.rightPlots)
+            self._last_settings_segment = cur_seg
 
-        self.settingsDialog = DialogSignalSelect(options=self.rightPlots)
+            def updateView(k, v):
+                self.rightPlots[k] = v
+                self.plot_right_axis()
+                self.render()
 
-        def updateView(k, v):
-            self.rightPlots[k] = v
-            self.plot_right_axis()
-            self.render()
+            self.settingsDialog.changeSelection.connect(updateView)
 
-        self.settingsDialog.changeSelection.connect(updateView)
         self.plot_right_axis()
         self.view.draw_idle()
 
@@ -668,13 +791,17 @@ class MultiTraceView(QMainWindow):
         mode = self.mode
         if self.state is None:
             return
-        if self.state.analog_signal is None:
+        if self.state.analog_signal is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
             return
 
         # self.ax_right_fig.clear()
         erp = self.state.get_erp()
+        if erp is not None and hasattr(erp, "magnitude"):
+            erp = erp.magnitude
+        if erp is None or erp.shape[0] == 0:
+            return
         # erp = np.clip(erp, 0, np.max(erp))
-        self.std = np.std(erp)
+        self.std = float(np.std(erp)) or 1.0
         # self.percentiles = self.percentiles = np.linspace(0,10,101)*np.std((erp - np.mean(erp)))#np.percentile(erp, np.arange(100))#np.percentile(erp[erp>0], np.arange(101))
         ylim = self.ax.get_ylim()
         xlim = self.ax.get_xlim()
@@ -771,7 +898,10 @@ class MultiTraceView(QMainWindow):
     def update_axis(self):  # TODO: plot these data using x as the time in millis.
         if self.state is None:
             return
-        if self.state.analog_signal is None:
+        if self.state.analog_signal is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
+            return
+        erp = self.state.analog_signal_erp
+        if erp is None or len(erp) == 0 or erp.shape[0] == 0:
             return
         self.ax.set_ylim(len(self.state.event_signal), 0)
         self.ax.set_xlim(0, len(self.state.analog_signal_erp[0]))
@@ -792,11 +922,14 @@ class MultiTraceView(QMainWindow):
                 ]
                 if len(major_locs) >= 2:
                     return ""
-                return self.func(
-                    x, pos
-                )  # "{0:g}".format(1000 * x / self.state.sampling_rate)
+        sr = self.state.sampling_rate
+        if sr is None and self.state.analog_signal is not None:
+            sr = getattr(self.state.analog_signal, "sampling_rate", None)
+        if sr is None:
+            sr = 1000
+        sr = float(sr.magnitude) if hasattr(sr, "magnitude") else float(sr)
 
-        func = lambda x, pos: "{0:g}".format(1000 * x / self.state.sampling_rate)
+        func = lambda x, pos: "{0:g}".format(1000 * x / sr)
         func_formatter = matplotlib.ticker.FuncFormatter(func)
 
         self.ax.xaxis.set_major_formatter(func_formatter)
@@ -804,9 +937,9 @@ class MultiTraceView(QMainWindow):
         # loc = matplotlib.ticker.MaxNLocator(
         #     steps=[1, 5, 10],
         # )  # this locator puts ticks at regular intervals
-        loc = matplotlib.ticker.MultipleLocator(self.state.sampling_rate / 10)
+        loc = matplotlib.ticker.MultipleLocator(sr / 10)
         self.ax.xaxis.set_major_locator(loc)
-        loc = matplotlib.ticker.MultipleLocator(self.state.sampling_rate / 100)
+        loc = matplotlib.ticker.MultipleLocator(sr / 100)
         self.ax.xaxis.set_minor_locator(loc)
 
         self.ax.xaxis.set_major_formatter(func_formatter)
@@ -831,95 +964,96 @@ class MultiTraceView(QMainWindow):
     points_spikegroups = None
 
     def plot_spikegroups(self, sgidx=None):
-        if self.points_spikegroups is None:
-            pass  # TODO optimisation of setting x_data rather than replotting
-        else:
-            # try:
-            for x in self.points_spikegroups:
-                if x is not None:
-                    x.remove()
+        if not hasattr(self, "Patches") or self.Patches is None:
+            self.Patches = {}
 
-            # optional legend
-            if self.legend is not None:
-                for txt in self.legend:
-                    txt.remove()
-                self.legend = None
-            # except:
-            #    pass
-        points_spikegroups = []
+        if self.legend is not None:
+            for txt in self.legend:
+                txt.remove()
+            self.legend = None
 
-        def plot(sgidx, **kwargs):
-            sg = self.state.getUnitGroup(sgidx)
+        if self.state is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
+            for line in self.Patches.values():
+                line.set_visible(False)
+            return list(self.Patches.values())
 
-            points = np.array(
-                [(x[0], i) for i, x in enumerate(sg.idx_arr) if x is not None]
+        sr = 10000.0
+        if hasattr(self.state, "sampling_rate") and self.state.sampling_rate is not None:
+            sr = (
+                float(self.state.sampling_rate.rescale(pq.Hz).magnitude)
+                if hasattr(self.state.sampling_rate, "magnitude")
+                else float(self.state.sampling_rate)
             )
-            if len(points) == 0:
-                # self.view.draw_idle()
-                return
-            # scat = self.ax.scatter(points[:, 0], points[:, 1], s=10, **kwargs)
-            points_spikegroups = []
-            for point in points:
-                rect = matplotlib.patches.Rectangle(
-                    (point[0] - 5, point[1]), 10, 1, **kwargs
-                )
+        elif self.state.analog_signal is not None and hasattr(self.state.analog_signal, "sampling_rate"):
+            sr = (
+                float(self.state.analog_signal.sampling_rate.rescale(pq.Hz).magnitude)
+                if hasattr(self.state.analog_signal.sampling_rate, "magnitude")
+                else float(self.state.analog_signal.sampling_rate)
+            )
 
-                points_spikegroups.append(rect)
-
-            # scat.set_animated(True)
-            # self.ax.draw_artist(scat)
-            points_spikegroups = PatchCollection(points_spikegroups, **kwargs)
-            self.ax.add_collection(points_spikegroups)
-            return points_spikegroups
-
-        # include other units
-        from matplotlib.cm import get_cmap
-        from matplotlib.patches import Polygon
-        import numpy as np
-
-        points_spikegroups = []
-        colors = get_cmap("Set2").colors
+        active_unit_indices = set()
         if self.includeAllUnitsCheckBox.isChecked():
-            legend = []
-            for i, x in enumerate(self.state.spike_groups):
-                if x.event.name == None:
-                    ss = str(i)
-                else:
-                    ss = x.event.name
-                points = np.array(
-                    [(a[0], i) for i, a in enumerate(x.idx_arr) if a is not None]
+            active_unit_indices.update(range(len(self.state.spike_groups)))
+        if self.includeUnitCheckbox.isChecked() and self.state.cur_spike_group is not None:
+            active_unit_indices.add(self.state.cur_spike_group)
+
+        # Hide any unused unit artists
+        for u_idx, line in list(self.Patches.items()):
+            if u_idx not in active_unit_indices or u_idx >= len(self.state.spike_groups):
+                line.set_visible(False)
+
+        import matplotlib
+        colors = matplotlib.colormaps["Set2"].colors
+        legend = []
+
+        for i in active_unit_indices:
+            if i >= len(self.state.spike_groups):
+                continue
+            x_unit = self.state.spike_groups[i]
+            lats = x_unit.get_latencies(self.state.event_signal)
+            valid = ~np.isnan(lats)
+            sweeps = np.where(valid)[0]
+            lat_vals = [(float(lats[s].rescale(pq.s).magnitude) if hasattr(lats[s], "rescale") else float(lats[s])) for s in sweeps]
+            samples = np.array([int(round(lv * sr)) for lv in lat_vals], dtype=float)
+
+            is_cur = (i == self.state.cur_spike_group)
+            c = "red" if is_cur else colors[i % len(colors)]
+            alpha = (0.6 if self.mode == "heatmap" else 1.0) if is_cur else 0.8
+            zorder = 12 if is_cur else 11
+
+            if i not in self.Patches or self.Patches[i] not in self.ax.lines:
+                line = Line2D(
+                    samples,
+                    sweeps,
+                    marker="s",
+                    linestyle="None",
+                    markersize=4,
+                    markerfacecolor="none",
+                    markeredgecolor=c,
+                    markeredgewidth=1.2,
+                    alpha=alpha,
+                    zorder=zorder,
                 )
+                self.ax.add_line(line)
+                self.Patches[i] = line
+            else:
+                line = self.Patches[i]
+                line.set_data(samples, sweeps)
+                line.set_markeredgecolor(c)
+                line.set_alpha(alpha)
+                line.set_zorder(zorder)
+                line.set_visible(True)
 
-                if i == self.state.cur_spike_group:
-                    if self.showLegend.isChecked():
-                        tt = self.ax.text(points[0][0], points[0][1], ss)
-                        tt.set_color("red")
-                        tt.set_backgroundcolor("white")
-                        tt.set_fontweight("bold")
-                        legend.append(tt)
-                    continue
+            if len(samples) > 0 and self.showLegend.isChecked():
+                ss = x_unit.event.name or f"unit_{i}"
+                tt = self.ax.text(samples[0], sweeps[0], ss)
+                tt.set_color(c)
+                tt.set_backgroundcolor("white")
+                tt.set_fontweight("bold")
+                legend.append(tt)
 
-                if self.showLegend.isChecked():
-                    tt = self.ax.text(points[0][0], points[0][1], ss)
-                    tt.set_color(colors[i % len(colors)])
-                    tt.set_backgroundcolor("white")
-                    tt.set_fontweight("bold")
-                    legend.append(tt)
-
-                artists = plot(i, color=colors[i % len(colors)])
-                points_spikegroups.append(artists)
-            self.legend = legend
-
-        # bg = self.
-        if self.includeUnitCheckbox.isChecked():
-            artists = plot(
-                self.state.cur_spike_group,
-                color="red",
-                alpha=0.6 if self.mode == "heatmap" else 1,
-            )
-            points_spikegroups.append(artists)
-        self.points_spikegroups = points_spikegroups
-
+        self.legend = legend
+        self.points_spikegroups = list(self.Patches.values())
         return self.points_spikegroups
 
     # @qsignal_throttle_wrapper(interval=33)
@@ -1018,8 +1152,14 @@ class MultiTraceView(QMainWindow):
 
     def __del__(self):
         self.remove_references()
-        self.close_conn.disconnect()
-        super().__del__()
+        try:
+            self.destroyed.disconnect(self.close_conn)
+        except Exception:
+            pass
+        try:
+            super().__del__()
+        except Exception:
+            pass
 
 
 import matplotlib.patches

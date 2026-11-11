@@ -129,15 +129,25 @@ class EventView(QtWidgets.QWidget):
             self.onStimNoChange
         )
         self.state.onLoadNewFile.connect(self.updateModel)
+        if hasattr(self.state, "onEventsUpdated"):
+            self.state.onEventsUpdated.connect(self.updateModel)
         # self.state.onUnitChange.connect(lambda x: self.model.resetInternalData())
 
     def updateModel(self):
+        if self.state is None or self.state.segment is None:
+            return
         evts = self.state.segment.events  # + [x.event for x in self.state.spike_groups]
 
         if evts is not None:
             self.load_events(evts)
 
     def onStimNoChange(self):
+        if self.state is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
+            return
+        if self.model is None or self.model.event is None or len(self.model.event) == 0:
+            return
+        if self.state.stimno >= len(self.state.event_signal):
+            return
         t = self.state.event_signal[self.state.stimno]
         diffs = t - self.model.event
         diffs[diffs < 0] = np.inf * pq.s

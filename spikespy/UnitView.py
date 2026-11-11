@@ -55,6 +55,15 @@ class UnitView(QMatplotlib):
         self.mean_line = None
         super().__init__(state=state, parent=parent, include_matplotlib_toolbar=True)
 
+        self.chk_show_neighbors = QCheckBox("Show Neighbor Channels", self)
+        self.chk_show_neighbors.setChecked(False)
+        self.chk_show_neighbors.setToolTip("Plot the unit's mean action potential waveform across nearby channels")
+        self.chk_show_neighbors.toggled.connect(self.updateAll)
+
+        if hasattr(self, "matplotlib_toolbar") and self.matplotlib_toolbar is not None:
+            self.matplotlib_toolbar.addSeparator()
+            self.matplotlib_toolbar.addWidget(self.chk_show_neighbors)
+
         def draw_evt(evt):
             self.blit()
             self.update_curstim_line(self.state.stimno)
@@ -63,6 +72,8 @@ class UnitView(QMatplotlib):
         self.canvas.mpl_connect("draw_event", draw_evt)
 
     def blit(self):
+        if self.axes is None or "main" not in self.axes:
+            return
         self.blit_data = self.canvas.copy_from_bbox(self.axes["main"].bbox)
 
     def setState(self, state):
@@ -71,6 +82,10 @@ class UnitView(QMatplotlib):
         self.state.onUnitChange.connect(self.updateAll)
         self.state.onUnitGroupChange.connect(self.updateAll)
         self.state.onLoadNewFile.connect(self.updateAll)
+        if hasattr(self.state, "onNewSpikeEvents"):
+            self.state.onNewSpikeEvents.connect(lambda *args: self.updateAll())
+        if hasattr(self.state, "onChannelChange"):
+            self.state.onChannelChange.connect(self.updateAll)
 
     @Slot()
     def updateAll(self):
@@ -78,10 +93,13 @@ class UnitView(QMatplotlib):
         self.setup_figure()
 
     def setup_figure(self):
-        if self.state.analog_signal is None:
+        self.axes = {"main": self.figure.add_subplot(111)}
+        if self.state is None or self.state.analog_signal is None:
+            return
+        sig_erp = self.state.analog_signal_erp
+        if sig_erp is None or len(sig_erp) == 0:
             return
         self.w = int(self.state.sampling_rate * 0.002)
-        self.axes = {"main": self.figure.add_subplot(111)}
         ax = self.axes["main"]
         xarr = np.arange(-self.w, +self.w)
         self.selected_line = ax.plot(
@@ -91,21 +109,73 @@ class UnitView(QMatplotlib):
         ax.axvline(0, ls="--", color="black")
 
         sg = self.state.getUnitGroup()
-        sig_erp = self.state.analog_signal_erp
-        idx_arr = sg.idx_arr
+        if sg is None:
+            return
+
+        sr = 10000.0
+        if hasattr(self.state, "sampling_rate") and self.state.sampling_rate is not None:
+            sr = (
+                float(self.state.sampling_rate.rescale(pq.Hz).magnitude)
+                if hasattr(self.state.sampling_rate, "magnitude")
+                else float(self.state.sampling_rate)
+            )
+        elif (
+            hasattr(self.state, "analog_signal")
+            and self.state.analog_signal is not None
+            and hasattr(self.state.analog_signal, "sampling_rate")
+        ):
+            sr = (
+                float(self.state.analog_signal.sampling_rate.rescale(pq.Hz).magnitude)
+                if hasattr(self.state.analog_signal.sampling_rate, "magnitude")
+                else float(self.state.analog_signal.sampling_rate)
+            )
+
+        if self.state.event_signal is not None and hasattr(sg, "get_latencies"):
+            lats = sg.get_latencies(self.state.event_signal)
+            sample_arr = []
+            for lat in lats:
+                if np.isnan(lat):
+                    sample_arr.append(None)
+                else:
+                    sec = float(lat.rescale(pq.s).magnitude) if hasattr(lat, "rescale") else float(lat)
+                    sample_arr.append((int(round(sec * sr)), 1))
+        elif getattr(sg, "idx_arr", None) is not None:
+            sample_arr = sg.idx_arr
+        else:
+            sample_arr = []
+
+        idx_arr = sample_arr
         self.lines = {}
         ylims = [-0.1, 0.1]
         mean_arr = np.zeros((len(xarr)))
+        aligned_centers = {}
+        should_align = getattr(self, "chk_show_neighbors", None) and self.chk_show_neighbors.isChecked()
+        search_r = max(int(0.00075 * sr), 3)
+
         for i, idx, d in zip(range(len(sig_erp)), idx_arr, sig_erp):
             if idx is None:
                 continue
+            c_idx = idx[0]
+            if should_align:
+                search_start = max(0, c_idx - search_r)
+                search_end = min(len(d), c_idx + search_r + 1)
+                if search_end > search_start:
+                    c_aligned = search_start + int(
+                        np.argmax(np.abs(d[search_start:search_end]))
+                    )
+                else:
+                    c_aligned = c_idx
+            else:
+                c_aligned = c_idx
+            aligned_centers[i] = c_aligned
+
             w = [-self.w, self.w]
-            xmin = idx[0] - self.w
+            xmin = c_aligned - self.w
             if xmin < 0:
                 w[0] = abs(xmin) + 1
                 xmin = 0
 
-            xmax = idx[0] + self.w
+            xmax = c_aligned + self.w
             if xmax > len(d):
                 w[1] = abs(xmax - len(d))
                 xmax = len(d)
@@ -122,30 +192,114 @@ class UnitView(QMatplotlib):
         from matplotlib.collections import LineCollection
 
         lc = LineCollection(self.lines.values(), alpha=0.3, color="gray")
+        denom = len(self.lines) if len(self.lines) > 0 else 1
         self.mean_line = ax.plot(
             np.arange(-self.w, self.w),
-            mean_arr / len(self.lines),
+            mean_arr / denom,
             ls="--",
             color="black",
             zorder=10,
+            label=getattr(self.state.analog_signal, "name", "Primary"),
         )[0]
         ax.add_artist(lc)
+
+        # Plot neighbor channels footprint if enabled
+        if getattr(self, "chk_show_neighbors", None) and self.chk_show_neighbors.isChecked() and sg is not None:
+            neighbors = getattr(sg, "neighbor_channels", []) or []
+            if not neighbors and hasattr(self.state, "get_available_channels"):
+                avail = [c for c in self.state.get_available_channels() if c != getattr(self.state.analog_signal, "name", "")]
+                neighbors = avail[:3]
+
+            colors = ["#e41a1c", "#377eb8", "#4daf4a", "#ff7f00", "#984ea3"]
+            has_neighbor_plotted = False
+            primary_name = getattr(self.state.analog_signal, "name", "")
+
+            for n_idx, ch_name in enumerate(neighbors):
+                if ch_name == primary_name:
+                    continue
+                ch_erp = (
+                    self.state.get_channel_erp(ch_name)
+                    if hasattr(self.state, "get_channel_erp")
+                    else None
+                )
+                if ch_erp is not None and len(ch_erp) > 0:
+                    n_mean_arr = np.zeros(len(xarr))
+                    n_count = 0
+                    for s_i, idx in enumerate(idx_arr):
+                        if idx is None or s_i >= len(ch_erp):
+                            continue
+                        d_ch = ch_erp[s_i]
+                        if hasattr(d_ch, "magnitude"):
+                            d_ch = d_ch.magnitude
+                        c_aligned = aligned_centers.get(s_i, idx[0])
+                        w = [-self.w, self.w]
+                        xmin = c_aligned - self.w
+                        if xmin < 0:
+                            w[0] = abs(xmin) + 1
+                            xmin = 0
+                        xmax = c_aligned + self.w
+                        if xmax > len(d_ch):
+                            w[1] = abs(xmax - len(d_ch))
+                            xmax = len(d_ch)
+                        ydata_ch = d_ch[xmin:xmax]
+                        try:
+                            n_mean_arr[w[0] + self.w : w[1] + self.w] += ydata_ch
+                            n_count += 1
+                            ylims[0] = min(ylims[0], np.min(ydata_ch))
+                            ylims[1] = max(ylims[1], np.max(ydata_ch))
+                        except Exception:
+                            pass
+
+                    if n_count > 0:
+                        c_color = colors[n_idx % len(colors)]
+                        n_mean = n_mean_arr / n_count
+                        peak_offset = int(np.argmax(np.abs(n_mean))) - self.w
+                        lag_ms = float((peak_offset / sr) * 1000.0)
+                        lbl = f"{ch_name} (Δt={lag_ms:+.2f}ms)"
+                        ax.plot(
+                            xarr,
+                            n_mean,
+                            ls="--",
+                            color=c_color,
+                            label=lbl,
+                            zorder=9,
+                        )
+                        has_neighbor_plotted = True
+
+            if has_neighbor_plotted:
+                ax.legend(loc="upper right", fontsize="small")
+
         ax.set_ylim(ylims)
 
         self.canvas.draw_idle()
 
     @Slot()
     def update_curstim_line(self, stimno):
-        idx = self.state.getUnitGroup().idx_arr[stimno]
-        self.canvas.restore_region(self.blit_data)
-        if stimno in self.lines:
+        if self.state is None or self.axes is None or "main" not in self.axes:
+            return
+        ug = self.state.getUnitGroup()
+        if ug is None:
+            return
+
+        has_spike = False
+        if self.state.event_signal is not None and stimno < len(self.state.event_signal) and hasattr(ug, "get_latencies"):
+            cur_ev = self.state.event_signal[stimno]
+            lat = ug.get_latencies(np.array([cur_ev.magnitude]) * cur_ev.units)[0]
+            has_spike = not np.isnan(lat)
+        elif getattr(ug, "idx_arr", None) is not None and stimno < len(ug.idx_arr):
+            has_spike = (ug.idx_arr[stimno] is not None)
+
+        if self.blit_data is not None:
+            self.canvas.restore_region(self.blit_data)
+        if self.lines and stimno in self.lines:
             grayline = self.lines[stimno]
             if stimno == self.state.stimno:
                 self.selected_line.set_visible(True)
                 self.selected_line.set_ydata(grayline[:, 1])
         else:
-            self.selected_line.set_visible(False)
-        if idx is not None:
+            if self.selected_line is not None:
+                self.selected_line.set_visible(False)
+        if has_spike and self.selected_line is not None:
             self.selected_line.set_visible(True)
             self.axes["main"].draw_artist(self.selected_line)
         self.canvas.update()

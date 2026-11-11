@@ -26,14 +26,26 @@ class MultiTraceFixedView(QMatplotlib):
         self.unsetCons()
         con = self.state.onStimNoChange.connect(lambda x: self.update_figure())
         self.connections.append(con)
+        if hasattr(self.state, "onNewSweep"):
+            con2 = self.state.onNewSweep.connect(lambda *args: self.update_figure())
+            self.connections.append(con2)
+        if hasattr(self.state, "onNewSpikeEvents"):
+            con3 = self.state.onNewSpikeEvents.connect(lambda *args: self.update_figure())
+            self.connections.append(con3)
         self.set_scale_setting()
 
         self.plot_update_signal.emit(True)
 
     def set_scale_setting(self):
+        if self.state is None:
+            return
+        if self.state.event_signal is None or len(self.state.event_signal) == 0:
+            return
         if self.get_settings().get("scale") is None:
             erp = self.state.get_erp()
-            ylim = np.std(np.abs(erp)) * 8
+            if erp is None or len(erp) == 0 or erp.shape[0] == 0:
+                return
+            ylim = (np.std(np.abs(erp)) or 1.0) * 8
             self.settings["scale"] = np.round(1 / ylim, decimals=4)
 
     def onLoadNewFile(self):
@@ -148,11 +160,15 @@ class MultiTraceFixedView(QMatplotlib):
     def draw_figure(self):
         if self.state is None:
             return False
+        if self.state.event_signal is None or len(self.state.event_signal) == 0:
+            return False
+        erp = self.state.get_erp()
+        if erp is None or len(erp) == 0 or erp.shape[0] == 0:
+            return False
         n_lines_pre = self.get_settings().get("n_lines_pre", 10)
         n_lines_post = self.get_settings().get("n_lines_post", 10)
         scale = self.get_settings().get("scale", 1)
         stimno = self.state.stimno
-        erp = self.state.get_erp()
         start = max(stimno - n_lines_pre, 0)
         stop = min(start + n_lines_pre + n_lines_post + 1, len(erp))
         dpts = erp[start:stop]

@@ -35,7 +35,7 @@ class TrackingView(QMainWindow):
         state: ViewerState = None,
     ) -> None:
         super().__init__(parent)
-        layout = QFormLayout(self)
+        layout = QFormLayout()
         self.state = state
         w = QWidget()
         w.setLayout(layout)
@@ -89,12 +89,85 @@ class TrackingView(QMainWindow):
         self.qsb_track_limit = qsb_track_limit
         layout.addRow(self.tr("Limit tracking"), qsb_track_limit)
 
+        self.qcb_auto_track = PySide6.QtWidgets.QCheckBox(self.tr("Live Auto-Track"), self)
+        layout.addRow(self.qcb_auto_track)
+
         # qbut_threshold_update.setFixedHeight(20)
         # layout.addRow(qbut_threshold_update)
         qbut_go = QPushButton("Track")
         layout.addRow(qbut_go)
 
         qbut_go.clicked.connect(self.trackUnit)
+
+        if self.state is not None and hasattr(self.state, "onNewSweep"):
+            self.state.onNewSweep.connect(self.on_new_sweep)
+
+    def on_new_sweep(self, stimno: int):
+        if not self.qcb_auto_track.isChecked() or self.state is None:
+            return
+        sg = self.state.getUnitGroup()
+        if sg is None or len(sg.event) == 0:
+            return
+
+        if self.state.event_signal is None or stimno >= len(self.state.event_signal):
+            return
+
+        # Find the most recent tracked spike in sg within self.qsb_max_skip.value() + 1 sweeps prior to stimno
+        max_skips = self.qsb_max_skip.value() + 1
+        prev_latency = None
+        min_prev = max(stimno - 1 - max_skips, 0)
+        if self.state.event_signal is not None and min_prev < stimno and hasattr(sg, "get_latencies"):
+            search_events = self.state.event_signal[min_prev:stimno]
+            lats = sg.get_latencies(search_events)
+            for k in range(len(lats) - 1, -1, -1):
+                if not np.isnan(lats[k]):
+                    prev_latency = lats[k].rescale(pq.s)
+                    break
+        elif getattr(sg, "idx_arr", None) is not None:
+            for prev_stim in range(stimno - 1, max(stimno - 1 - max_skips, -1), -1):
+                if prev_stim < len(sg.idx_arr) and sg.idx_arr[prev_stim] is not None:
+                    prev_sample = sg.idx_arr[prev_stim][0]
+                    prev_latency = (prev_sample / self.state.sampling_rate) * pq.s
+                    break
+
+        if prev_latency is None:
+            return
+
+        window = self.qsb_window_size.value() * pq.ms
+        threshold = self.qsb_threshold.value() * pq.mV
+        stim_time = self.state.event_signal[stimno]
+        raw_data = self.state.analog_signal
+
+        max_ts = None
+        # Check if basic_tracking has track_single_sweep
+        from . import basic_tracking
+        if hasattr(basic_tracking, "track_single_sweep"):
+            max_ts = basic_tracking.track_single_sweep(raw_data, stim_time, prev_latency, threshold, window)
+        else:
+            flip = False
+            thresh_val = threshold
+            if threshold < 0:
+                flip = True
+                thresh_val = -threshold
+
+            timeslice = raw_data.time_slice(
+                stim_time + prev_latency - (window / 2),
+                stim_time + prev_latency + (window / 2),
+            )
+            if len(timeslice) > 0:
+                ts_data = timeslice * -1 if flip else timeslice
+                max_idx = np.argmax(ts_data)
+                max_val = ts_data[max_idx]
+                if max_val >= thresh_val and thresh_val >= 0:
+                    max_ts = timeslice.times[max_idx]
+
+        if max_ts is not None:
+            latency_samples = int(
+                np.round(
+                    ((max_ts - stim_time).rescale("s") * self.state.analog_signal.sampling_rate.rescale("Hz")).magnitude
+                )
+            )
+            self.state.setUnit(latency_samples, stimno=stimno)
 
     def updateThresholdFromUnit(self):
         if self.state is None:

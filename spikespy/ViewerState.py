@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 from tempfile import tempdir
 from turtle import update
-from typing import Any, List, Optional, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import neo
 import numpy as np
@@ -38,155 +38,265 @@ from .APTrack_experiment_import import (
     TypeID,
 )
 from .NeoOpenEphyisIO import open_ephys_to_neo
-from .processing import create_erp_signals
+from .io_manager import (
+    APTrackDialog,
+    expand_multichannel_segment,
+    export_units_csv,
+    export_units_npz,
+    import_units_csv,
+    load_file,
+    open_matlab_to_neo,
+    prompt_for_neo_file,
+    save_state_to_nix,
+)
 
 
-class lru_numpy_memmap:
-    def __init__(self):
-        self.cache_dir = tempfile.gettempdir()
-        self.cache_dict = {}
-        self.data_cache = {}
 
-    def clear_cache(self):
-        for k, v in self.cache_dict.items():
-            assert Path(v).parent == Path(self.cache_dir)
-            for attempt in range(3):
-                try:
-                    Path(v).unlink()
-                    break
-                # you may want to explicitly check for PermissionError
-                except Exception as e:
-                    time.sleep(1)
+from .processing import (
+    BoundedERPCache,
+    LiveERPBuffer,
+    MultiAnalogSignal,
+    MultiChannelTemplateMatcher,
+    create_erp_signals,
+)
 
-        self.cache_dict = {}
-        self.data_cache = {}
-
-    def __call__(
-        self,
-        func,
-        keyfunc=None,
-    ):
-        if keyfunc is None:
-            keyfunc = lambda *args, **kwargs: ";".join(
-                [str(hash(a)) for a in args] + [f"{k}={hash(v)}" for k, v in kwargs]
-            )
-
-        def _(*args, **kwargs):
-            key = keyfunc(*args, **kwargs)
-            if key in self.cache_dict:
-                if key in self.data_cache:
-                    return self.data_cache[key]
-                try:
-                    data = np.load(self.cache_dict[key], mmap_mode="r+")
-                    self.data_cache[key] = np.load(self.cache_dict[key], mmap_mode="r+")
-                    return data
-                except:
-
-                    logging.warn("cache appears to be removed")
-
-            res = func(*args, **kwargs)
-            tmpfile_loc = tempfile.mkstemp(dir=self.cache_dir)[1] + ".npy"
-            self.cache_dict[key] = tmpfile_loc
-
-            np.save(tmpfile_loc, res)
-            del res
-            return np.load(self.cache_dict[key], mmap_mode="r+")
-
-        _.cache_clear = self.clear_cache
-        return _
+lru_numpy_memmap = BoundedERPCache
 
 
 @dataclass
 class tracked_neuron_unit:
+    """A UI class for tracked neurons.
+    Stores the current state of neurons tracked and provides high-performance vectorized queries.
     """
-    a UI class for tracked neurons.
-    This is to store the current state of neurons tracked
 
-    #TODO: this abstraction is quite annoying. idx_arr in particular makes this hard to use
-    """
+    channel: str = ""
+    neighbor_channels: List[str] = field(default_factory=list)
+    fibre_type: str = ""
+    notes: str = ""
+    _idx_arr: List[Any] = None
+    event: Event = None
+
+    def __init__(
+        self,
+        event: Event = None,
+        channel: str = "",
+        neighbor_channels: List[str] = None,
+        fibre_type: str = "",
+        notes: str = "",
+        idx_arr: List[Any] = None,
+    ):
+        self.event = event if event is not None else Event()
+        self.channel = channel
+        self.neighbor_channels = list(neighbor_channels) if neighbor_channels is not None else []
+        self.fibre_type = fibre_type
+        self.notes = notes
+        self._idx_arr = idx_arr
 
     @property
     def idx_arr(self):
-        logging.warning(
-            "Accessing idx_arr is deprecated and will be removed in future versions. use get_latencies instead"
-        )
         return self._idx_arr
 
     @idx_arr.setter
     def idx_arr(self, value):
-        logging.warning(
-            "Setting idx_arr is deprecated and will be removed in future versions."
-        )
         self._idx_arr = value
 
-    fibre_type: str = ""
-    notes: str = ""
-    idx_arr: List[int] = None
-    event: Event = None
+    def get_number_of_events(self, event_signal=None, window_size=None):
+        if self.event is not None and len(self.event) > 0:
+            if event_signal is not None and len(event_signal) > 0 and window_size is not None:
+                ev_s = self.event.rescale(pq.s).magnitude
+                stim_s = event_signal.rescale(pq.s).magnitude
+                max_lat_s = float(
+                    window_size.rescale(pq.s).magnitude
+                    if hasattr(window_size, "rescale")
+                    else float(window_size)
+                )
+                idx_sweeps = np.searchsorted(stim_s, ev_s, side="right") - 1
+                valid_sw = (idx_sweeps >= 0) & (idx_sweeps < len(stim_s))
+                dt = ev_s[valid_sw] - stim_s[idx_sweeps[valid_sw]]
+                in_win = (dt >= 0) & (dt <= max_lat_s)
+                return int(len(np.unique(idx_sweeps[valid_sw][in_win])))
+            return len(self.event)
+        if self._idx_arr is not None:
+            return len([x for x in self._idx_arr if x is not None])
+        return 0
 
-    def get_number_of_events(self):
-        return len([x for x in self.idx_arr if x is not None])
+    def get_window(self, event_signal=None, sampling_rate=None, window_size=None):
+        if (
+            event_signal is not None
+            and sampling_rate is not None
+            and self.event is not None
+            and len(self.event) > 0
+        ):
+            sweeps, samples = self.get_valid_sweep_indices_and_samples(
+                event_signal, sampling_rate, window_size
+            )
+            if len(samples) > 0:
+                return (int(np.min(samples)), int(np.max(samples)))
 
-    def get_window(self):
-        # return the min-time & max-time of the events
-        idx_arr_filt = [x[0] for x in self.idx_arr if x is not None]
-        if len(idx_arr_filt) == 0:
+        if self._idx_arr is not None:
+            idx_arr_filt = [
+                (x[0] if isinstance(x, (tuple, list)) else x)
+                for x in self._idx_arr
+                if x is not None
+            ]
+            if len(idx_arr_filt) > 0:
+                return (int(min(idx_arr_filt)), int(max(idx_arr_filt)))
+        return None
+
+    def get_sweep_sample_latencies(
+        self,
+        event_signal: neo.Event,
+        sampling_rate: float,
+        window_size: pq.Quantity = None,
+    ) -> np.ndarray:
+        """Returns a 1D float64 array of length len(event_signal) containing the spike latency
+        in samples for each sweep (np.nan where no valid spike exists within [0, window_size]).
+        """
+        if event_signal is None or len(event_signal) == 0:
+            return np.empty(0, dtype=np.float64)
+
+        n_sweeps = len(event_signal)
+        lat_samples = np.full(n_sweeps, np.nan, dtype=np.float64)
+
+        if self.event is None or len(self.event) == 0:
+            return lat_samples
+
+        ev_s = (
+            self.event.rescale(pq.s).magnitude
+            if hasattr(self.event, "rescale")
+            else np.asarray(self.event, dtype=np.float64)
+        )
+        stim_s = (
+            event_signal.rescale(pq.s).magnitude
+            if hasattr(event_signal, "rescale")
+            else np.asarray(event_signal, dtype=np.float64)
+        )
+
+        max_lat_s = (
+            float(window_size.rescale(pq.s).magnitude)
+            if (window_size is not None and hasattr(window_size, "rescale"))
+            else (float(window_size) if window_size is not None else float("inf"))
+        )
+        sr = float(
+            sampling_rate.rescale(pq.Hz).magnitude
+            if hasattr(sampling_rate, "rescale")
+            else float(sampling_rate)
+        )
+
+        idx_sweeps = np.searchsorted(stim_s, ev_s, side="right") - 1
+        valid_mask = (idx_sweeps >= 0) & (idx_sweeps < n_sweeps)
+        if not np.any(valid_mask):
+            return lat_samples
+
+        sw = idx_sweeps[valid_mask]
+        dt = ev_s[valid_mask] - stim_s[sw]
+        in_win = (dt >= 0) & (dt <= max_lat_s)
+        sw_win = sw[in_win]
+        dt_win = dt[in_win]
+        samp = np.round(dt_win * sr)
+
+        for s_idx, sample_val in zip(sw_win, samp):
+            if np.isnan(lat_samples[s_idx]):
+                lat_samples[s_idx] = sample_val
+
+        return lat_samples
+
+    def get_valid_sweep_indices_and_samples(
+        self,
+        event_signal: neo.Event,
+        sampling_rate: float,
+        window_size: pq.Quantity = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Returns (sweep_indices, sample_latencies) as 1D int64 arrays for all sweeps
+        that have a valid spike within [0, window_size].
+        """
+        lat_samples = self.get_sweep_sample_latencies(event_signal, sampling_rate, window_size)
+        if len(lat_samples) == 0:
+            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
+
+        valid_mask = ~np.isnan(lat_samples)
+        sweeps = np.where(valid_mask)[0].astype(np.int64)
+        samples = lat_samples[valid_mask].astype(np.int64)
+        return sweeps, samples
+
+    def get_sweep_sample(
+        self,
+        stimno: int,
+        event_signal: neo.Event,
+        sampling_rate: float,
+        window_size: pq.Quantity = None,
+    ) -> Optional[int]:
+        """Fast O(log N) lookup for a single stimno using np.searchsorted."""
+        if (
+            event_signal is None
+            or stimno < 0
+            or stimno >= len(event_signal)
+            or self.event is None
+            or len(self.event) == 0
+        ):
             return None
-        return (int(min(idx_arr_filt)), int(max(idx_arr_filt)))
+
+        ev_s = (
+            self.event.rescale(pq.s).magnitude
+            if hasattr(self.event, "rescale")
+            else np.asarray(self.event, dtype=np.float64)
+        )
+        stim_ts = float(
+            event_signal[stimno].rescale(pq.s).magnitude
+            if hasattr(event_signal[stimno], "rescale")
+            else float(event_signal[stimno])
+        )
+        max_lat_s = (
+            float(window_size.rescale(pq.s).magnitude)
+            if (window_size is not None and hasattr(window_size, "rescale"))
+            else (float(window_size) if window_size is not None else float("inf"))
+        )
+        sr = float(
+            sampling_rate.rescale(pq.Hz).magnitude
+            if hasattr(sampling_rate, "rescale")
+            else float(sampling_rate)
+        )
+
+        idx = np.searchsorted(ev_s, stim_ts)
+        if idx < len(ev_s):
+            dt = ev_s[idx] - stim_ts
+            if 0 <= dt <= max_lat_s:
+                return int(np.round(dt * sr))
+
+        return None
 
     def get_idx_arr(self, event_signal, signal_chan):
-        p = [None for x in range(len(event_signal))]
-        for e in x.times:
-            i = int(np.searchsorted(event_signal, e).base) - 1
-            x = int(((e - event_signal[i]) * signal_chan.sampling_rate).base)
-            p[i] = (
-                x,
-                signal_chan.base[event_signal[i].base * signal_chan.sampling_rate.base],
-            )
+        p = [None for _ in range(len(event_signal))]
+        if self.event is None or len(self.event) == 0:
+            return p
+        sr = float(signal_chan.sampling_rate.rescale(pq.Hz).magnitude)
+        sweeps, samples = self.get_valid_sweep_indices_and_samples(event_signal, sr)
+        for sw, sa in zip(sweeps, samples):
+            p[sw] = (int(sa), 1)
         return p
 
     def get_latencies(self, event_signal: pq.UnitTime) -> pq.UnitTime:
+        """Returns the latencies of the events in the spikegroup in ms.
+        If the event is not in the spikegroup, returns np.nan.
         """
-        returns the latencies of the events in the spikegroup in ms.
-        if the event is not in the spikegroup, it returns np.nan
-
-        note: this will only return one latency per event, if there are multiple events in the same time, it will only return the first one.
-
-        """
+        if self.event is None or len(self.event.times) == 0:
+            return np.ones(len(event_signal)) * np.nan * pq.ms
+        if len(event_signal) == 0:
+            return np.empty(0) * pq.ms
 
         next_spikes = np.searchsorted(self.event.times, event_signal).magnitude
         next_spikes = np.clip(next_spikes, 0, len(self.event.times) - 1)
-        if len(self.event.times) == 0:
-            return np.ones(len(event_signal)) * np.nan * pq.ms
         spike_times = self.event.times[next_spikes] - (
             np.asarray(event_signal) * event_signal.units
         )
-
         spike_times = spike_times.rescale(pq.ms)
         spike_times[spike_times < (0 * pq.s)] = np.nan * pq.ms
         return spike_times
-        for i, e in enumerate(event_signal):
-            next_spike = np.searchsorted(self.event.times, e)
-            if next_spike == len(self.event.times):
-                continue
-            p[i] = (self.event.times[next_spike] - e).rescale(pq.ms)
-
-        # for e in self.event.times:
-        #     i = np.searchsorted(event_signal, e) - 1
-        #     p[i] = (e - event_signal[i]).rescale(pq.ms)
-        return p
 
     def get_sweeps(self, event_signal: pq.UnitTime) -> pq.UnitTime:
-        """
-        returns the sweep numbers/event numbers in the spikegroup.
-
-        """
-
-        if len(self.event.times) == 0:
+        """Returns the sweep numbers/event numbers in the spikegroup."""
+        if self.event is None or len(self.event.times) == 0 or len(event_signal) == 0:
             return np.nan
-        if len(event_signal) == 0:
-            return np.nan
-
         sweeps = np.searchsorted(event_signal, self.event.times).magnitude
         return sweeps
 
@@ -196,6 +306,12 @@ class ViewerState(QObject):
     onUnitChange = Signal(int)
     onUnitGroupChange = Signal()
     onStimNoChange = Signal(int)
+    onNewSweep = Signal(int)
+    onNewSpikeEvents = Signal(int)
+    onStreamStateChanged = Signal(bool)
+    onEventsUpdated = Signal()
+    onUnitAnnotated = Signal(dict)
+    onChannelChange = Signal(str)
 
     def __init__(self, parent=None, segment=None, spike_groups=None):
         super().__init__(parent)
@@ -212,6 +328,54 @@ class ViewerState(QObject):
         self.undo_queue = []
         self.MAX_UNDO = 10
         self.title = ""
+
+        # Live streaming state attributes
+        self.is_streaming: bool = False
+        self.follow_live: bool = True
+        self.auto_track_enabled: bool = False
+        self.auto_switch_unit_channel: bool = False
+        self._live_erp_buffer: Optional[LiveERPBuffer] = None
+        self._live_aux_erp_buffers: dict = {}
+        self._live_channel_signals: dict = {}
+        self.active_channel_names: List[str] = []
+        self.focus_channels: List[str] = []
+
+    def get_available_channels(self) -> List[str]:
+        if self.is_streaming and self._live_aux_erp_buffers:
+            channels = []
+            if self.analog_signal is not None and getattr(self.analog_signal, "name", None):
+                channels.append(self.analog_signal.name)
+            for k in self._live_aux_erp_buffers.keys():
+                if k not in channels:
+                    channels.append(k)
+            return channels
+        elif self.segment is not None and len(self.segment.analogsignals) > 0:
+            return [sig.name for sig in self.segment.analogsignals]
+        else:
+            return [self.analog_signal.name] if self.analog_signal is not None and getattr(self.analog_signal, "name", None) else []
+
+    def get_channel_erp(self, channel_name: str = None):
+        if channel_name is None or (self.analog_signal is not None and channel_name == self.analog_signal.name):
+            return self.get_erp()
+        if hasattr(self, "_live_aux_erp_buffers") and self._live_aux_erp_buffers and channel_name in self._live_aux_erp_buffers:
+            buf = self._live_aux_erp_buffers[channel_name]
+            return buf.data if len(buf) > 0 else np.zeros((0, buf.window_samples)) * buf.units
+        if self.segment is not None:
+            for sig in self.segment.analogsignals:
+                if sig.name == channel_name:
+                    return self.get_erp(signal=sig, event_signal=self.event_signal)
+        return None
+
+    def get_channel_signal(self, channel_name: str = None):
+        if channel_name is None:
+            return self.analog_signal
+        if getattr(self, "is_streaming", False) and hasattr(self, "_live_channel_signals") and channel_name in self._live_channel_signals:
+            return self._live_channel_signals[channel_name]
+        if self.segment is not None:
+            for sig in self.segment.analogsignals:
+                if sig.name == channel_name:
+                    return sig
+        return None
 
     def save_undo(self, func):
         self.undo_queue.append(func)
@@ -233,6 +397,14 @@ class ViewerState(QObject):
         if unitid > len(self.spike_groups):
             return
         self.cur_spike_group = unitid
+        if 0 <= unitid < len(self.spike_groups):
+            sg = self.spike_groups[unitid]
+            if (
+                getattr(sg, "channel", "") != ""
+                and getattr(self, "auto_switch_unit_channel", False)
+                and sg.channel != getattr(self.analog_signal, "name", "")
+            ):
+                self.set_active_channel(sg.channel)
         self.onUnitGroupChange.emit()
 
     @Slot(int, int)
@@ -257,12 +429,19 @@ class ViewerState(QObject):
         if len(evt) > 0:
             to_keep = (evt < self.event_signal[stimno]) | (
                 (evt > self.event_signal[stimno + 1])
-                if self.stimno < len(self.event_signal) - 1
+                if stimno < len(self.event_signal) - 1
                 else False
             )  # Prevent crash on final index
             # TODO: we should remove by index, and also use purely the timestamps not idx_arr
             self.spike_groups[self.cur_spike_group].event = evt[to_keep]
             evt = evt[to_keep]
+
+        sg = self.spike_groups[self.cur_spike_group]
+        if sg.idx_arr is None:
+            sg.idx_arr = []
+        while len(sg.idx_arr) <= stimno:
+            sg.idx_arr.append(None)
+
         if latency is None:
             self.spike_groups[self.cur_spike_group].idx_arr[stimno] = None
 
@@ -310,9 +489,46 @@ class ViewerState(QObject):
             evt2.name = evt.name
             self.spike_groups[self.cur_spike_group].event = evt2
 
+            # When annotating a spike on a unit, if sg.channel == "" and self.analog_signal is not None:
+            if getattr(sg, "channel", "") == "" and self.analog_signal is not None and getattr(self.analog_signal, "name", ""):
+                sg.channel = self.analog_signal.name
+                sg.event.annotations["channel"] = self.analog_signal.name
+
         self.spike_groups[
             self.cur_spike_group
         ].event.sort()  # TODO: not sure if this breaks the array annotations.
+
+        # Emit onUnitAnnotated with unit details
+        lat_samples = int(latency) if latency is not None and latency >= 0 else None
+        lat_ms = (
+            float((latency / self.analog_signal.sampling_rate).rescale(pq.ms).magnitude)
+            if lat_samples is not None and self.analog_signal is not None
+            else None
+        )
+        ts_s = (
+            float(
+                (
+                    self.event_signal[stimno]
+                    + (latency / self.analog_signal.sampling_rate)
+                )
+                .rescale(pq.s)
+                .magnitude
+            )
+            if lat_samples is not None
+            and self.analog_signal is not None
+            and self.event_signal is not None
+            and stimno < len(self.event_signal)
+            else None
+        )
+        self.onUnitAnnotated.emit({
+            "unit": self.spike_groups[self.cur_spike_group].event.name,
+            "unit_idx": int(self.cur_spike_group),
+            "stimno": int(stimno),
+            "latency_samples": lat_samples,
+            "latency_ms": lat_ms,
+            "timestamp_s": ts_s,
+            "fibre_type": str(self.spike_groups[self.cur_spike_group].fibre_type),
+        })
 
         self.onUnitChange.emit(stimno)
 
@@ -364,6 +580,9 @@ class ViewerState(QObject):
 
     @Slot(int)
     def setStimNo(self, stimno: int):
+        if self.event_signal is None or len(self.event_signal) == 0:
+            self.stimno = 0
+            return
         self.stimno = max(min(stimno, len(self.event_signal) - 1), 0)
         self.onStimNoChange.emit(self.stimno)
 
@@ -419,35 +638,30 @@ class ViewerState(QObject):
         self.onUnitGroupChange.emit()
 
     def update_idx_arrs(self):
-        for sg in self.spike_groups:
-            # if sg.idx_arr is not None:
-            #    continue
-            p = [None for x in range(len(self.event_signal))]
-            sg.idx_arr = p
-            for e in sg.event.rescale("s").times:
-                i = (
-                    int(
-                        np.searchsorted(
-                            self.event_signal.rescale("s"), e, side="right"
-                        ).base
-                    )
-                    - 1
-                )
-                if i < 0:
-                    continue
-                x = int(
-                    ((e - self.event_signal[i]) * self.analog_signal.sampling_rate).base
-                )
-                if e > self.analog_signal.t_stop:
-                    continue
-                try:
-                    v = self.analog_signal.time_slice(e, e + 1 * pq.ms)[0]
-                except:
-                    v = None
-                if (e - self.event_signal[i]) > self.window_size:
-                    continue
-                p[i] = (x, v)
+        if self.event_signal is None or len(self.event_signal) == 0:
+            for sg in self.spike_groups:
+                sg.idx_arr = []
+            return
 
+        sr = float(
+            self.sampling_rate
+            if self.sampling_rate is not None
+            else (
+                self.analog_signal.sampling_rate.rescale(pq.Hz).magnitude
+                if self.analog_signal is not None
+                else 30000.0
+            )
+        )
+
+        n_sweeps = len(self.event_signal)
+        for sg in self.spike_groups:
+            p = [None for _ in range(n_sweeps)]
+            if sg.event is not None and len(sg.event) > 0:
+                sweeps, samples = sg.get_valid_sweep_indices_and_samples(
+                    self.event_signal, sr, self.window_size
+                )
+                for sw, sa in zip(sweeps, samples):
+                    p[sw] = (int(sa), 1)
             sg.idx_arr = p
 
     def get_erp(
@@ -457,19 +671,72 @@ class ViewerState(QObject):
         channel=0,
         window_size=None,
     ):
+        if window_size is None:
+            window_size = self.window_size
+
+        if (
+            self._live_erp_buffer is not None
+            and (signal is None or signal is self.analog_signal)
+            and (event_signal is None or event_signal is self.event_signal)
+        ):
+            if len(self._live_erp_buffer) > 0:
+                return self._live_erp_buffer.data
+            else:
+                num_samples = int(
+                    self.window_size.rescale(pq.s).magnitude
+                    * (self.sampling_rate or 30000)
+                )
+                units = (
+                    self.analog_signal.units
+                    if self.analog_signal is not None
+                    else pq.mV
+                )
+                return np.zeros((0, num_samples)) * units
+
+        if (
+            self.segment is None
+            or self.event_signal is None
+            or len(self.event_signal) == 0
+        ):
+            num_samples = int(
+                self.window_size.rescale(pq.s).magnitude
+                * (self.sampling_rate or 30000)
+            )
+            units = (
+                self.analog_signal.units
+                if self.analog_signal is not None
+                else pq.mV
+            )
+            return np.zeros((1, num_samples)) * units
+
         if signal is None:
             signal = self.analog_signal
         if event_signal is None:
             event_signal = self.event_signal
-        if window_size is None:
-            window_size = self.window_size
 
-        signal_idx = next(
-            i for i, x in enumerate(self.segment.analogsignals) if x.name == signal.name
-        )
-        events_idx = next(
-            i for i, x in enumerate(self.segment.events) if x.name == event_signal.name
-        )
+        try:
+            signal_idx = next(
+                i
+                for i, x in enumerate(self.segment.analogsignals)
+                if x.name == signal.name
+            )
+            events_idx = next(
+                i
+                for i, x in enumerate(self.segment.events)
+                if x.name == event_signal.name
+            )
+        except StopIteration:
+            num_samples = int(
+                self.window_size.rescale(pq.s).magnitude
+                * (self.sampling_rate or 30000)
+            )
+            units = (
+                self.analog_signal.units
+                if self.analog_signal is not None
+                else pq.mV
+            )
+            return np.zeros((1, num_samples)) * units
+
         return self._get_erp(
             signal_idx, events_idx, channel, float(window_size.rescale(pq.second))
         )
@@ -562,6 +829,8 @@ class ViewerState(QObject):
         return self.spike_groups[unit]
 
     def set_segment(self, data: neo.Segment):
+        if data is not None:
+            data = expand_multichannel_segment(data)
 
         kwargs = {}
         cur_evt = [
@@ -582,7 +851,7 @@ class ViewerState(QObject):
             analog_signal = data.analogsignals[0]
             kwargs["analog_signal"] = analog_signal
         else:
-            analog_signal = data.analogsignals[cur_evt[0]]
+            analog_signal = data.analogsignals[cur_analogsig[0]]
 
         spike_event_groups = []
 
@@ -590,7 +859,13 @@ class ViewerState(QObject):
             if not x.name.startswith("unit"):
                 continue
 
-            spike_event_groups.append(tracked_neuron_unit(event=x))
+            spike_event_groups.append(
+                tracked_neuron_unit(
+                    event=x,
+                    channel=x.annotations.get("channel", ""),
+                    neighbor_channels=list(x.annotations.get("neighbor_channels", [])),
+                )
+            )
 
         cur_sel = [
             i
@@ -600,153 +875,469 @@ class ViewerState(QObject):
         if len(cur_sel) == 0:
             self.cur_spike_group = 0
         else:
-            self.cur_spike_group = self.cur_sel[0]
+            self.cur_spike_group = cur_sel[0]
 
         self.segment = data
 
         self.set_data(analog_signal, event_signal, spike_groups=spike_event_groups)
 
+    def start_live_session(
+        self,
+        sampling_rate: float = 30000.0,
+        window_size_ms: float = 500.0,
+        channel_name: str = "rd.0",
+        units=pq.uV,
+        aux_channels: List[str] = None,
+        channels: List[Union[int, str]] = None,
+    ):
+        """
+        Initializes a fresh live streaming session for real-time visualization and annotation.
+        """
+        if channels:
+            ch_names = []
+            for idx, c in enumerate(channels):
+                if isinstance(c, int):
+                    ch_names.append(channel_name if (idx == 0 and channel_name != "rd.0") else f"CH{c}")
+                else:
+                    ch_names.append(str(c))
+            channel_name = ch_names[0]
+            self.active_channel_names = list(ch_names)
+        else:
+            self.active_channel_names = [channel_name]
+            if aux_channels:
+                for ch in aux_channels:
+                    ch_str = str(ch)
+                    if ch_str not in self.active_channel_names:
+                        self.active_channel_names.append(ch_str)
 
-def load_file(data_path, type="h5", **kwargs):
-    # currently this only loads the first segment
-    if type == "h5":
-        data = NixIO(data_path, mode="ro").read_block(0).segments
-    # elif type == "dabsys":
-    # data = import_dapsys_csv_files(data_path)[0].segments[0]
-    elif type == "openEphys":
-        # data = open_ephys_to_neo(data_path)
-        data = neo.OpenEphysBinaryIO(data_path).read_block(0).segments[0]
+        self.segment = neo.Segment(name="OpenEphys Live")
+        self._live_channel_signals = {}
+        self._live_aux_erp_buffers = {}
+        window_samples = int(sampling_rate * window_size_ms / 1000.0)
 
-    elif type == "nwb":
-        data = neo.NWBIO(data_path).read_block(block_index=0).segments[0]
-
-    elif type == "matlab":
-        data = open_matlab_to_neo(data_path)
-
-    elif type == "APTrack":
-        d = APTrackDialog()
-        val = d.exec_()
-        config = d.get_config()
-        t = config.pop("record")
-
-        # skip the predicted items so we don't duplicate them
-        skip_list = ["rd.0", "rd.0.bp", "stimVolt", "stim"]
-        additional_channels = []
-        for k, v in config.items():
-            if any(k in x for x in skip_list):
-                continue
-
-            extra_channel = APTrackRecording(
-                v,
-                TypeID.ANALOG,
-                k,
-                "",
+        for ch in self.active_channel_names:
+            sig = MultiAnalogSignal()
+            sig.name = ch
+            sig.sampling_rate = sampling_rate * pq.Hz
+            sig.units = units
+            self._live_channel_signals[ch] = sig
+            self._live_aux_erp_buffers[ch] = LiveERPBuffer(
+                window_samples=window_samples,
+                units=units,
             )
-            additional_channels.append(extra_channel)
+            self.segment.analogsignals.append(sig)
 
-        DS4_channels = [
-            APTrackRecording(
-                "ADC2",
-                TypeID.TTL,
-                "env.ds4.stimVolt",
-                "The DS5 1V per 10mA",
-            ),
-            APTrackRecording(
-                "ADC2",
-                TypeID.ANALOG,
-                "env.ds4.stimVolt",
-                "The DS5 1V per 10mA",
-            ),
-        ]
+        self.analog_signal = self._live_channel_signals[channel_name]
+        self._live_erp_buffer = self._live_aux_erp_buffers[channel_name]
 
-        data = open_aptrack(data_path, t, config, additional_channels)
-        # blk = neo.OpenEphysIO(data_path).read_block(0)
-        # data = blk.segments[0]
-    elif type == "spike2":
-        data = neo.Spike2IO(data_path)
-    if isinstance(data, (list, ObjectList)):  # multiple segments
-        # create multianalogsignals if there are segments labeled as "ERP"
-        final_sig = next(
-            x
-            for x in data
-            if x.name != "ERP"
-            and x.annotations.get("class_", "") != "multianalogsignal"
+        self.event_signal = neo.Event(
+            np.array([], dtype=float) * pq.s,
+            name="env.stim",
+            units=pq.s,
         )
-        for seg in data:
-            from .processing import MultiAnalogSignal
+        self.segment.events.append(self.event_signal)
 
-            if (
-                seg.name == "ERP"
-                or seg.annotations.get("class_", "") == "multianalogsignal"
-            ):
-                erp = MultiAnalogSignal(seg.analogsignals)
-                final_sig.analogsignals.append(erp)
+        if self.spike_groups and len(self.spike_groups) > 0:
+            for sg in self.spike_groups:
+                sg.event = neo.Event(
+                    np.array([], dtype=float) * pq.s,
+                    name=sg.event.name,
+                    units=pq.s,
+                    **sg.event.annotations,
+                )
+                sg.idx_arr = []
+                if sg.event not in self.segment.events:
+                    self.segment.events.append(sg.event)
+        else:
+            evt = neo.Event(
+                np.array([], dtype=float) * pq.s,
+                name="unit_0",
+                units=pq.s,
+            )
+            evt.annotations["type"] = "unit"
+            evt.annotations["unit"] = 0
+            evt.annotations["notes"] = ""
+            evt.annotations["fibre_type"] = ""
+            self.spike_groups = [tracked_neuron_unit(event=evt, idx_arr=[])]
+            self.segment.events.append(evt)
 
-        data = final_sig
-    if len(data.events) == 0:
-        event_signal = Event()
-    else:
-        event_signal = data.events[0]
-    signal_chan = data.analogsignals[0]
+        self.cur_spike_group = 0
+        self.stimno = 0
+        self.is_streaming = True
+        self.sampling_rate = int(sampling_rate)
+        self.window_size = (window_size_ms / 1000.0) * pq.s
+        self._peaks = []
+        self._get_erp.cache_clear()
+        self.onLoadNewFile.emit()
+        self.onStreamStateChanged.emit(True)
 
-    spike_event_groups = []
+    def stop_live_session(self):
+        """
+        Stops the live streaming session.
+        """
+        self.is_streaming = False
+        self.onStreamStateChanged.emit(False)
 
-    for x in data.events:
-        x: Event = x
-        if (not x.name.startswith("unit")) and (
-            x.annotations.get("type", "") != "unit"
-        ):
-            continue
-        # info = x.times[:,np.newaxis]-event_signal
-        # p = [None for x in range(len(event_signal))]
+    def set_active_channel(self, channel_name_or_sig: Union[str, neo.AnalogSignal]):
+        """
+        Switch the active displayed channel in real time during live streaming or offline mode.
+        """
+        if channel_name_or_sig is None:
+            return
 
-        spike_event_groups.append(tracked_neuron_unit(event=x))
+        if isinstance(channel_name_or_sig, str):
+            ch_name = channel_name_or_sig
+            if getattr(self, "is_streaming", False) and hasattr(self, "_live_aux_erp_buffers") and ch_name in self._live_aux_erp_buffers:
+                if hasattr(self, "_live_channel_signals") and ch_name in self._live_channel_signals:
+                    self.analog_signal = self._live_channel_signals[ch_name]
+                elif self.analog_signal is not None:
+                    self.analog_signal.name = ch_name
+                self._live_erp_buffer = self._live_aux_erp_buffers[ch_name]
+                self._peaks = None
+                self._get_erp.cache_clear()
+                self.update_idx_arrs()
+                self.onChannelChange.emit(ch_name)
+                self.onLoadNewFile.emit()
+                if self.event_signal is not None and len(self.event_signal) > 0:
+                    self.onStimNoChange.emit(self.stimno)
+                self.onEventsUpdated.emit()
+                return
 
-    data.file_origin = data_path
-    return data, signal_chan, event_signal, spike_event_groups
+            # Offline mode by channel name
+            found_sig = None
+            if self.segment is not None and getattr(self.segment, "analogsignals", None):
+                for x in self.segment.analogsignals:
+                    if getattr(x, "name", "") == ch_name:
+                        found_sig = x
+                        break
+            if found_sig is not None:
+                self.set_data(analog_signal=found_sig)
+                self.onChannelChange.emit(found_sig.name)
+            else:
+                self.onChannelChange.emit(ch_name)
+        else:
+            sig = channel_name_or_sig
+            sig_name = getattr(sig, "name", "")
+            if getattr(self, "is_streaming", False) and hasattr(self, "_live_aux_erp_buffers") and sig_name in self._live_aux_erp_buffers:
+                self.analog_signal = sig
+                self._live_erp_buffer = self._live_aux_erp_buffers[sig_name]
+                self._peaks = None
+                self._get_erp.cache_clear()
+                self.update_idx_arrs()
+                self.onChannelChange.emit(sig_name)
+                self.onLoadNewFile.emit()
+                if self.event_signal is not None and len(self.event_signal) > 0:
+                    self.onStimNoChange.emit(self.stimno)
+                self.onEventsUpdated.emit()
+            else:
+                self.set_data(analog_signal=sig)
+                self.onChannelChange.emit(sig_name)
 
+    def append_sweep(
+        self,
+        stim_timestamp: Union[float, pq.Quantity],
+        sweep_waveform: np.ndarray,
+        pre_offset_s: float = 0.0,
+        spike_latencies_s: dict = None,
+        aux_sweeps: dict = None,
+    ) -> int:
+        """
+        Append a new stimulus sweep to the live session.
+        Supports 1D (window_samples,) and 2D (n_channels, window_samples) waveforms.
+        """
+        if isinstance(stim_timestamp, (int, float)):
+            stim_ts_q = stim_timestamp * pq.s
+        else:
+            stim_ts_q = stim_timestamp.rescale(pq.s)
 
-def prompt_for_neo_file(type):
-    if type is None:
-        type = QInputDialog().getItem(
-            None,
-            "Select file type",
-            "Filetype",
-            ["h5", "openEphys", "APTrack", "matlab", "spike2", "nwb"],
-        )[0]
-
-    if type in ("h5", "spike2", "nwb"):
-        fname = QFileDialog.getOpenFileName(None, "Open")[0]
-    elif type in ("openEphys", "APTrack", "matlab"):
-        fname = QFileDialog.getExistingDirectory(None, "Open OpenEphys")
-    else:
-        raise Exception(f"Unknown filetype: {type}")
-    return fname, type
-
-
-def get_predicted_aps(self):
-    """
-    look at action potential predictors and return the predicted action potentials
-    """
-
-
-def open_matlab_to_neo(folder):
-    from pathlib import Path
-
-    from scipy.io import loadmat
-
-    matfiles = Path(folder).glob("*.mat")
-    seg = neo.Segment()
-    for m in matfiles:
-        mf = loadmat(m)
-        asig = neo.AnalogSignal(
-            mf["data"].T,
-            pq.V,
-            sampling_rate=mf["samplerate"][0, 0] * pq.Hz,
-            name=m.stem,
+        # Append stim_timestamp to self.event_signal (updating self.segment.events[0] as well)
+        new_times = np.append(self.event_signal.as_array(), stim_ts_q.magnitude) * pq.s
+        new_event = neo.Event(
+            new_times,
+            name=self.event_signal.name,
+            units=pq.s,
+            **self.event_signal.annotations,
         )
-        seg.analogsignals.append(asig)
-    return seg
+        if self.segment is not None and len(self.segment.events) > 0:
+            for idx_ev, ev in enumerate(self.segment.events):
+                if ev.name == self.event_signal.name or id(ev) == id(self.event_signal):
+                    self.segment.events[idx_ev] = new_event
+                    break
+        self.event_signal = new_event
+        new_stim_idx = len(self.event_signal) - 1
+
+        units = self.analog_signal.units if self.analog_signal is not None else pq.uV
+        sr = (
+            self.sampling_rate * pq.Hz
+            if not hasattr(self.sampling_rate, "rescale")
+            else self.sampling_rate
+        )
+
+        is_2d = hasattr(sweep_waveform, "ndim") and sweep_waveform.ndim == 2
+
+        if is_2d:
+            n_ch = sweep_waveform.shape[0]
+            for ch_i in range(n_ch):
+                ch_name = (
+                    self.active_channel_names[ch_i]
+                    if hasattr(self, "active_channel_names") and ch_i < len(self.active_channel_names)
+                    else f"CH{ch_i}"
+                )
+                ch_wave = sweep_waveform[ch_i]
+                sig_slice = neo.AnalogSignal(
+                    ch_wave,
+                    units=units,
+                    sampling_rate=sr,
+                    t_start=stim_ts_q + (pre_offset_s * pq.s),
+                    name=ch_name,
+                )
+                if hasattr(self, "_live_channel_signals") and ch_name in self._live_channel_signals:
+                    self._live_channel_signals[ch_name].append_signal(sig_slice)
+                elif ch_name == getattr(self.analog_signal, "name", "") and isinstance(self.analog_signal, MultiAnalogSignal):
+                    self.analog_signal.append_signal(sig_slice)
+
+                if hasattr(self, "_live_aux_erp_buffers") and ch_name in self._live_aux_erp_buffers:
+                    aux_buf = self._live_aux_erp_buffers[ch_name]
+                    aux_buf.append_sweep(ch_wave[: aux_buf.window_samples])
+                elif ch_name == getattr(self.analog_signal, "name", "") and self._live_erp_buffer is not None:
+                    self._live_erp_buffer.append_sweep(ch_wave[: self._live_erp_buffer.window_samples])
+
+            primary_waveform = (
+                sweep_waveform[0]
+                if (not hasattr(self, "active_channel_names") or self.analog_signal is None or self.analog_signal.name not in self.active_channel_names)
+                else sweep_waveform[self.active_channel_names.index(self.analog_signal.name)]
+            )
+        else:
+            # 1D waveform
+            sig_slice = neo.AnalogSignal(
+                sweep_waveform,
+                units=units,
+                sampling_rate=sr,
+                t_start=stim_ts_q + (pre_offset_s * pq.s),
+                name=self.analog_signal.name if self.analog_signal is not None else "rd.0",
+            )
+            if hasattr(self, "_live_channel_signals") and getattr(self.analog_signal, "name", "") in self._live_channel_signals:
+                self._live_channel_signals[self.analog_signal.name].append_signal(sig_slice)
+            elif isinstance(self.analog_signal, MultiAnalogSignal):
+                self.analog_signal.append_signal(sig_slice)
+
+            # Appends the [0, window_samples] portion to primary buffer
+            cur_ch_name = getattr(self.analog_signal, "name", "")
+            if hasattr(self, "_live_aux_erp_buffers") and cur_ch_name in self._live_aux_erp_buffers:
+                self._live_aux_erp_buffers[cur_ch_name].append_sweep(
+                    sweep_waveform[: self._live_aux_erp_buffers[cur_ch_name].window_samples]
+                )
+            elif self._live_erp_buffer is not None:
+                self._live_erp_buffer.append_sweep(
+                    sweep_waveform[: self._live_erp_buffer.window_samples]
+                )
+
+            # Handle aux sweeps if any
+            if aux_sweeps and hasattr(self, "_live_aux_erp_buffers") and self._live_aux_erp_buffers:
+                for aux_ch, aux_wave in aux_sweeps.items():
+                    if aux_ch == cur_ch_name:
+                        continue  # Do not double-append to primary
+                    if aux_ch in self._live_aux_erp_buffers:
+                        aux_buf = self._live_aux_erp_buffers[aux_ch]
+                        aux_buf.append_sweep(aux_wave[: aux_buf.window_samples])
+                    if hasattr(self, "_live_channel_signals") and aux_ch in self._live_channel_signals:
+                        aux_sig = neo.AnalogSignal(
+                            aux_wave,
+                            units=units,
+                            sampling_rate=sr,
+                            t_start=stim_ts_q + (pre_offset_s * pq.s),
+                            name=aux_ch,
+                        )
+                        self._live_channel_signals[aux_ch].append_signal(aux_sig)
+
+            primary_waveform = sweep_waveform
+
+        # Incrementally computes peaks (find_peaks(d) and find_peaks(-d)) for this single new sweep
+        if self._peaks is None:
+            self._peaks = []
+        from scipy.signal import find_peaks
+
+        d = primary_waveform
+        if hasattr(d, "magnitude"):
+            d = d.magnitude
+        d = np.asarray(d).flatten()
+        pts, _ = find_peaks(d)
+        pts_down, _ = find_peaks(-1 * d)
+        pts = np.sort(np.hstack([pts, pts_down]).flatten())
+        self._peaks.append(pts)
+
+        # Appends None to sg.idx_arr for each sg in self.spike_groups
+        for sg in self.spike_groups:
+            if sg.idx_arr is None:
+                sg.idx_arr = []
+            while len(sg.idx_arr) < new_stim_idx:
+                sg.idx_arr.append(None)
+            sg.idx_arr.append(None)
+
+        # If spike_latencies_s is provided, records those spikes in corresponding tracked_neuron_unit
+        if spike_latencies_s:
+            for key, lat in spike_latencies_s.items():
+                sg = None
+                sg_idx = None
+                if isinstance(key, int) and 0 <= key < len(self.spike_groups):
+                    sg = self.spike_groups[key]
+                    sg_idx = key
+                else:
+                    for idx_u, u in enumerate(self.spike_groups):
+                        if u.event.name == str(key):
+                            sg = u
+                            sg_idx = idx_u
+                            break
+                if sg is not None and lat is not None:
+                    lat_qty = (
+                        lat * pq.s if not hasattr(lat, "rescale") else lat.rescale(pq.s)
+                    )
+                    spike_time = stim_ts_q + lat_qty
+                    lat_samples = int(
+                        np.round(
+                            (lat_qty * (self.sampling_rate * pq.Hz)).simplified.magnitude
+                        )
+                    )
+                    sg.idx_arr[new_stim_idx] = (lat_samples, 1)
+                    new_ev_times = (
+                        np.append(sg.event.as_array(), spike_time.magnitude) * pq.s
+                    )
+                    sg.event = neo.Event(
+                        new_ev_times,
+                        name=sg.event.name,
+                        units=pq.s,
+                        **sg.event.annotations,
+                    )
+                    sg.event.sort()
+                    if self.segment is not None:
+                        for seg_i, seg_ev in enumerate(self.segment.events):
+                            if seg_ev.name == sg.event.name:
+                                self.segment.events[seg_i] = sg.event
+                                break
+
+        # If self.follow_live is True, updates self.stimno = new_stim_idx
+        if self.follow_live:
+            self.stimno = new_stim_idx
+
+        # Emits signals
+        self.onNewSweep.emit(new_stim_idx)
+        if self.follow_live:
+            self.onStimNoChange.emit(self.stimno)
+        self.onEventsUpdated.emit()
+
+        return new_stim_idx
+
+    def append_unit_spikes(
+        self,
+        unit_name: str,
+        spike_timestamps_s: Union[np.ndarray, pq.Quantity],
+        create_if_missing: bool = True,
+    ):
+        """
+        Append spike timestamps to a unit, updating its event and idx_arr.
+        """
+        unit_idx = None
+        sg = None
+        for i, u in enumerate(self.spike_groups):
+            if u.event.name == unit_name:
+                unit_idx = i
+                sg = u
+                break
+
+        if sg is None:
+            if create_if_missing:
+                evt = neo.Event(
+                    np.array([], dtype=float) * pq.s,
+                    name=unit_name,
+                    units=pq.s,
+                )
+                evt.annotations["type"] = "unit"
+                evt.annotations["unit"] = len(self.spike_groups)
+                evt.annotations["notes"] = ""
+                evt.annotations["fibre_type"] = ""
+                sg = tracked_neuron_unit(
+                    event=evt,
+                    idx_arr=[None]
+                    * (
+                        len(self.event_signal)
+                        if self.event_signal is not None
+                        else 0
+                    ),
+                )
+                self.spike_groups.append(sg)
+                if self.segment is not None:
+                    self.segment.events.append(evt)
+                unit_idx = len(self.spike_groups) - 1
+            else:
+                return
+
+        if not hasattr(spike_timestamps_s, "rescale"):
+            spikes_q = np.atleast_1d(spike_timestamps_s) * pq.s
+        else:
+            spikes_q = np.atleast_1d(spike_timestamps_s).rescale(pq.s)
+
+        spikes_mag = (
+            spikes_q.magnitude if hasattr(spikes_q, "magnitude") else np.asarray(spikes_q)
+        )
+        ev_mag = (
+            sg.event.as_array() if hasattr(sg.event, "as_array") else np.asarray(sg.event)
+        )
+
+        if len(sg.event) == 0:
+            combined_mag = spikes_mag
+        else:
+            combined_mag = np.concatenate([ev_mag, spikes_mag])
+
+        unique_times = np.unique(combined_mag) * pq.s
+        sg.event = neo.Event(
+            unique_times,
+            name=sg.event.name,
+            units=pq.s,
+            **sg.event.annotations,
+        )
+        sg.event.sort()
+
+        if self.segment is not None:
+            for seg_i, seg_ev in enumerate(self.segment.events):
+                if seg_ev.name == sg.event.name:
+                    self.segment.events[seg_i] = sg.event
+                    break
+
+        if self.event_signal is not None and len(self.event_signal) > 0:
+            if sg.idx_arr is None:
+                sg.idx_arr = []
+            while len(sg.idx_arr) < len(self.event_signal):
+                sg.idx_arr.append(None)
+
+            for spike in spikes_q:
+                i = (
+                    int(
+                        np.searchsorted(
+                            self.event_signal.rescale("s"), spike, side="right"
+                        ).base
+                    )
+                    - 1
+                )
+                if 0 <= i < len(self.event_signal):
+                    lat_s = spike - self.event_signal[i]
+                    if 0 * pq.s <= lat_s <= self.window_size:
+                        sr_val = (
+                            self.sampling_rate
+                            if self.sampling_rate is not None
+                            else (
+                                self.analog_signal.sampling_rate.magnitude
+                                if self.analog_signal is not None
+                                else 30000
+                            )
+                        )
+                        lat_samples = int(
+                            np.round((lat_s * (sr_val * pq.Hz)).simplified.magnitude)
+                        )
+                        sg.idx_arr[i] = (lat_samples, 1)
+
+        self.onNewSpikeEvents.emit(unit_idx)
+        self.onEventsUpdated.emit()
+
 
 
 class APPredictor:
@@ -759,91 +1350,3 @@ class APPredictor:
     def update(self):
         # return an event signal with the predicted action potentials
         pass
-
-
-class APTrackDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Load APTrack Data")
-
-        self.bottomLayout = QFormLayout()
-        self.topLayout = QFormLayout()
-        self.mainLayout = QVBoxLayout()
-
-        self.topLayout.addRow(QLabel("custom parameters"))
-        self.sbRecordNumber = QSpinBox()
-        self.sbRecordNumber.setMinimum(0)
-
-        self.inputsConfig = {}
-        self.labelBoxes = []
-        self.inputBoxes = []
-
-        self.topLayout.addRow(QLabel("Rec#"), self.sbRecordNumber)
-
-        labelBox = QLabel("Rec. channel")
-        inputBox = QLineEdit("CH1")
-        self.topLayout.addRow(labelBox, inputBox)
-        self.labelBoxes.append(labelBox)
-        self.inputBoxes.append(inputBox)
-
-        labelBox = QLabel("Stimulus ch.")
-        inputBox = QLineEdit("ADC2")
-        self.topLayout.addRow(labelBox, inputBox)
-        self.labelBoxes.append(labelBox)
-        self.inputBoxes.append(inputBox)
-
-        config = {
-            # "rd.0": "CH1",
-            # "stimVolt": "ADC2", # strictly necessary
-            # "stim": "ADC5",
-            # "thermode": "ADC7",
-            "button": "ADC8",
-        }
-        for k, v in config.items():
-            labelBox = QLineEdit(k)
-            inputBox = QLineEdit(v)
-            self.labelBoxes.append(labelBox)
-            self.inputBoxes.append(inputBox)
-            self.topLayout.addRow(labelBox, inputBox)
-
-        self.addButton = QPushButton("+")
-        self.addButton.clicked.connect(self.addWidget)
-        self.removeButton = QPushButton("-")
-        self.removeButton.clicked.connect(self.removeWidget)
-
-        self.bottomLayout.addRow(self.addButton, self.removeButton)
-
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.bottomLayout.addRow(self.buttons)
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-
-        self.mainLayout.addLayout(self.topLayout)
-        self.mainLayout.addLayout(self.bottomLayout)
-        self.setLayout(self.mainLayout)
-
-    def get_config(self):
-        config = {}
-        config["record"] = self.sbRecordNumber.value()
-        config["rd.0"] = self.inputBoxes[0].text()
-        config["stimVolt"] = self.inputBoxes[1].text()
-
-        for i in range(len(self.inputBoxes) - 2):
-            config[self.labelBoxes[i + 2].text()] = self.inputBoxes[i + 2].text()
-
-        return config
-
-    def addWidget(self):
-        # TODO: inputs config will break with this method
-        labelBox = QLineEdit("new_input")
-        inputBox = QLineEdit("ADC8")
-        self.topLayout.addRow(labelBox, inputBox)
-        self.labelBoxes.append(labelBox)
-        self.inputBoxes.append(inputBox)
-
-    def removeWidget(self):
-        if self.topLayout.rowCount() < 5:
-            return
-        self.topLayout.removeRow(self.topLayout.rowCount() - 1)
-        self.labelBoxes.pop()
-        self.inputBoxes.pop()

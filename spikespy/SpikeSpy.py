@@ -64,10 +64,18 @@ from .SingleTraceView import SingleTraceView
 from .SpikeGroupTable import SpikeGroupTableView
 from .TrackingView import TrackingView
 from .UnitView import UnitView
+from .UnitFootprintView import UnitFootprintView
 from .ViewerState import ViewerState, prompt_for_neo_file, tracked_neuron_unit
+from .io_manager import (
+    export_units_csv,
+    export_units_npz,
+    import_units_csv,
+    save_state_to_nix,
+)
 from .EventView import EventView
 from .MultiTraceFixedView import MultiTraceFixedView
 from .UnitSuggestor import UnitSuggestor
+from .open_ephys_addin import OpenEphysLiveView
 import PySide6QtAds as QtAds
 from typing import Dict
 
@@ -78,12 +86,14 @@ window_options = {
     "MultiTrace": MultiTraceView,
     "MultiTraceFixedView": MultiTraceFixedView,
     "UnitView": UnitView,
+    "UnitFootprintView": UnitFootprintView,
     "SpikeGroupTable": SpikeGroupTableView,
     "SingleTraceView": SingleTraceView,
     "Settings": NeoSettingsView,
     "TrackingView": TrackingView,
     "Data": QNeoSelector,
     "Events": EventView,
+    "OpenEphysLive": OpenEphysLiveView,
 }
 suggestors: Dict[str, UnitSuggestor] = {}
 
@@ -338,11 +348,27 @@ class MdiView(QMainWindow):
 
         def move(dist=1, mode=None):
             print(f"move {dist}")
-            cur_point = (
-                self.state.spike_groups[self.state.cur_spike_group].idx_arr[
-                    self.state.stimno
-                ]
-            )[0]
+            sg = self.state.spike_groups[self.state.cur_spike_group]
+            sr = 10000.0
+            if hasattr(self.state, "sampling_rate") and self.state.sampling_rate is not None:
+                sr = float(self.state.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(self.state.sampling_rate, "magnitude") else float(self.state.sampling_rate)
+            elif self.state.analog_signal is not None and hasattr(self.state.analog_signal, "sampling_rate"):
+                sr = float(self.state.analog_signal.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(self.state.analog_signal.sampling_rate, "magnitude") else float(self.state.analog_signal.sampling_rate)
+
+            cur_point = None
+            if self.state.event_signal is not None and self.state.stimno < len(self.state.event_signal) and hasattr(sg, "get_latencies"):
+                cur_ev = self.state.event_signal[self.state.stimno]
+                lat = sg.get_latencies(np.array([cur_ev.magnitude]) * cur_ev.units)[0]
+                if not np.isnan(lat):
+                    cur_point = int(round(float((lat.rescale(pq.s) * sr).magnitude)))
+            elif getattr(sg, "idx_arr", None) is not None and self.state.stimno < len(sg.idx_arr):
+                item = sg.idx_arr[self.state.stimno]
+                if item is not None:
+                    cur_point = item[0]
+
+            if cur_point is None:
+                return
+
             if mode is None:
                 mode = self.move_mode
             if mode == "snap":
@@ -399,19 +425,39 @@ class MdiView(QMainWindow):
         self.shortcut_snap.activated.connect(toggle_snap)
 
         def copy_previous():
-            try:
-                sg = self.state.spike_groups[self.state.cur_spike_group].idx_arr
-                new_x = next(
-                    sg[x][0]
-                    for x in range(self.state.stimno - 1, -1, -1)
-                    if sg[x] is not None
-                )
+            sg = self.state.spike_groups[self.state.cur_spike_group]
+            sr = 10000.0
+            if hasattr(self.state, "sampling_rate") and self.state.sampling_rate is not None:
+                sr = float(self.state.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(self.state.sampling_rate, "magnitude") else float(self.state.sampling_rate)
+            elif self.state.analog_signal is not None and hasattr(self.state.analog_signal, "sampling_rate"):
+                sr = float(self.state.analog_signal.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(self.state.analog_signal.sampling_rate, "magnitude") else float(self.state.analog_signal.sampling_rate)
+
+            new_x = None
+            if self.state.event_signal is not None and self.state.stimno > 0 and hasattr(sg, "get_latencies"):
+                search_evts = self.state.event_signal[0 : self.state.stimno]
+                lats = sg.get_latencies(search_evts)
+                for k in range(len(lats) - 1, -1, -1):
+                    if not np.isnan(lats[k]):
+                        new_x = int(round(float((lats[k].rescale(pq.s) * sr).magnitude)))
+                        break
+            elif getattr(sg, "idx_arr", None) is not None:
+                try:
+                    new_x = next(
+                        sg.idx_arr[x][0]
+                        for x in range(self.state.stimno - 1, -1, -1)
+                        if sg.idx_arr[x] is not None
+                    )
+                except StopIteration:
+                    pass
+
+            if new_x is not None:
                 # localise to nearest peak
                 cur_erp = self.state.get_erp()[self.state.stimno]
-                offset = np.argmax(cur_erp[new_x - 300 : new_x + 300]) - 300
-                self.state.setUnit(new_x + offset)
-            except StopIteration:
-                pass
+                start_w = max(0, new_x - 300)
+                end_w = min(len(cur_erp), new_x + 300)
+                if end_w > start_w:
+                    offset = np.argmax(cur_erp[start_w:end_w]) - (new_x - start_w)
+                    self.state.setUnit(new_x + offset)
 
         self.shortcut_copy_previous = QShortcut(
             QKeySequence(Qt.Key_C), self, context=Qt.ApplicationShortcut
@@ -420,11 +466,9 @@ class MdiView(QMainWindow):
 
     def export_csv(self):
         save_filename = QFileDialog.getSaveFileName(self, "Export")[0]
-
-        if save_filename is None:
+        if not save_filename:
             return
-        units = [x.event for x in self.state.spike_groups]
-        export_csv(save_filename, stim_evt=self.state.event_signal, unit_evts=units)
+        export_units_csv(save_filename, unit_evts=self.state.spike_groups, stim_evt=self.state.event_signal)
 
     def updateRecents(self, filename, type):
 
@@ -458,63 +502,19 @@ class MdiView(QMainWindow):
                 )
             )
 
-    def export_npz(
-        self,
-    ):  # save a condensed analysis package. - should also be able to load these in spikespy
-        from .processing import create_erp_signals
-
-        # erp = self.state.get_erp()
-        timestamps = self.state.event_signal
-        details = {
-            "sampling_rate": self.state.sampling_rate,
-            "unit": "mV",
-            "window_size": self.state.window_size,
-            "original_data": "",  # TODO: get ref. to original file if possible
-        }
-
-        units = self.state.spike_groups
-        units_erps = [
-            create_erp_signals(
-                self.state.analog_signal, e.event, -0.5 * pq.ms, 1 * pq.ms
-            )
-            for e in units
-        ]
-        other_events = self.state.segment.events
-        signal_erps = [
-            create_erp_signals(e, timestamps, -0.5 * pq.ms, 1 * pq.ms)
-            for e in self.state.segment.analogsignals
-        ]
+    def export_npz(self):
+        save_filename = QFileDialog.getSaveFileName(self, "Export NPZ", filter="*.npz")[0]
+        if not save_filename:
+            return
+        export_units_npz(save_filename, self.state)
 
     def import_csv(self):
         open_filename = QFileDialog.getOpenFileName(self, "csv import")[0]
-        if open_filename is None:
+        if not open_filename:
             return
-        from csv import DictReader
-
-        with open(open_filename, "r") as f:
-            r = DictReader(f)
-            try:
-                k = next(x for x in r.fieldnames if "timestamp" in x.lower())
-            except StopIteration:
-                import logging
-
-                logging.warn("StopIteration not found")
-                return
-
-            unit = pq.ms
-            out = {}
-            for row in r:
-                spikeid = str(row.get("SpikeID", "0"))
-                out[spikeid] = out.get(spikeid, []) + [row[k]]
-
-            out2 = []
-            for k, v in out.items():
-                timestamps = neo.Event(
-                    np.array(v, dtype=np.float64), units=unit, name=f"unit_{k}"
-                )
-                out2.append(tracked_neuron_unit(event=timestamps.rescale(pq.s)))
-
-            self.state.set_data(spike_groups=(self.state.spike_groups or []) + out2)
+        imported_units = import_units_csv(open_filename)
+        if imported_units:
+            self.state.set_data(spike_groups=(self.state.spike_groups or []) + imported_units)
 
     def newWindow(self, k, pos=QtAds.TopDockWidgetArea, name=None):
         # TODO: this needs to be smarter. window names must be unique for perspectives. need to be able to recreate old windows by name
@@ -574,89 +574,30 @@ class MdiView(QMainWindow):
         )
 
 
-def save_file(filename, spike_groups, data: neo.Segment = None, metadata=None):
-    """
-    Saves a file containing the spike groups
-    """
-    if metadata is None:
-        metadata = {
-            "current_user": environ.get("USERNAME", environ.get("USER")),
-            "date": datetime.now(),
-        }
-
-    # TODO: we could try just updating the events in an already existing h5
-    if filename is None:
-
-        # check if data is an opened file in rw
-        # check if analogsignals are in file (by nix_name), if not either add of fail.
-        # check if events are in file (by nix_name, and data)
-        # remove changed events, add new ones
-        pass
-    blk = neo.Block(name="main")
-
-    if data is not None:
-        from copy import deepcopy
-
-        data2 = deepcopy(data)
-
-        # remove all 'nix_names' which prevent saving the file
-        for x in [*data2.analogsignals, *data2.events, data2]:
-            if "nix_name" in x.annotations:
-                del x.annotations["nix_name"]
-
-        # extract any multianalogsignals into separate segment
-        for x in data2.analogsignals:
-            if isinstance(x, MultiAnalogSignal):
-                data2.analogsignals.remove(x)
-                new_seg = neo.Segment("ERP")
-                new_seg.analogsignals = x.signals
-                blk.segments.append(new_seg)
-
-        # data2.analogsignals = [x.rescale("mV") for x in data2.analogsignals]
-
-        # remove previous unit annotations
-        data2.events = [
-            x
-            for x in data2.events
-            if not x.name.startswith("unit") and x.annotations.get("type") != "unit"
-        ]
-    else:
-        data2 = neo.Segment()
-
-    for i, x in enumerate(spike_groups):
-        x.event.annotate(**metadata)
-        x.event.name = x.event.name or f"unit_{i}"
-        data2.events.append(x.event)
-
-    blk.segments.append(data2)
-    data2.block = blk
-    if Path(filename).exists():
-        Path(filename).unlink()  # should probably do a user check here...
-    blk.annotations["session_start_time"] = data2.annotations.get(
-        "session_start_time", datetime.now()
-    )
-    output_formats = {"h5": NixIO, "nwb": neo.NWBIO}
-    export_class = output_formats[filename.split(".")[-1]]
-    n = export_class(filename, mode="rw")
-    n.write_block(blk)
-    n.close()
+save_file = save_state_to_nix
 
 
-def align_spikegroup(spikegroup, erp_arr):
+def align_spikegroup(spikegroup, erp_arr, event_signal=None, sampling_rate=10000):
     """given a spike group attempt to align using convolution - note this should go outside of the UI component"""
-    # 1. get spike events as 2d matrix
     window = 200
-    arr = [
-        erp_arr[i, x[0] - window : x[0] + window]
-        for i, x in enumerate(spikegroup.idx_arr)
-    ]
+    arr = []
+    if event_signal is not None and hasattr(spikegroup, "get_latencies"):
+        lats = spikegroup.get_latencies(event_signal)
+        sr = float(sampling_rate.rescale(pq.Hz).magnitude) if hasattr(sampling_rate, "magnitude") else float(sampling_rate)
+        for i, lat in enumerate(lats):
+            if not np.isnan(lat) and i < erp_arr.shape[0]:
+                c_s = int(round(float((lat.rescale(pq.s) * sr).magnitude)))
+                if c_s - window >= 0 and c_s + window <= erp_arr.shape[1]:
+                    arr.append(erp_arr[i, c_s - window : c_s + window])
+    elif getattr(spikegroup, "idx_arr", None) is not None:
+        for i, x in enumerate(spikegroup.idx_arr):
+            if x is not None and i < erp_arr.shape[0]:
+                c_s = x[0]
+                if c_s - window >= 0 and c_s + window <= erp_arr.shape[1]:
+                    arr.append(erp_arr[i, c_s - window : c_s + window])
 
-    # 2. correlate event signals with eachother
-    np.convolve(arr, arr, axis=-1)
-    # 3. take n-best overlaps & create template
-
-    # 4. align all other signals to this template.
-    # TODO
+    if len(arr) > 0:
+        np.convolve(arr, arr, axis=-1)
     pass
 
 
@@ -734,25 +675,14 @@ class InfoDialog(QDialog):
         return out
 
 
-def export_csv(save_filename, unit_evts, stim_evt):
-    with open(save_filename, "w", newline="") as f:
-        w = writer(f)
-        # self.state.segment
-        w.writerow(["SpikeID", "Stimulus_number", "Latency_ms", "Timestamp_ms"])
-        for i, sg in enumerate(unit_evts):
-            nom = sg.name
-            if nom is None or nom == "":
-                nom = f"unit_{i}"
-            for timestamp in sg:
-                stim_no = stim_evt.searchsorted(timestamp) - 1
-                latency = (timestamp - stim_evt[stim_no]).rescale(pq.ms)
-
-                w.writerow([nom, stim_no, latency.base, timestamp.rescale(pq.ms).base])
+export_csv = export_units_csv
 
 
 def register_plugin(plugin_name, plugin_class):
-    suggestors = []
-    if isinstance(plugin_class, UnitSuggestor):
+    is_suggestor = isinstance(plugin_class, UnitSuggestor) or (
+        isinstance(plugin_class, type) and issubclass(plugin_class, UnitSuggestor)
+    )
+    if is_suggestor:
         suggestors[plugin_name] = plugin_class
     else:
         window_options[plugin_name] = plugin_class
