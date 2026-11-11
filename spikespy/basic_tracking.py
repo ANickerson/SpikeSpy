@@ -136,8 +136,69 @@ def track_single_sweep(
     return None
 
 
+def track_sweep_waveform(
+    waveform,
+    sampling_rate,
+    prev_latency,
+    threshold=0.01,
+    window_ms=5.0,
+) -> Optional[int]:
+    """Track a spike peak in a single sweep waveform given previous spike latency.
+    Returns detected sample index (integer) relative to sweep start, or None.
+    """
+    from scipy.signal import find_peaks
 
-# TODO: use peak finding first then windowing. this will (hopefully) prevent runaways
+    if hasattr(waveform, "magnitude"):
+        arr_data = waveform.magnitude
+    else:
+        arr_data = waveform
+    arr = np.asarray(arr_data, dtype=np.float32).flatten()
+
+    sr = float(sampling_rate.rescale(pq.Hz).magnitude if hasattr(sampling_rate, "rescale") else sampling_rate)
+    prev_s = float(prev_latency.rescale(pq.s).magnitude if hasattr(prev_latency, "rescale") else prev_latency)
+    win_s = float((window_ms * pq.ms).rescale(pq.s).magnitude if not hasattr(window_ms, "rescale") else window_ms.rescale(pq.s).magnitude)
+    thresh_val = float(threshold.magnitude if hasattr(threshold, "magnitude") else threshold)
+
+    # If waveform has physical units and threshold is provided as mV or unitless mV,
+    # convert appropriately to match waveform.units
+    if hasattr(waveform, "units"):
+        wf_units_str = str(waveform.units).lower()
+        if hasattr(threshold, "rescale"):
+            thresh_val = float(threshold.rescale(waveform.units).magnitude)
+        elif "uv" in wf_units_str or "µv" in wf_units_str:
+            # threshold is in mV, waveform is in uV: 1 mV = 1000 uV
+            thresh_val = thresh_val * 1000.0
+        elif "v" in wf_units_str and "mv" not in wf_units_str:
+            # waveform in V: 1 mV = 0.001 V
+            thresh_val = thresh_val * 0.001
+
+    if thresh_val < 0:
+        flip = True
+        thresh_comp = -thresh_val
+    else:
+        flip = False
+        thresh_comp = thresh_val
+
+    prev_sample = int(round(prev_s * sr))
+    half_win = max(1, int(round((win_s / 2.0) * sr)))
+    start_s = max(0, prev_sample - half_win)
+    end_s = min(len(arr), prev_sample + half_win + 1)
+    if end_s <= start_s:
+        return None
+
+    snip = -arr[start_s:end_s] if flip else arr[start_s:end_s]
+    peaks, _ = find_peaks(snip, height=thresh_comp)
+
+    if len(peaks) > 0:
+        target = prev_sample - start_s
+        chosen_peak_offset = int(peaks[np.argmin(np.abs(peaks - target))])
+        return start_s + chosen_peak_offset
+    elif len(snip) > 0 and np.max(snip) >= thresh_comp:
+        chosen_peak_offset = int(np.argmax(snip))
+        return start_s + chosen_peak_offset
+
+    return None
+
 
 
 def test_track_basic():

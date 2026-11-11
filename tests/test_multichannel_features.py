@@ -9,6 +9,8 @@ from spikespy.ViewerState import ViewerState, tracked_neuron_unit
 from spikespy.SingleTraceView import SingleTraceView
 from spikespy.UnitView import UnitView
 from spikespy.SpikeGroupTable import SpikeGroupTableView, SpikeGroupTableModel
+from spikespy.TrackingView import TrackingView
+from spikespy.processing import LiveERPBuffer
 
 
 @pytest.fixture
@@ -464,4 +466,128 @@ def test_streaming_rendering_optimizations(qtbot, mock_multichannel_state):
     assert len(vals) == len(live_buf)
 
 
+def test_multi_unit_live_tracking_and_table_toggle(qtbot, mock_multichannel_state):
+    """Verify live multi-unit tracking across different channels, table column toggles, and parameter synchronization."""
+    state = mock_multichannel_state
+    sr = 10000.0 * pq.Hz
 
+    # State already has Unit 0 on CH0. Add Unit 1 on CH1
+    evt1 = neo.Event(state.event_signal.times + (100 / 10000.0) * pq.s, name="unit_1", units=pq.s)
+    evt1.annotations["channel"] = "CH1"
+    evt1.annotations["tracking_channel"] = "CH1"
+    sg1 = tracked_neuron_unit(
+        event=evt1,
+        channel="CH1",
+        tracking_channel="CH1",
+        auto_track=False,
+        tracking_window_ms=6.0,
+        tracking_threshold_mv=0.02,
+    )
+    state.spike_groups.append(sg1)
+    state.segment.events.append(evt1)
+    state.update_idx_arrs()
+
+    # Unit 0 is on CH0
+    sg0 = state.spike_groups[0]
+    sg0.channel = "CH0"
+    sg0.tracking_channel = "CH0"
+    sg0.auto_track = False
+
+    # Instantiate views
+    tbl_view = SpikeGroupTableView(state=state)
+    tr_view = TrackingView(state=state)
+    qtbot.addWidget(tbl_view)
+    qtbot.addWidget(tr_view)
+
+    model = tbl_view.spike_tablemodel
+    assert model.columnCount() == 11
+    assert model.headers[8] == "track"
+    assert model.headers[9] == "win (ms)"
+    assert model.headers[10] == "thresh (mV)"
+
+    # Test column 8 ("track") checkbox toggle via model.setData
+    idx_track_0 = model.index(0, 8)
+    idx_track_1 = model.index(1, 8)
+
+    assert model.data(idx_track_0, Qt.CheckStateRole) == Qt.Unchecked
+    assert sg0.auto_track is False
+
+    # Toggle Unit 0 auto_track to True
+    model.setData(idx_track_0, Qt.Checked, Qt.CheckStateRole)
+    assert sg0.auto_track is True
+    assert sg0.event.annotations["auto_track"] is True
+    assert model.data(idx_track_0, Qt.CheckStateRole) == Qt.Checked
+
+    # Toggle Unit 1 auto_track to True
+    model.setData(idx_track_1, Qt.Checked, Qt.CheckStateRole)
+    assert sg1.auto_track is True
+    assert sg1.event.annotations["auto_track"] is True
+    assert model.data(idx_track_1, Qt.CheckStateRole) == Qt.Checked
+
+    # Test editing column 9 ("win (ms)") and column 10 ("thresh (mV)") in table model
+    idx_win_0 = model.index(0, 9)
+    idx_thresh_0 = model.index(0, 10)
+    model.setData(idx_win_0, 8.0, Qt.EditRole)
+    assert sg0.tracking_window_ms == 8.0
+    assert sg0.event.annotations["tracking_window_ms"] == 8.0
+    assert model.data(idx_win_0, Qt.DisplayRole) == 8.0
+
+    model.setData(idx_thresh_0, 0.03, Qt.EditRole)
+    assert sg0.tracking_threshold_mv == 0.03
+    assert sg0.event.annotations["tracking_threshold_mv"] == 0.03
+    assert model.data(idx_thresh_0, Qt.DisplayRole) == 0.03
+
+    # Test TrackingView parameter synchronization when switching units
+    state.setUnitGroup(0)
+    assert tr_view.lbl_active_unit.text() == "Unit: unit_0"
+    assert tr_view.lbl_unit_channel.text() == "Channel: CH0"
+    assert tr_view.qsb_window_size.value() == 8.0
+    assert abs(tr_view.qsb_threshold.value() - 0.03) < 1e-4
+    assert tr_view.qcb_auto_track.isChecked() is True
+
+    state.setUnitGroup(1)
+    assert tr_view.lbl_active_unit.text() == "Unit: unit_1"
+    assert tr_view.lbl_unit_channel.text() == "Channel: CH1"
+    assert tr_view.qsb_window_size.value() == 6.0
+    assert abs(tr_view.qsb_threshold.value() - 0.02) < 1e-4
+    assert tr_view.qcb_auto_track.isChecked() is True
+
+    # Prepare streaming live buffers for live sweep tracking test
+    # Primary channel CH0 and aux channel CH1
+    live_buf0 = LiveERPBuffer(window_samples=500, units=pq.uV)
+    live_buf1 = LiveERPBuffer(window_samples=500, units=pq.uV)
+
+    # Populate initial sweeps (0 to 4)
+    erp0 = state.get_channel_erp("CH0")
+    erp1 = state.get_channel_erp("CH1")
+    for s_i in range(len(state.event_signal)):
+        live_buf0.append_sweep(erp0[s_i])
+        live_buf1.append_sweep(erp1[s_i])
+
+    state.is_streaming = True
+    state._live_erp_buffer = live_buf0
+    state._live_aux_erp_buffers = {"CH0": live_buf0, "CH1": live_buf1}
+    state.active_channel_names = ["CH0", "CH1"]
+
+    # Sweep 5: spike on CH0 at sample 104, spike on CH1 at sample 106
+    # Note: 50 uV = 0.05 mV >= threshold (0.03 mV for unit 0, 0.02 mV for unit 1)
+    w0_new = np.zeros(500, dtype=np.float32)
+    w0_new[104] = 50.0  # 50 uV peak
+    w1_new = np.zeros(500, dtype=np.float32)
+    w1_new[106] = 50.0
+
+    # Append new sweep with 2D array or aux_sweeps dict
+    t_new = state.event_signal.times[-1] + 0.1 * pq.s
+    idx_new = state.append_sweep(
+        stim_timestamp=t_new,
+        sweep_waveform=w0_new,
+        aux_sweeps={"CH1": w1_new},
+    )
+    assert idx_new == 5
+
+    # Verify track_stimulus_all_units automatically tracked both units on their respective channels!
+    assert sg0.idx_arr[5] is not None
+    assert sg0.idx_arr[5][0] == 104
+
+    assert sg1.idx_arr[5] is not None
+    assert sg1.idx_arr[5][0] == 106

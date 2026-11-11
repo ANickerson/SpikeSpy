@@ -278,7 +278,7 @@ def load_file(data_path, type="h5", **kwargs):
 
 
 def export_units_csv(save_filename: str, unit_evts, stim_evt: neo.Event):
-    """Export unit spikes to CSV including Channel and Neighbor_channels metadata."""
+    """Export unit spikes to CSV including Channel, Neighbor_channels, and Tracking metadata."""
     with open(save_filename, "w", newline="") as f:
         w = writer(f)
         w.writerow([
@@ -288,16 +288,31 @@ def export_units_csv(save_filename: str, unit_evts, stim_evt: neo.Event):
             "Timestamp_ms",
             "Channel",
             "Neighbor_channels",
+            "auto_track",
+            "tracking_window_ms",
+            "tracking_threshold_mv",
+            "tracking_max_skips",
+            "tracking_channel",
         ])
         for i, item in enumerate(unit_evts):
             if hasattr(item, "event"):
                 evt = item.event
                 channel = getattr(item, "channel", "") or evt.annotations.get("channel", "")
                 neighbors = getattr(item, "neighbor_channels", []) or evt.annotations.get("neighbor_channels", [])
+                auto_track = getattr(item, "auto_track", False) or evt.annotations.get("auto_track", False)
+                win_ms = getattr(item, "tracking_window_ms", 5.0) if hasattr(item, "tracking_window_ms") else evt.annotations.get("tracking_window_ms", 5.0)
+                thresh_mv = getattr(item, "tracking_threshold_mv", 0.01) if hasattr(item, "tracking_threshold_mv") else evt.annotations.get("tracking_threshold_mv", 0.01)
+                max_skips = getattr(item, "tracking_max_skips", 1) if hasattr(item, "tracking_max_skips") else evt.annotations.get("tracking_max_skips", 1)
+                trk_channel = getattr(item, "tracking_channel", "") or evt.annotations.get("tracking_channel", "")
             else:
                 evt = item
                 channel = evt.annotations.get("channel", "")
                 neighbors = evt.annotations.get("neighbor_channels", [])
+                auto_track = evt.annotations.get("auto_track", False)
+                win_ms = evt.annotations.get("tracking_window_ms", 5.0)
+                thresh_mv = evt.annotations.get("tracking_threshold_mv", 0.01)
+                max_skips = evt.annotations.get("tracking_max_skips", 1)
+                trk_channel = evt.annotations.get("tracking_channel", "")
 
             nom = evt.name or f"unit_{i}"
             neigh_str = ";".join(neighbors) if isinstance(neighbors, (list, tuple)) else str(neighbors)
@@ -319,7 +334,19 @@ def export_units_csv(save_filename: str, unit_evts, stim_evt: neo.Event):
                     lat_val = float("nan")
 
                 ts_ms = float(timestamp.rescale(pq.ms).magnitude)
-                w.writerow([nom, stim_no, lat_val, ts_ms, channel, neigh_str])
+                w.writerow([
+                    nom,
+                    stim_no,
+                    lat_val,
+                    ts_ms,
+                    channel,
+                    neigh_str,
+                    auto_track,
+                    win_ms,
+                    thresh_mv,
+                    max_skips,
+                    trk_channel,
+                ])
 
 
 # Backward compatibility alias
@@ -327,7 +354,7 @@ export_csv = export_units_csv
 
 
 def import_units_csv(open_filename: str):
-    """Import units from CSV, parsing SpikeID, timestamp, channel, and neighbor_channels."""
+    """Import units from CSV, parsing SpikeID, timestamp, channel, neighbor_channels, and tracking metadata."""
     from .ViewerState import tracked_neuron_unit
 
     with open(open_filename, "r") as f:
@@ -345,15 +372,55 @@ def import_units_csv(open_filename: str):
         ch_key = fieldnames_lower.get("channel", None)
         neigh_key = fieldnames_lower.get("neighbor_channels", fieldnames_lower.get("neighbors", None))
         id_key = fieldnames_lower.get("spikeid", "SpikeID")
+        auto_track_key = fieldnames_lower.get("auto_track", None)
+        win_ms_key = fieldnames_lower.get("tracking_window_ms", None)
+        thresh_mv_key = fieldnames_lower.get("tracking_threshold_mv", None)
+        max_skips_key = fieldnames_lower.get("tracking_max_skips", None)
+        trk_ch_key = fieldnames_lower.get("tracking_channel", None)
 
         units_dict: Dict[str, Dict[str, Any]] = {}
         for row in r:
             spikeid = str(row.get(id_key, "0"))
             if spikeid not in units_dict:
+                auto_track_val = False
+                if auto_track_key and row.get(auto_track_key) is not None:
+                    at_raw = row[auto_track_key]
+                    auto_track_val = at_raw.strip().lower() in ("true", "1", "t", "yes") if isinstance(at_raw, str) else bool(at_raw)
+
+                win_ms_val = 5.0
+                if win_ms_key and row.get(win_ms_key):
+                    try:
+                        win_ms_val = float(row[win_ms_key])
+                    except (ValueError, TypeError):
+                        pass
+
+                thresh_mv_val = 0.01
+                if thresh_mv_key and row.get(thresh_mv_key):
+                    try:
+                        thresh_mv_val = float(row[thresh_mv_key])
+                    except (ValueError, TypeError):
+                        pass
+
+                max_skips_val = 1
+                if max_skips_key and row.get(max_skips_key):
+                    try:
+                        max_skips_val = int(float(row[max_skips_key]))
+                    except (ValueError, TypeError):
+                        pass
+
+                trk_ch_val = ""
+                if trk_ch_key and row.get(trk_ch_key):
+                    trk_ch_val = str(row[trk_ch_key])
+
                 units_dict[spikeid] = {
                     "timestamps": [],
                     "channel": row.get(ch_key, "") if ch_key else "",
                     "neighbor_channels": [],
+                    "auto_track": auto_track_val,
+                    "tracking_window_ms": win_ms_val,
+                    "tracking_threshold_mv": thresh_mv_val,
+                    "tracking_max_skips": max_skips_val,
+                    "tracking_channel": trk_ch_val,
                 }
                 if neigh_key and row.get(neigh_key):
                     raw_n = row[neigh_key]
@@ -370,10 +437,21 @@ def import_units_csv(open_filename: str):
             evt.annotations["type"] = "unit"
             evt.annotations["channel"] = v["channel"]
             evt.annotations["neighbor_channels"] = v["neighbor_channels"]
+            evt.annotations["auto_track"] = v["auto_track"]
+            evt.annotations["tracking_window_ms"] = v["tracking_window_ms"]
+            evt.annotations["tracking_threshold_mv"] = v["tracking_threshold_mv"]
+            evt.annotations["tracking_max_skips"] = v["tracking_max_skips"]
+            evt.annotations["tracking_channel"] = v["tracking_channel"]
+
             sg = tracked_neuron_unit(
                 event=evt.rescale(pq.s),
                 channel=v["channel"],
                 neighbor_channels=v["neighbor_channels"],
+                auto_track=v["auto_track"],
+                tracking_window_ms=v["tracking_window_ms"],
+                tracking_threshold_mv=v["tracking_threshold_mv"],
+                tracking_max_skips=v["tracking_max_skips"],
+                tracking_channel=v["tracking_channel"],
             )
             out.append(sg)
 
@@ -460,6 +538,16 @@ def save_state_to_nix(filename: str, spike_groups, data: neo.Segment = None, met
             evt.annotations["fibre_type"] = sg.fibre_type
         if hasattr(sg, "notes") and sg.notes:
             evt.annotations["notes"] = sg.notes
+        if hasattr(sg, "auto_track"):
+            evt.annotations["auto_track"] = sg.auto_track
+        if hasattr(sg, "tracking_window_ms"):
+            evt.annotations["tracking_window_ms"] = sg.tracking_window_ms
+        if hasattr(sg, "tracking_threshold_mv"):
+            evt.annotations["tracking_threshold_mv"] = sg.tracking_threshold_mv
+        if hasattr(sg, "tracking_max_skips"):
+            evt.annotations["tracking_max_skips"] = sg.tracking_max_skips
+        if hasattr(sg, "tracking_channel"):
+            evt.annotations["tracking_channel"] = sg.tracking_channel
         data2.events.append(evt)
 
     blk.segments.append(data2)

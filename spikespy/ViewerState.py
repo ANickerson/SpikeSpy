@@ -59,6 +59,7 @@ from .processing import (
     MultiChannelTemplateMatcher,
     create_erp_signals,
 )
+from . import basic_tracking
 
 lru_numpy_memmap = BoundedERPCache
 
@@ -75,6 +76,12 @@ class tracked_neuron_unit:
     notes: str = ""
     _idx_arr: List[Any] = None
     event: Event = None
+    auto_track: bool = False
+    tracking_window_ms: float = 5.0
+    tracking_threshold_mv: float = 0.01
+    tracking_max_skips: int = 1
+    tracking_channel: str = ""
+    tracking_algorithm: str = "basic"
 
     def __init__(
         self,
@@ -84,6 +91,12 @@ class tracked_neuron_unit:
         fibre_type: str = "",
         notes: str = "",
         idx_arr: List[Any] = None,
+        auto_track: bool = False,
+        tracking_window_ms: float = 5.0,
+        tracking_threshold_mv: float = 0.01,
+        tracking_max_skips: int = 1,
+        tracking_channel: str = "",
+        tracking_algorithm: str = "basic",
     ):
         self.event = event if event is not None else Event()
         self.channel = channel
@@ -91,6 +104,23 @@ class tracked_neuron_unit:
         self.fibre_type = fibre_type
         self.notes = notes
         self._idx_arr = idx_arr
+
+        ann = getattr(self.event, "annotations", {})
+        self.auto_track = bool(ann.get("auto_track", auto_track))
+        self.tracking_window_ms = float(ann.get("tracking_window_ms", tracking_window_ms))
+        self.tracking_threshold_mv = float(ann.get("tracking_threshold_mv", tracking_threshold_mv))
+        self.tracking_max_skips = int(ann.get("tracking_max_skips", tracking_max_skips))
+        self.tracking_channel = str(ann.get("tracking_channel", tracking_channel))
+        self.tracking_algorithm = str(ann.get("tracking_algorithm", tracking_algorithm))
+
+        # Ensure annotations dictionary has these synced
+        if hasattr(self.event, "annotations"):
+            self.event.annotations["auto_track"] = self.auto_track
+            self.event.annotations["tracking_window_ms"] = self.tracking_window_ms
+            self.event.annotations["tracking_threshold_mv"] = self.tracking_threshold_mv
+            self.event.annotations["tracking_max_skips"] = self.tracking_max_skips
+            self.event.annotations["tracking_channel"] = self.tracking_channel
+            self.event.annotations["tracking_algorithm"] = self.tracking_algorithm
 
     @property
     def idx_arr(self):
@@ -407,22 +437,32 @@ class ViewerState(QObject):
                 self.set_active_channel(sg.channel)
         self.onUnitGroupChange.emit()
 
+    @Slot(int, int, int)
     @Slot(int, int)
-    def setUnit(self, latency, stimno=None):
+    @Slot(int)
+    @Slot()
+    def setUnit(self, latency, stimno=None, unit_idx: Optional[int] = None):
         if stimno is None:
             stimno = self.stimno
-        evt = self.spike_groups[self.cur_spike_group].event
+        if unit_idx is None:
+            unit_idx = self.cur_spike_group
+        if unit_idx < 0 or unit_idx >= len(self.spike_groups):
+            return
+
+        sg = self.spike_groups[unit_idx]
+        evt = sg.event
 
         def undo(
-            x=self.cur_spike_group,
-            evt=self.spike_groups[self.cur_spike_group].event.copy(),
-            stimno=self.stimno,
+            x=unit_idx,
+            evt=sg.event.copy(),
+            stimno=stimno,
             self=self,
         ):
             evt.sort()
-            self.spike_groups[self.cur_spike_group].event = evt
+            self.spike_groups[x].event = evt
             self.update_idx_arrs()
             self.onUnitChange.emit(stimno)
+            self.onNewSpikeEvents.emit(x)
 
         self.save_undo(undo)
 
@@ -433,17 +473,16 @@ class ViewerState(QObject):
                 else False
             )  # Prevent crash on final index
             # TODO: we should remove by index, and also use purely the timestamps not idx_arr
-            self.spike_groups[self.cur_spike_group].event = evt[to_keep]
+            sg.event = evt[to_keep]
             evt = evt[to_keep]
 
-        sg = self.spike_groups[self.cur_spike_group]
         if sg.idx_arr is None:
             sg.idx_arr = []
         while len(sg.idx_arr) <= stimno:
             sg.idx_arr.append(None)
 
         if latency is None:
-            self.spike_groups[self.cur_spike_group].idx_arr[stimno] = None
+            sg.idx_arr[stimno] = None
 
         else:
             if (
@@ -452,9 +491,8 @@ class ViewerState(QObject):
                 prv_lat = np.nan
                 for attempts in range(3):
                     prev_event_time = self.event_signal.times[
-                        self.stimno - 1 - attempts
+                        stimno - 1 - attempts
                     ]
-                    sg = self.getUnitGroup()
                     prv_lat = sg.get_latencies(
                         np.array([prev_event_time]) * prev_event_time.units
                     )[0].rescale("s")
@@ -466,8 +504,7 @@ class ViewerState(QObject):
             elif (
                 latency == -2
             ):  # if latency is -2, we want to find the next spike and use that as the latency
-                next_event_time = self.event_signal.times[self.stimno + 1]
-                sg = self.getUnitGroup()
+                next_event_time = self.event_signal.times[stimno + 1]
                 next_lat = sg.get_latencies(
                     np.array([next_event_time]) * next_event_time.units
                 )[0].rescale("s")
@@ -476,7 +513,7 @@ class ViewerState(QObject):
                         (next_lat * self.analog_signal.sampling_rate).magnitude
                     )
 
-            self.spike_groups[self.cur_spike_group].idx_arr[stimno] = (
+            sg.idx_arr[stimno] = (
                 latency,
                 1,
             )  # TODO: fix
@@ -487,16 +524,14 @@ class ViewerState(QObject):
                 )
             )
             evt2.name = evt.name
-            self.spike_groups[self.cur_spike_group].event = evt2
+            sg.event = evt2
 
             # When annotating a spike on a unit, if sg.channel == "" and self.analog_signal is not None:
             if getattr(sg, "channel", "") == "" and self.analog_signal is not None and getattr(self.analog_signal, "name", ""):
                 sg.channel = self.analog_signal.name
                 sg.event.annotations["channel"] = self.analog_signal.name
 
-        self.spike_groups[
-            self.cur_spike_group
-        ].event.sort()  # TODO: not sure if this breaks the array annotations.
+        sg.event.sort()  # TODO: not sure if this breaks the array annotations.
 
         # Emit onUnitAnnotated with unit details
         lat_samples = int(latency) if latency is not None and latency >= 0 else None
@@ -521,16 +556,17 @@ class ViewerState(QObject):
             else None
         )
         self.onUnitAnnotated.emit({
-            "unit": self.spike_groups[self.cur_spike_group].event.name,
-            "unit_idx": int(self.cur_spike_group),
+            "unit": sg.event.name,
+            "unit_idx": int(unit_idx),
             "stimno": int(stimno),
             "latency_samples": lat_samples,
             "latency_ms": lat_ms,
             "timestamp_s": ts_s,
-            "fibre_type": str(self.spike_groups[self.cur_spike_group].fibre_type),
+            "fibre_type": str(sg.fibre_type),
         })
 
         self.onUnitChange.emit(stimno)
+        self.onNewSpikeEvents.emit(unit_idx)
 
     @Slot(Event)
     def updateUnit(self, event, merge=False):
@@ -570,6 +606,81 @@ class ViewerState(QObject):
         del self.spike_groups[self.cur_spike_group].idx_arr
         self.update_idx_arrs()
         self.onUnitGroupChange.emit()
+
+    def track_stimulus_all_units(self, stimno: int) -> List[dict]:
+        """Track all auto_track enabled units on their respective channels for stimulus index stimno."""
+        results = []
+        if self.event_signal is None or stimno < 0 or stimno >= len(self.event_signal):
+            return results
+
+        sr = float(
+            self.sampling_rate
+            if self.sampling_rate is not None
+            else (
+                self.analog_signal.sampling_rate.rescale(pq.Hz).magnitude
+                if self.analog_signal is not None
+                else 30000.0
+            )
+        )
+
+        for unit_idx, sg in enumerate(self.spike_groups):
+            if not getattr(sg, "auto_track", False):
+                continue
+
+            ch = getattr(sg, "tracking_channel", "") or getattr(sg, "channel", "") or (self.analog_signal.name if self.analog_signal else "")
+            ch_erp = self.get_channel_erp(ch) if ch else self.get_erp()
+            if ch_erp is None:
+                ch_erp = self.get_erp()
+
+            if ch_erp is None or stimno >= len(ch_erp):
+                continue
+
+            # Check if unit already has an annotated spike on this sweep
+            existing_sample = sg.get_sweep_sample(stimno, self.event_signal, sr, self.window_size)
+            if existing_sample is not None:
+                continue
+
+            # Find most recent spike latency in prior sweeps within tracking_max_skips
+            max_skips = getattr(sg, "tracking_max_skips", 1)
+            prev_latency = None
+            min_stim = max(0, stimno - 1 - max_skips)
+            for prev_s in range(stimno - 1, min_stim - 1, -1):
+                prev_sample = sg.get_sweep_sample(prev_s, self.event_signal, sr, self.window_size)
+                if prev_sample is not None:
+                    prev_latency = (prev_sample / sr) * pq.s
+                    break
+                elif getattr(sg, "idx_arr", None) is not None and prev_s < len(sg.idx_arr) and sg.idx_arr[prev_s] is not None:
+                    prev_samp = sg.idx_arr[prev_s][0]
+                    prev_latency = (prev_samp / sr) * pq.s
+                    break
+
+            if prev_latency is None:
+                continue
+
+            sweep_wf = np.asarray(ch_erp[stimno].magnitude if hasattr(ch_erp[stimno], "magnitude") else ch_erp[stimno], dtype=np.float32)
+            thresh_mv = getattr(sg, "tracking_threshold_mv", 0.01)
+            win_ms = getattr(sg, "tracking_window_ms", 5.0)
+
+            detected_sample = basic_tracking.track_sweep_waveform(
+                sweep_wf,
+                sr,
+                prev_latency,
+                threshold=thresh_mv,
+                window_ms=win_ms,
+            )
+
+            if detected_sample is not None:
+                self.setUnit(detected_sample, stimno=stimno, unit_idx=unit_idx)
+                results.append({
+                    "unit_idx": unit_idx,
+                    "unit": sg.event.name,
+                    "stimno": stimno,
+                    "channel": ch,
+                    "sample": detected_sample,
+                    "latency_ms": (detected_sample / sr) * 1000.0,
+                })
+
+        return results
 
     def stimno_offset_to_event(self, stimno, offset):
         """
@@ -1218,6 +1329,10 @@ class ViewerState(QObject):
         # If self.follow_live is True, updates self.stimno = new_stim_idx
         if self.follow_live:
             self.stimno = new_stim_idx
+
+        # Live multi-unit auto-tracking
+        if getattr(self, "auto_track_enabled", False) or any(getattr(sg, "auto_track", False) for sg in self.spike_groups):
+            self.track_stimulus_all_units(new_stim_idx)
 
         # Emits signals
         self.onNewSweep.emit(new_stim_idx)

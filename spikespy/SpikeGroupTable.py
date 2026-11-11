@@ -225,7 +225,7 @@ class SpikeGroupTableModel(QAbstractTableModel):
         )
         self.spikegroups_func = spikegroups_func
         self.spikegroups = self.spikegroups_func()
-        self.headers = ["name", "start", "end", "N", "type", "notes", "channel", "neighbors"]
+        self.headers = ["name", "start", "end", "N", "type", "notes", "channel", "neighbors", "track", "win (ms)", "thresh (mV)"]
         self.annotations_to_show = {
             "notes": "notes",
             "type": "fibre_type",
@@ -262,6 +262,35 @@ class SpikeGroupTableModel(QAbstractTableModel):
         column = index.column()
         row = index.row()
         sg = self.spikegroups_func()[row]
+
+        # Column 8: track checkbox
+        if column == 8:
+            if role == Qt.CheckStateRole:
+                return Qt.Checked if getattr(sg, "auto_track", False) else Qt.Unchecked
+            elif role == Qt.DisplayRole:
+                return ""
+            elif role == Qt.EditRole:
+                return getattr(sg, "auto_track", False)
+            elif role == "SPIKEGROUP_ROLE":
+                return sg
+            return None
+
+        # Column 9: win (ms)
+        if column == 9:
+            if role in (Qt.DisplayRole, Qt.EditRole):
+                return getattr(sg, "tracking_window_ms", 5.0)
+            elif role == "SPIKEGROUP_ROLE":
+                return sg
+            return None
+
+        # Column 10: thresh (mV)
+        if column == 10:
+            if role in (Qt.DisplayRole, Qt.EditRole):
+                return getattr(sg, "tracking_threshold_mv", 0.01)
+            elif role == "SPIKEGROUP_ROLE":
+                return sg
+            return None
+
         if role == Qt.DisplayRole or role == Qt.EditRole:
             if column == 0:  # name / SpikeID
                 return getattr(sg.event, "name", None) or row
@@ -308,10 +337,28 @@ class SpikeGroupTableModel(QAbstractTableModel):
         value: Any,
         role: int = ...,
     ) -> bool:
+        column = index.column()
+        row = index.row()
+        sg = self.spikegroups_func()[row]
+
+        # Column 8: track
+        if column == 8:
+            if role == Qt.CheckStateRole:
+                val = bool(value == Qt.Checked or value == Qt.Checked.value or value is True)
+                sg.auto_track = val
+                if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+                    sg.event.annotations["auto_track"] = val
+                self.dataChanged.emit(index, index)
+                return True
+            elif role == Qt.EditRole:
+                val = bool(value)
+                sg.auto_track = val
+                if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+                    sg.event.annotations["auto_track"] = val
+                self.dataChanged.emit(index, index)
+                return True
+
         if role == Qt.EditRole:
-            column = index.column()
-            row = index.row()
-            sg = self.spikegroups_func()[row]
             if column == 0:
                 sg.event.name = str(value)
                 self.dataChanged.emit(index, index)
@@ -342,15 +389,31 @@ class SpikeGroupTableModel(QAbstractTableModel):
                 sg.event.annotations["neighbor_channels"] = parsed_chans
                 self.dataChanged.emit(index, index)
                 return True
+            elif column == 9:  # win (ms)
+                sg.tracking_window_ms = float(value)
+                if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+                    sg.event.annotations["tracking_window_ms"] = float(value)
+                self.dataChanged.emit(index, index)
+                return True
+            elif column == 10:  # thresh (mV)
+                sg.tracking_threshold_mv = float(value)
+                if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+                    sg.event.annotations["tracking_threshold_mv"] = float(value)
+                self.dataChanged.emit(index, index)
+                return True
 
         return False
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlags:
         flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
-        # Editable columns: name (0), type (4), notes (5), channel (6), neighbors (7)
-        if index.column() in (0, 4, 5, 6, 7):
+        # Column 8: UserCheckable + Editable
+        if index.column() == 8:
+            flags |= Qt.ItemIsUserCheckable | Qt.ItemIsEditable
+        # Columns 0, 4, 5, 6, 7, 9, 10: Editable
+        elif index.column() in (0, 4, 5, 6, 7, 9, 10):
             flags |= Qt.ItemIsEditable
         return flags
+
 
 
 if __name__ == "__main__":

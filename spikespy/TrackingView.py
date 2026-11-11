@@ -14,10 +14,12 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QMainWindow,
     QPushButton,
     QSpinBox,
     QStyle,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -35,11 +37,18 @@ class TrackingView(QMainWindow):
         state: ViewerState = None,
     ) -> None:
         super().__init__(parent)
-        layout = QFormLayout()
         self.state = state
-        w = QWidget()
-        w.setLayout(layout)
-        self.setCentralWidget(w)
+        self._syncing = False
+
+        main_vbox = QVBoxLayout()
+        header_layout = QHBoxLayout()
+        self.lbl_active_unit = QLabel("Unit: unit_0")
+        self.lbl_unit_channel = QLabel("Channel: CH0")
+        header_layout.addWidget(self.lbl_active_unit)
+        header_layout.addWidget(self.lbl_unit_channel)
+        main_vbox.addLayout(header_layout)
+
+        layout = QFormLayout()
 
         qsb_window_size = QDoubleSpinBox(self)
         qsb_window_size.setMinimumWidth(100)
@@ -49,7 +58,6 @@ class TrackingView(QMainWindow):
         qsb_window_size.setValue(5)
         qsb_window_size.setSingleStep(0.5)
         self.qsb_window_size = qsb_window_size
-
         layout.addRow(self.tr("window size (ms)"), qsb_window_size)
 
         qsb_threshold = QDoubleSpinBox(self)
@@ -59,8 +67,8 @@ class TrackingView(QMainWindow):
         qsb_threshold.setDecimals(4)
         qsb_threshold.setValue(0.01)
         qsb_threshold.setSingleStep(0.01)
-
         self.qsb_threshold = qsb_threshold
+
         try:
             self.updateThresholdFromUnit()
         except:
@@ -72,7 +80,6 @@ class TrackingView(QMainWindow):
         )
         qbut_threshold_update.clicked.connect(self.updateThresholdFromUnit)
         ql.addWidget(qbut_threshold_update)
-
         layout.addRow(self.tr("Threshold (mV)"), ql)
 
         qsb_max_skip = QSpinBox(self)
@@ -92,82 +99,169 @@ class TrackingView(QMainWindow):
         self.qcb_auto_track = PySide6.QtWidgets.QCheckBox(self.tr("Live Auto-Track"), self)
         layout.addRow(self.qcb_auto_track)
 
-        # qbut_threshold_update.setFixedHeight(20)
-        # layout.addRow(qbut_threshold_update)
         qbut_go = QPushButton("Track")
         layout.addRow(qbut_go)
-
         qbut_go.clicked.connect(self.trackUnit)
 
-        if self.state is not None and hasattr(self.state, "onNewSweep"):
-            self.state.onNewSweep.connect(self.on_new_sweep)
+        # Batch & unit helper buttons
+        self.qbut_apply_all = QPushButton("Apply Params to All Units")
+        self.qbut_apply_all.clicked.connect(self.apply_params_to_all_units)
+        layout.addRow(self.qbut_apply_all)
+
+        btn_row = QHBoxLayout()
+        self.qbut_enable_all = QPushButton("Enable All Units")
+        self.qbut_enable_all.clicked.connect(self.enable_all_units)
+        self.qbut_disable_all = QPushButton("Disable All Units")
+        self.qbut_disable_all.clicked.connect(self.disable_all_units)
+        btn_row.addWidget(self.qbut_enable_all)
+        btn_row.addWidget(self.qbut_disable_all)
+        layout.addRow(btn_row)
+
+        self.qbut_track_all = QPushButton("Track All Enabled Units")
+        self.qbut_track_all.clicked.connect(self.track_all_enabled_units)
+        layout.addRow(self.qbut_track_all)
+
+        main_vbox.addLayout(layout)
+        w = QWidget()
+        w.setLayout(main_vbox)
+        self.setCentralWidget(w)
+
+        # Connect control changes to update active unit
+        self.qsb_window_size.valueChanged.connect(self._on_params_changed)
+        self.qsb_threshold.valueChanged.connect(self._on_params_changed)
+        self.qsb_max_skip.valueChanged.connect(self._on_params_changed)
+        self.qcb_auto_track.toggled.connect(self._on_params_changed)
+
+        if self.state is not None:
+            if hasattr(self.state, "onUnitGroupChange"):
+                self.state.onUnitGroupChange.connect(self.sync_from_active_unit)
+            if hasattr(self.state, "onUnitChange"):
+                self.state.onUnitChange.connect(self.sync_from_active_unit)
+            if hasattr(self.state, "onNewSweep"):
+                self.state.onNewSweep.connect(self.on_new_sweep)
+            self.sync_from_active_unit()
+
+    def sync_from_active_unit(self):
+        if self.state is None:
+            return
+        sg = None
+        try:
+            sg = self.state.getUnitGroup()
+        except Exception:
+            pass
+
+        if sg is None and hasattr(self.state, "spike_groups") and len(self.state.spike_groups) > 0:
+            if 0 <= self.state.cur_spike_group < len(self.state.spike_groups):
+                sg = self.state.spike_groups[self.state.cur_spike_group]
+
+        if sg is None:
+            return
+
+        self._syncing = True
+        self.qsb_window_size.blockSignals(True)
+        self.qsb_threshold.blockSignals(True)
+        self.qsb_max_skip.blockSignals(True)
+        self.qcb_auto_track.blockSignals(True)
+
+        name = getattr(sg.event, "name", "") if (getattr(sg, "event", None) is not None and getattr(sg.event, "name", None)) else f"unit_{self.state.cur_spike_group}"
+        ch = getattr(sg, "tracking_channel", "") or getattr(sg, "channel", "") or "default"
+        self.lbl_active_unit.setText(f"Unit: {name}")
+        self.lbl_unit_channel.setText(f"Channel: {ch}")
+
+        self.qsb_window_size.setValue(float(getattr(sg, "tracking_window_ms", 5.0)))
+        self.qsb_threshold.setValue(float(getattr(sg, "tracking_threshold_mv", 0.01)))
+        self.qsb_max_skip.setValue(int(getattr(sg, "tracking_max_skips", 1)))
+        self.qcb_auto_track.setChecked(bool(getattr(sg, "auto_track", False)))
+
+        self.qsb_window_size.blockSignals(False)
+        self.qsb_threshold.blockSignals(False)
+        self.qsb_max_skip.blockSignals(False)
+        self.qcb_auto_track.blockSignals(False)
+        self._syncing = False
+
+    def _on_params_changed(self, *args):
+        if self._syncing or self.state is None:
+            return
+        sg = None
+        try:
+            sg = self.state.getUnitGroup()
+        except Exception:
+            pass
+        if sg is None and hasattr(self.state, "spike_groups") and 0 <= self.state.cur_spike_group < len(self.state.spike_groups):
+            sg = self.state.spike_groups[self.state.cur_spike_group]
+        if sg is None:
+            return
+
+        win_val = float(self.qsb_window_size.value())
+        thresh_val = float(self.qsb_threshold.value())
+        skip_val = int(self.qsb_max_skip.value())
+        track_val = bool(self.qcb_auto_track.isChecked())
+
+        sg.tracking_window_ms = win_val
+        sg.tracking_threshold_mv = thresh_val
+        sg.tracking_max_skips = skip_val
+        sg.auto_track = track_val
+
+        if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+            sg.event.annotations["tracking_window_ms"] = win_val
+            sg.event.annotations["tracking_threshold_mv"] = thresh_val
+            sg.event.annotations["tracking_max_skips"] = skip_val
+            sg.event.annotations["auto_track"] = track_val
+
+        if hasattr(self.state, "onUnitGroupChange"):
+            self.state.onUnitGroupChange.emit()
+
+    def apply_params_to_all_units(self):
+        if self.state is None or not hasattr(self.state, "spike_groups"):
+            return
+        win_val = float(self.qsb_window_size.value())
+        thresh_val = float(self.qsb_threshold.value())
+        skip_val = int(self.qsb_max_skip.value())
+        for sg in self.state.spike_groups:
+            sg.tracking_window_ms = win_val
+            sg.tracking_threshold_mv = thresh_val
+            sg.tracking_max_skips = skip_val
+            if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+                sg.event.annotations["tracking_window_ms"] = win_val
+                sg.event.annotations["tracking_threshold_mv"] = thresh_val
+                sg.event.annotations["tracking_max_skips"] = skip_val
+        if hasattr(self.state, "onUnitGroupChange"):
+            self.state.onUnitGroupChange.emit()
+
+    def enable_all_units(self):
+        if self.state is None or not hasattr(self.state, "spike_groups"):
+            return
+        for sg in self.state.spike_groups:
+            sg.auto_track = True
+            if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+                sg.event.annotations["auto_track"] = True
+        self.sync_from_active_unit()
+        if hasattr(self.state, "onUnitGroupChange"):
+            self.state.onUnitGroupChange.emit()
+
+    def disable_all_units(self):
+        if self.state is None or not hasattr(self.state, "spike_groups"):
+            return
+        for sg in self.state.spike_groups:
+            sg.auto_track = False
+            if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+                sg.event.annotations["auto_track"] = False
+        self.sync_from_active_unit()
+        if hasattr(self.state, "onUnitGroupChange"):
+            self.state.onUnitGroupChange.emit()
+
+    def track_all_enabled_units(self):
+        if self.state is None or self.state.event_signal is None:
+            return
+        n_sweeps = len(self.state.event_signal)
+        for s in range(n_sweeps):
+            self.state.track_stimulus_all_units(s)
 
     def on_new_sweep(self, stimno: int):
-        if not self.qcb_auto_track.isChecked() or self.state is None:
+        if self.state is None:
             return
-        sg = self.state.getUnitGroup()
-        if sg is None or len(sg.event) == 0:
-            return
+        self.state.track_stimulus_all_units(stimno)
 
-        if self.state.event_signal is None or stimno >= len(self.state.event_signal):
-            return
-
-        # Find the most recent tracked spike in sg within self.qsb_max_skip.value() + 1 sweeps prior to stimno
-        max_skips = self.qsb_max_skip.value() + 1
-        prev_latency = None
-        min_prev = max(stimno - 1 - max_skips, 0)
-        if self.state.event_signal is not None and min_prev < stimno and hasattr(sg, "get_latencies"):
-            search_events = self.state.event_signal[min_prev:stimno]
-            lats = sg.get_latencies(search_events)
-            for k in range(len(lats) - 1, -1, -1):
-                if not np.isnan(lats[k]):
-                    prev_latency = lats[k].rescale(pq.s)
-                    break
-        elif getattr(sg, "idx_arr", None) is not None:
-            for prev_stim in range(stimno - 1, max(stimno - 1 - max_skips, -1), -1):
-                if prev_stim < len(sg.idx_arr) and sg.idx_arr[prev_stim] is not None:
-                    prev_sample = sg.idx_arr[prev_stim][0]
-                    prev_latency = (prev_sample / self.state.sampling_rate) * pq.s
-                    break
-
-        if prev_latency is None:
-            return
-
-        window = self.qsb_window_size.value() * pq.ms
-        threshold = self.qsb_threshold.value() * pq.mV
-        stim_time = self.state.event_signal[stimno]
-        raw_data = self.state.analog_signal
-
-        max_ts = None
-        # Check if basic_tracking has track_single_sweep
-        from . import basic_tracking
-        if hasattr(basic_tracking, "track_single_sweep"):
-            max_ts = basic_tracking.track_single_sweep(raw_data, stim_time, prev_latency, threshold, window)
-        else:
-            flip = False
-            thresh_val = threshold
-            if threshold < 0:
-                flip = True
-                thresh_val = -threshold
-
-            timeslice = raw_data.time_slice(
-                stim_time + prev_latency - (window / 2),
-                stim_time + prev_latency + (window / 2),
-            )
-            if len(timeslice) > 0:
-                ts_data = timeslice * -1 if flip else timeslice
-                max_idx = np.argmax(ts_data)
-                max_val = ts_data[max_idx]
-                if max_val >= thresh_val and thresh_val >= 0:
-                    max_ts = timeslice.times[max_idx]
-
-        if max_ts is not None:
-            latency_samples = int(
-                np.round(
-                    ((max_ts - stim_time).rescale("s") * self.state.analog_signal.sampling_rate.rescale("Hz")).magnitude
-                )
-            )
-            self.state.setUnit(latency_samples, stimno=stimno)
 
     def updateThresholdFromUnit(self):
         if self.state is None:
