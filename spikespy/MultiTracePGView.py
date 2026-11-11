@@ -6,8 +6,8 @@ import quantities as pq
 from neo import Event
 
 import PySide6
-from PySide6 import QtCore
-from PySide6.QtCore import Qt, Signal, Slot, QTimer, QRectF
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import Qt, Signal, Slot, QTimer, QRectF, QPointF
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -66,7 +66,8 @@ class EphysTimeAxisItem(pg.AxisItem):
 class MultiTracePGView(QMainWindow):
     """
     High-performance PyQtGraph port of MultiTraceView.
-    Delivers 60 FPS GPU-accelerated waterfall heatmaps and multi-trace visualization.
+    Delivers 60 FPS GPU-accelerated waterfall heatmaps, multi-trace visualization,
+    and interactive click-to-draw polygon corridor spike tracking.
     """
 
     right_ax_data: Dict = {}
@@ -98,7 +99,12 @@ class MultiTracePGView(QMainWindow):
         self.update_timer = QTimer()
         self.update_timer.setSingleShot(True)
         self.update_timer.timeout.connect(self.updateAll)
-        self.update_timer.setInterval(50)  # PyQtGraph can handle much faster updates
+        self.update_timer.setInterval(50)
+
+        # Selector state
+        self.selector_active: bool = False
+        self.selector_points: List[List[float]] = []
+        self.selector_width: float = 100.0  # samples
 
         # Build UI layout
         self._init_ui()
@@ -121,7 +127,6 @@ class MultiTracePGView(QMainWindow):
         self.setup_figure()
 
     def _init_ui(self):
-        # Central widget with GraphicsLayoutWidget
         central = QWidget(self)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -162,14 +167,28 @@ class MultiTracePGView(QMainWindow):
         self.tracked_unit_scatter = pg.ScatterPlotItem(size=8, symbol="s", pen=None, brush=pg.mkBrush(255, 0, 0, 200))
         self.main_plot.addItem(self.tracked_unit_scatter)
 
-        # 5. PolyLine ROI for spike selection
-        self.poly_roi: Optional[pg.PolyLineROI] = None
-        self.roi_corridor_item: Optional[pg.PlotCurveItem] = None
-        self.selector_active: bool = False
-        self.selector_width: float = 10.0  # in ms
+        # 5. Interactive Selector Graphics (Corridor polygon + Polyline with handles)
+        self.corridor_item = QtWidgets.QGraphicsPolygonItem()
+        self.corridor_item.setPen(pg.mkPen("purple", width=1, style=Qt.DashLine))
+        self.corridor_item.setBrush(pg.mkBrush(160, 32, 240, 50))
+        self.corridor_item.setZValue(20)
+        self.main_plot.addItem(self.corridor_item)
+        self.corridor_item.setVisible(False)
 
-        # Handle mouse clicks on the plot scene
+        self.selector_line_item = pg.PlotDataItem(
+            pen=pg.mkPen("purple", width=2),
+            symbol="o",
+            symbolSize=7,
+            symbolBrush=pg.mkBrush("purple"),
+            symbolPen=pg.mkPen("w", width=1),
+        )
+        self.selector_line_item.setZValue(21)
+        self.main_plot.addItem(self.selector_line_item)
+        self.selector_line_item.setVisible(False)
+
+        # Handle mouse clicks and movement
         self.main_plot.scene().sigMouseClicked.connect(self._on_plot_clicked)
+        self.main_plot.scene().sigMouseMoved.connect(self._on_plot_mouse_moved)
 
         layout.addWidget(self.glw)
         self.setCentralWidget(central)
@@ -256,6 +275,7 @@ class MultiTracePGView(QMainWindow):
 
         # Action Buttons
         self.polySelectButton = QPushButton("Selector")
+        self.polySelectButton.setCheckable(True)
         self.polySelectButton.clicked.connect(lambda *args: self.toggle_polySelector())
         toolbar.addWidget(self.polySelectButton)
 
@@ -295,13 +315,66 @@ class MultiTracePGView(QMainWindow):
             self.update_ylim(self.state.stimno)
 
     def _on_plot_clicked(self, event):
-        """Handle single clicks to select stimulus sweep without interfering with drag-panning."""
+        """Handle clicks on the plot for both normal sweep navigation and selector point placement."""
+        pos = self.main_plot.vb.mapSceneToView(event.scenePos())
+
+        # If selector is active, left-click adds a vertex, right-click removes the last vertex
+        if self.selector_active:
+            if event.button() == Qt.LeftButton:
+                self.selector_points.append([float(pos.x()), float(pos.y())])
+                self._redraw_selector()
+                event.accept()
+                return
+            elif event.button() == Qt.RightButton:
+                if self.selector_points:
+                    self.selector_points.pop()
+                    self._redraw_selector()
+                    event.accept()
+                    return
+
+        # Normal mode: single left-click selects stimulus sweep
         if event.button() == Qt.LeftButton:
-            pos = self.main_plot.vb.mapSceneToView(event.scenePos())
             stimno = int(round(pos.y()))
             if self.state and self.state.event_signal is not None:
                 if 0 <= stimno < len(self.state.event_signal):
                     self.state.setStimNo(stimno)
+
+    def _on_plot_mouse_moved(self, scene_pos):
+        """Draw dynamic preview from the last point to cursor when selector is active."""
+        if not self.selector_active or len(self.selector_points) == 0:
+            return
+        pos = self.main_plot.vb.mapSceneToView(scene_pos)
+        pts = self.selector_points + [[float(pos.x()), float(pos.y())]]
+        self._update_selector_graphics(pts)
+
+    def _redraw_selector(self):
+        if not self.selector_active:
+            self.selector_line_item.setVisible(False)
+            self.corridor_item.setVisible(False)
+            return
+        self._update_selector_graphics(self.selector_points)
+
+    def _update_selector_graphics(self, pts_list: List[List[float]]):
+        if len(pts_list) == 0:
+            self.selector_line_item.setVisible(False)
+            self.corridor_item.setVisible(False)
+            return
+
+        pts = np.array(pts_list)
+        self.selector_line_item.setData(pts[:, 0], pts[:, 1])
+        self.selector_line_item.setVisible(True)
+
+        if len(pts) >= 2:
+            w = self.selector_width
+            upper = pts + np.array([w / 2.0, 0.0])
+            lower = pts - np.array([w / 2.0, 0.0])
+            lower = lower[::-1]
+            poly_points = np.vstack([upper, lower, upper[0]])
+            qpoly = QtGui.QPolygonF([QPointF(float(p[0]), float(p[1])) for p in poly_points])
+            self.corridor_item.setPolygon(qpoly)
+            self.corridor_item.setVisible(True)
+        else:
+            self.corridor_item.setVisible(False)
 
     def set_state(self, state: ViewerState):
         self.remove_references()
@@ -431,7 +504,6 @@ class MultiTracePGView(QMainWindow):
         if self.state is None or self.state.event_signal is None:
             return
 
-        # Clear existing legend and others
         for item in self.legend_items:
             self.main_plot.removeItem(item)
         self.legend_items.clear()
@@ -450,7 +522,7 @@ class MultiTracePGView(QMainWindow):
                 c = SET2_COLORS[i % len(SET2_COLORS)]
 
                 if i == self.state.cur_spike_group:
-                    continue  # plotted below with red highlight
+                    continue
 
                 scat = pg.ScatterPlotItem(
                     x=pts_arr[:, 0],
@@ -550,14 +622,12 @@ class MultiTracePGView(QMainWindow):
         self.plot_right_axis()
 
     def plot_right_axis(self):
-        # Remove existing right subplots from the layout
         for p in self.right_plots.values():
             self.glw.removeItem(p)
         self.right_plots.clear()
 
         active_axes = [(k, v) for k, v in self.right_ax_data.items() if self.rightPlots.get(k, False)]
         if not active_axes:
-            # Stretch main plot to fill window completely
             self.glw.ci.layout.setColumnStretchFactor(0, 1)
             return
 
@@ -579,28 +649,21 @@ class MultiTracePGView(QMainWindow):
     # --- PolyLine Selection and Peak Tracking ---
 
     def toggle_polySelector(self, mode: Optional[bool] = None):
-        self.selector_active = mode if mode is not None else (not self.selector_active)
-        if self.selector_active:
-            if self.poly_roi is None:
-                # Initialize ROI across central vertical range
-                y_range = self.main_plot.viewRange()[1]
-                x_range = self.main_plot.viewRange()[0]
-                y_mid = (y_range[0] + y_range[1]) / 2
-                x_mid = (x_range[0] + x_range[1]) / 2
-                pts = [[x_mid, y_range[0] + 5], [x_mid, y_range[1] - 5]]
-                self.poly_roi = pg.PolyLineROI(pts, closed=False, pen=pg.mkPen("purple", width=2))
-                self.poly_roi.sigRegionChanged.connect(self._update_roi_corridor)
-                self.main_plot.addItem(self.poly_roi)
+        new_active = mode if mode is not None else (not self.selector_active)
+        self.selector_active = new_active
+        self.polySelectButton.setChecked(self.selector_active)
 
-            self.poly_roi.setVisible(True)
-            self._update_roi_corridor()
+        if self.selector_active:
+            self.selector_points = []
+            self.main_plot.setCursor(Qt.CrossCursor)
+            self.main_plot.vb.setMouseEnabled(x=False, y=False)  # disable pan while clicking vertices
             self.dialogPolySelect.show()
             self.dialogPolySelect.change()
         else:
-            if self.poly_roi:
-                self.poly_roi.setVisible(False)
-            if self.roi_corridor_item:
-                self.roi_corridor_item.setVisible(False)
+            self.selector_points = []
+            self.main_plot.setCursor(Qt.ArrowCursor)
+            self.main_plot.vb.setMouseEnabled(x=True, y=True)
+            self._redraw_selector()
             self.dialogPolySelect.hide()
 
     def _on_selector_window_change(self, window_size_ms: float, min_thresh: float):
@@ -608,74 +671,50 @@ class MultiTracePGView(QMainWindow):
             sr = float(self.state.analog_signal.sampling_rate.magnitude)
             self.selector_width = (window_size_ms / 1000.0) * sr
         else:
-            self.selector_width = 10.0
-        self._update_roi_corridor()
-
-    def _update_roi_corridor(self):
-        if not self.selector_active or self.poly_roi is None:
-            return
-        handles = self.poly_roi.getHandles()
-        if len(handles) < 2:
-            return
-        coords = [self.poly_roi.mapToParent(h.pos()) for h in handles]
-        xys = np.array([(p.x(), p.y()) for p in coords])
-        w = self.selector_width
-
-        upper = xys + np.array([w / 2, 0])
-        lower = xys - np.array([w / 2, 0])
-        lower = lower[::-1]
-        poly_points = np.vstack([upper, lower, upper[0]])
-
-        if self.roi_corridor_item is None:
-            self.roi_corridor_item = pg.PlotCurveItem(
-                pen=pg.mkPen("purple", width=1, style=Qt.DashLine),
-                brush=pg.mkBrush(128, 0, 128, 40),
-                fillLevel=0,
-            )
-            self.main_plot.addItem(self.roi_corridor_item)
-
-        self.roi_corridor_item.setData(poly_points[:, 0], poly_points[:, 1])
-        self.roi_corridor_item.setVisible(True)
+            self.selector_width = 100.0
+        self._redraw_selector()
 
     def polySelect(self):
-        """Interpolate across line selector vertices and detect unit spikes."""
-        if self.poly_roi is None or self.state is None:
+        """Interpolate across drawn selector vertices and detect unit action potentials."""
+        if len(self.selector_points) < 2 or self.state is None:
+            self.toggle_polySelector(False)
             return
 
         window_size_ms, min_peak = self.dialogPolySelect.getValues()
-        handles = self.poly_roi.getHandles()
-        if len(handles) < 2:
-            return
-
-        coords = [self.poly_roi.mapToParent(h.pos()) for h in handles]
-        xys = np.array([(p.x(), p.y()) for p in coords])
+        xys = np.array(self.selector_points, dtype=float)
 
         sr = float(self.state.analog_signal.sampling_rate.magnitude)
-        window_size = int(sr * window_size_ms / 1000)
+        window_size = int(sr * window_size_ms / 1000.0)
         erp = self.state.get_erp()
         if erp is None:
+            self.toggle_polySelector(False)
             return
 
         out = []
-        for i in range(xys.shape[0] - 1):
+        for i in range(len(xys) - 1):
             seg = np.array([xys[i], xys[i + 1]], dtype=float)
             seg = seg[np.argsort(seg[:, 1])]  # sort by sweep index
 
-            stimpos = np.arange(int(seg[0, 1]), int(seg[1, 1]))
+            start_stim = int(round(seg[0, 1]))
+            end_stim = int(round(seg[1, 1]))
+            stimpos = np.arange(start_stim, end_stim + 1)
             if len(stimpos) == 0:
                 continue
+
             arr = np.interp(stimpos, seg[:, 1], seg[:, 0])
             for x, stimno in zip(arr, stimpos):
                 if stimno >= erp.shape[0] or stimno < 0:
                     continue
                 x2 = int(x - (window_size // 2))
-                vals = erp[stimno, max(0, x2) : min(erp.shape[1], x2 + window_size)]
-                if len(vals) == 0:
+                x_start = max(0, x2)
+                x_end = min(erp.shape[1], x2 + window_size)
+                if x_end <= x_start:
                     continue
-                x2_offset = np.argmax((1 if min_peak >= 0 else -1) * vals)
+                vals = erp[stimno, x_start:x_end]
+                x2_offset = int(np.argmax((1 if min_peak >= 0 else -1) * vals))
                 peak_val = vals[x2_offset]
                 if (1 if min_peak >= 0 else -1) * peak_val > abs(min_peak):
-                    out.append((x2 + x2_offset, stimno, peak_val))
+                    out.append((x_start + x2_offset, stimno, peak_val))
 
         if len(out) > 0:
             out_arr = np.array(out)

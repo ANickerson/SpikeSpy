@@ -60,14 +60,17 @@ from spikespy.processing import MultiAnalogSignal
 from .mng_file_selector import QNeoSelector
 from .MultiTraceView import MultiTraceView
 from .MultiTracePGView import MultiTracePGView
-from .NeoSettingsView import NeoSettingsView
+from .MultiTraceFixedView import MultiTraceFixedView
+from .MultiTraceFixedPGView import MultiTraceFixedPGView
+from .UnitView import UnitView
+from .UnitPGView import UnitPGView
 from .SingleTraceView import SingleTraceView
+from .SingleTracePGView import SingleTracePGView
+from .NeoSettingsView import NeoSettingsView
 from .SpikeGroupTable import SpikeGroupTableView
 from .TrackingView import TrackingView
-from .UnitView import UnitView
 from .ViewerState import ViewerState, prompt_for_neo_file, tracked_neuron_unit
 from .EventView import EventView
-from .MultiTraceFixedView import MultiTraceFixedView
 from .UnitSuggestor import UnitSuggestor
 import PySide6QtAds as QtAds
 from typing import Dict
@@ -79,9 +82,12 @@ window_options = {
     "MultiTrace": MultiTraceView,
     "MultiTrace (PyQtGraph)": MultiTracePGView,
     "MultiTraceFixedView": MultiTraceFixedView,
+    "MultiTraceFixedView (PyQtGraph)": MultiTraceFixedPGView,
     "UnitView": UnitView,
-    "SpikeGroupTable": SpikeGroupTableView,
+    "UnitView (PyQtGraph)": UnitPGView,
     "SingleTraceView": SingleTraceView,
+    "SingleTraceView (PyQtGraph)": SingleTracePGView,
+    "SpikeGroupTable": SpikeGroupTableView,
     "Settings": NeoSettingsView,
     "TrackingView": TrackingView,
     "Data": QNeoSelector,
