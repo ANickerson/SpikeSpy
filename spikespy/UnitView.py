@@ -10,7 +10,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvas, NavigationToolbar2QT
 from matplotlib.figure import Figure
 from matplotlib.path import Path
 from matplotlib.widgets import PolygonSelector
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, Signal, Slot
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, Signal, Slot, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -55,6 +55,22 @@ class UnitView(QMatplotlib):
         self.mean_line = None
         super().__init__(state=state, parent=parent, include_matplotlib_toolbar=True)
 
+        self.render_count: int = 0
+        self._dirty: bool = False
+        self._user_hidden: bool = False
+        self.render_timer = QTimer(self)
+        interval = (
+            self.state.get_ui_refresh_rate_ms()
+            if self.state and hasattr(self.state, "get_ui_refresh_rate_ms")
+            else 33
+        )
+        self.render_timer.setInterval(interval)
+        self.render_timer.timeout.connect(self._on_render_timer_tick)
+        self.render_timer.start()
+
+        if self.state and hasattr(self.state, "onUIRefreshRateChange"):
+            self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
+
         self.chk_show_neighbors = QCheckBox("Show Neighbor Channels", self)
         self.chk_show_neighbors.setChecked(False)
         self.chk_show_neighbors.setToolTip("Plot the unit's mean action potential waveform across nearby channels")
@@ -71,6 +87,54 @@ class UnitView(QMatplotlib):
 
         self.canvas.mpl_connect("draw_event", draw_evt)
 
+    def is_view_culled(self) -> bool:
+        if getattr(self, "_user_hidden", False):
+            return True
+        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+            return True
+        curr = self
+        while curr.parentWidget() is not None:
+            curr = curr.parentWidget()
+            if curr.isMinimized():
+                return True
+        if self.parentWidget() is not None and not self.isVisible():
+            return True
+        if getattr(self, "_was_shown", False) and not self.isVisible():
+            return True
+        return False
+
+    def _on_render_timer_tick(self):
+        try:
+            if not self.isVisible() or not getattr(self, "_dirty", False):
+                return
+            self._dirty = False
+            self._do_updateAll_core()
+        except RuntimeError:
+            pass
+
+    def setVisible(self, visible: bool):
+        if not visible:
+            self._user_hidden = True
+        else:
+            self._user_hidden = False
+            self._was_shown = True
+        super().setVisible(visible)
+        if visible and getattr(self, "_dirty", False):
+            self._dirty = False
+            self._do_updateAll_core()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._user_hidden = True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._was_shown = True
+        self._user_hidden = False
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self._do_updateAll_core()
+
     def blit(self):
         if self.axes is None or "main" not in self.axes:
             return
@@ -86,10 +150,27 @@ class UnitView(QMatplotlib):
             self.state.onNewSpikeEvents.connect(lambda *args: self.updateAll())
         if hasattr(self.state, "onChannelChange"):
             self.state.onChannelChange.connect(self.updateAll)
+        if hasattr(self.state, "onNewSweep"):
+            self.state.onNewSweep.connect(lambda *args: self.updateAll())
+        if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
+            self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
+            self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
 
     @Slot()
     def updateAll(self):
-        self.figure.clear()
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        self._dirty = False
+        self._do_updateAll_core()
+
+    def _do_updateAll_core(self):
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        self.render_count = getattr(self, "render_count", 0) + 1
+        for ax in list(self.figure.axes):
+            ax.remove()
         self.setup_figure()
 
     def setup_figure(self):

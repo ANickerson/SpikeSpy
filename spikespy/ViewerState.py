@@ -60,6 +60,7 @@ from .processing import (
     create_erp_signals,
 )
 from . import basic_tracking
+from .tracking_worker import LiveTrackingManager
 
 lru_numpy_memmap = BoundedERPCache
 
@@ -342,6 +343,7 @@ class ViewerState(QObject):
     onEventsUpdated = Signal()
     onUnitAnnotated = Signal(dict)
     onChannelChange = Signal(str)
+    onUIRefreshRateChange = Signal(int)
 
     def __init__(self, parent=None, segment=None, spike_groups=None):
         super().__init__(parent)
@@ -358,6 +360,7 @@ class ViewerState(QObject):
         self.undo_queue = []
         self.MAX_UNDO = 10
         self.title = ""
+        self.ui_refresh_rate_ms: int = 33  # ~30 FPS
 
         # Live streaming state attributes
         self.is_streaming: bool = False
@@ -369,6 +372,20 @@ class ViewerState(QObject):
         self._live_channel_signals: dict = {}
         self.active_channel_names: List[str] = []
         self.focus_channels: List[str] = []
+
+        self.tracking_manager = LiveTrackingManager(self)
+        self.tracking_manager.spike_tracked.connect(self._on_async_spike_tracked)
+
+    @Slot(int, int, int)
+    def _on_async_spike_tracked(self, unit_idx: int, detected_sample: int, stimno: int):
+        self.setUnit(detected_sample, stimno=stimno, unit_idx=unit_idx)
+
+    def set_ui_refresh_rate_ms(self, interval_ms: int):
+        self.ui_refresh_rate_ms = max(5, int(interval_ms))
+        self.onUIRefreshRateChange.emit(self.ui_refresh_rate_ms)
+
+    def get_ui_refresh_rate_ms(self) -> int:
+        return getattr(self, "ui_refresh_rate_ms", 33)
 
     def get_available_channels(self) -> List[str]:
         if self.is_streaming and self._live_aux_erp_buffers:
@@ -935,7 +952,7 @@ class ViewerState(QObject):
     def getUnitGroup(self, unit=None):
         if unit is None:
             unit = self.cur_spike_group
-        if unit is None:
+        if unit is None or not self.spike_groups or unit < 0 or unit >= len(self.spike_groups):
             return None
         return self.spike_groups[unit]
 
@@ -1330,9 +1347,9 @@ class ViewerState(QObject):
         if self.follow_live:
             self.stimno = new_stim_idx
 
-        # Live multi-unit auto-tracking
+        # Live multi-unit auto-tracking (asynchronous on background thread pool)
         if getattr(self, "auto_track_enabled", False) or any(getattr(sg, "auto_track", False) for sg in self.spike_groups):
-            self.track_stimulus_all_units(new_stim_idx)
+            self.tracking_manager.track_stimulus_async(self, new_stim_idx)
 
         # Emits signals
         self.onNewSweep.emit(new_stim_idx)

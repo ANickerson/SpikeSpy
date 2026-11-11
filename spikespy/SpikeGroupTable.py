@@ -3,7 +3,7 @@ from typing import Any, List, Optional, Union
 import PySide6
 
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, Signal, Slot
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, Signal, Slot, QTimer
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -39,6 +39,23 @@ class SpikeGroupTableView(QWidget):
         state: ViewerState = None,
     ) -> None:
         super().__init__(parent)
+        self.render_count: int = 0
+        self._dirty: bool = False
+        self._user_hidden: bool = False
+
+        self.update_timer = QTimer(self)
+        interval = (
+            state.get_ui_refresh_rate_ms()
+            if state and hasattr(state, "get_ui_refresh_rate_ms")
+            else 33
+        )
+        self.update_timer.setInterval(interval)
+        self.update_timer.timeout.connect(self._on_render_timer_tick)
+        self.update_timer.start()
+
+        if state and hasattr(state, "onUIRefreshRateChange"):
+            state.onUIRefreshRateChange.connect(self.update_timer.setInterval)
+
         self.spike_tablemodel = SpikeGroupTableModel(lambda: state.spike_groups)
 
         self.tbl = SpikeGroupTableView2(self)
@@ -50,6 +67,8 @@ class SpikeGroupTableView(QWidget):
             state.onLoadNewFile.connect(self.update)
             if hasattr(state, "onNewSpikeEvents"):
                 state.onNewSpikeEvents.connect(self.update)
+            if hasattr(state, "onNewSweep"):
+                state.onNewSweep.connect(self.update)
 
         self.tbl.setSelectionBehavior(QTableView.SelectRows)
         # self.tbl.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -126,7 +145,66 @@ class SpikeGroupTableView(QWidget):
                 if ch and hasattr(self.state, "set_active_channel"):
                     self.state.set_active_channel(ch)
 
+    def is_view_culled(self) -> bool:
+        if getattr(self, "_user_hidden", False):
+            return True
+        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+            return True
+        curr = self
+        while curr.parentWidget() is not None:
+            curr = curr.parentWidget()
+            if curr.isMinimized():
+                return True
+        if self.parentWidget() is not None and not self.isVisible():
+            return True
+        if getattr(self, "_was_shown", False) and not self.isVisible():
+            return True
+        return False
+
+    def _on_render_timer_tick(self):
+        try:
+            if not self.isVisible() or not getattr(self, "_dirty", False):
+                return
+            self._dirty = False
+            self._do_update_core()
+        except RuntimeError:
+            pass
+
+    def setVisible(self, visible: bool):
+        if not visible:
+            self._user_hidden = True
+        else:
+            self._user_hidden = False
+            self._was_shown = True
+        super().setVisible(visible)
+        if visible and getattr(self, "_dirty", False):
+            self._dirty = False
+            self._do_update_core()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._user_hidden = True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._was_shown = True
+        self._user_hidden = False
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self._do_update_core()
+
     def update(self):
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        self._dirty = False
+        self._do_update_core()
+
+    def _do_update_core(self):
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        self.render_count = getattr(self, "render_count", 0) + 1
         self.spike_tablemodel.update()
         # Ensure the correct row is selected as per state
         if self.state is None:

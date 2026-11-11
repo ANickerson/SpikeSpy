@@ -153,8 +153,24 @@ class SingleTraceView(QMainWindow):
 
         self.setCentralWidget(self.view)
 
+        self.render_count: int = 0
+        self._dirty: bool = False
+        self._user_hidden: bool = False
+        self.render_timer = QTimer(self)
+        interval = (
+            self.state.get_ui_refresh_rate_ms()
+            if self.state and hasattr(self.state, "get_ui_refresh_rate_ms")
+            else 33
+        )
+        self.render_timer.setInterval(interval)
+        self.render_timer.timeout.connect(self._on_render_timer_tick)
+        self.render_timer.start()
+
+        if self.state and hasattr(self.state, "onUIRefreshRateChange"):
+            self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
+
         # connect to signals
-        self.updateFigure = qsignal_throttle(self.updateFigure_core, 3)
+        self.updateFigure = self._mark_dirty_and_schedule
 
         self.updateHistogram = qsignal_throttle(self.updateHistogram_core, 1000)
 
@@ -620,14 +636,64 @@ class SingleTraceView(QMainWindow):
         )
         self._histogram_dirty = False
 
-    # @Slot()
-    # def updateFigure(self):
+    def _mark_dirty_and_schedule(self, *args, **kwargs):
+        self._dirty = True
 
-    #     if not self.updateFigure.isActive():
+    def is_view_culled(self) -> bool:
+        if getattr(self, "_user_hidden", False):
+            return True
+        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+            return True
+        curr = self
+        while curr.parentWidget() is not None:
+            curr = curr.parentWidget()
+            if curr.isMinimized():
+                return True
+        if self.parentWidget() is not None and not self.isVisible():
+            return True
+        if getattr(self, "_was_shown", False) and not self.isVisible():
+            return True
+        return False
 
-    #         self.updateFigure.start()
+    def _on_render_timer_tick(self):
+        try:
+            if not self.isVisible():
+                return
+            if not getattr(self, "_dirty", False):
+                return
+            self._dirty = False
+            self.updateFigure_core()
+        except RuntimeError:
+            pass
+
+    def setVisible(self, visible: bool):
+        if not visible:
+            self._user_hidden = True
+        else:
+            self._user_hidden = False
+            self._was_shown = True
+        super().setVisible(visible)
+        if visible and getattr(self, "_dirty", False):
+            self._dirty = False
+            self.updateFigure_core()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._user_hidden = True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._was_shown = True
+        self._user_hidden = False
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self.updateFigure_core()
 
     def updateFigure_core(self):
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        self.render_count = getattr(self, "render_count", 0) + 1
         if self.state is None:
             return
         if self.state.analog_signal is None or self.state.event_signal is None or len(self.state.event_signal) == 0:

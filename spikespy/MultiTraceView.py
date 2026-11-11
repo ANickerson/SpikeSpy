@@ -268,8 +268,25 @@ class MultiTraceView(QMainWindow):
         self.references = []
         self.Patches = {}
         self._last_settings_segment = None
+        self.render_count: int = 0
+        self._dirty: bool = False
+        self._user_hidden: bool = False
         self.messages = None
         self.legend = None
+
+        # Throttled render timer (30 FPS or configured)
+        self.render_timer = QTimer(self)
+        interval = (
+            self.state.get_ui_refresh_rate_ms()
+            if self.state and hasattr(self.state, "get_ui_refresh_rate_ms")
+            else 33
+        )
+        self.render_timer.setInterval(interval)
+        self.render_timer.timeout.connect(self._on_render_timer_tick)
+        self.render_timer.start()
+
+        if self.state and hasattr(self.state, "onUIRefreshRateChange"):
+            self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
 
         # throttle the update for upateAll to every 500ms when using the comboboxes.
         self.update_timer = QTimer()
@@ -642,11 +659,69 @@ class MultiTraceView(QMainWindow):
         if hasattr(self.state, "onNewSpikeEvents"):
             self.references.append(self.state.onNewSpikeEvents.connect(lambda *args: self.render()))
 
+        if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
+            self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
+            self.references.append(self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval))
+
         self.update_axis()
         # self.state.onUnitChange.connect(lambda x:self.reset_right_axes_data())
         self.reset_right_axes_data()
 
+    def is_view_culled(self) -> bool:
+        if getattr(self, "_user_hidden", False):
+            return True
+        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+            return True
+        curr = self
+        while curr.parentWidget() is not None:
+            curr = curr.parentWidget()
+            if curr.isMinimized():
+                return True
+        if self.parentWidget() is not None and not self.isVisible():
+            return True
+        if getattr(self, "_was_shown", False) and not self.isVisible():
+            return True
+        return False
+
+    def _on_render_timer_tick(self):
+        try:
+            if not self.isVisible():
+                return
+            if not getattr(self, "_dirty", False):
+                return
+            self._dirty = False
+            self.on_new_sweep(self.state.stimno if self.state else 0)
+        except RuntimeError:
+            pass
+
+    def setVisible(self, visible: bool):
+        if not visible:
+            self._user_hidden = True
+        else:
+            self._user_hidden = False
+            self._was_shown = True
+        super().setVisible(visible)
+        if visible and getattr(self, "_dirty", False):
+            self._dirty = False
+            self.on_new_sweep(self.state.stimno if self.state else 0)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._user_hidden = True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._was_shown = True
+        self._user_hidden = False
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self.on_new_sweep(self.state.stimno if self.state else 0)
+
     def on_new_sweep(self, stimno: int):
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        self.render_count = getattr(self, "render_count", 0) + 1
         if self.state is None:
             return
         erp = self.state.get_erp()
@@ -734,7 +809,13 @@ class MultiTraceView(QMainWindow):
             self.right_ax_data = {
                 "Stim. Freq. (Hz)": stimFreq_data,
             }
-        for x in self.state.segment.analogsignals:
+        sigs_to_check = []
+        if getattr(self.state, "segment", None) is not None and getattr(self.state.segment, "analogsignals", None):
+            sigs_to_check = list(self.state.segment.analogsignals)
+        elif getattr(self.state, "analog_signal", None) is not None:
+            sigs_to_check = [self.state.analog_signal]
+
+        for x in sigs_to_check:
             try:
                 if (
                     getattr(self.state, "is_streaming", False)
@@ -1058,6 +1139,10 @@ class MultiTraceView(QMainWindow):
 
     # @qsignal_throttle_wrapper(interval=33)
     def render(self):
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        self.render_count = getattr(self, "render_count", 0) + 1
 
         self.view.draw_idle()
 

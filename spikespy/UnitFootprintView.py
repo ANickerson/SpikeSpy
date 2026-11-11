@@ -107,10 +107,28 @@ class UnitFootprintView(QMainWindow):
         self.matplotlib_toolbar = NavigationToolbar2QT(self.canvas, self)
         self.addToolBar(self.matplotlib_toolbar)
 
-        # Throttling timer for smooth streaming updates
+        self.render_count: int = 0
+        self._dirty: bool = False
+        self._user_hidden: bool = False
+
+        # Throttled render timer (30 FPS or configured)
+        self.render_timer = QTimer(self)
+        interval = (
+            self.state.get_ui_refresh_rate_ms()
+            if self.state and hasattr(self.state, "get_ui_refresh_rate_ms")
+            else 33
+        )
+        self.render_timer.setInterval(interval)
+        self.render_timer.timeout.connect(self._on_render_timer_tick)
+        self.render_timer.start()
+
+        if self.state and hasattr(self.state, "onUIRefreshRateChange"):
+            self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
+
+        # Legacy update_timer retained for compatibility
         self.update_timer = QTimer(self)
         self.update_timer.setSingleShot(True)
-        self.update_timer.setInterval(200)
+        self.update_timer.setInterval(33)
         self.update_timer.timeout.connect(self.update_plot)
 
         # Signal connections for UI controls
@@ -127,6 +145,54 @@ class UnitFootprintView(QMainWindow):
         if state is not None:
             self.setState(state)
 
+    def is_view_culled(self) -> bool:
+        if getattr(self, "_user_hidden", False):
+            return True
+        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+            return True
+        curr = self
+        while curr.parentWidget() is not None:
+            curr = curr.parentWidget()
+            if curr.isMinimized():
+                return True
+        if self.parentWidget() is not None and not self.isVisible():
+            return True
+        if getattr(self, "_was_shown", False) and not self.isVisible():
+            return True
+        return False
+
+    def _on_render_timer_tick(self):
+        try:
+            if not self.isVisible() or not getattr(self, "_dirty", False):
+                return
+            self._dirty = False
+            self._do_update_plot()
+        except RuntimeError:
+            pass
+
+    def setVisible(self, visible: bool):
+        if not visible:
+            self._user_hidden = True
+        else:
+            self._user_hidden = False
+            self._was_shown = True
+        super().setVisible(visible)
+        if visible and getattr(self, "_dirty", False):
+            self._dirty = False
+            self._do_update_plot()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._user_hidden = True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._was_shown = True
+        self._user_hidden = False
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self._do_update_plot()
+
     def setState(self, state: ViewerState):
         self.state = state
         if self.state is not None:
@@ -142,11 +208,13 @@ class UnitFootprintView(QMainWindow):
                 self.state.onChannelChange.connect(lambda *args: self.schedule_update())
             if hasattr(self.state, "onNewSweep"):
                 self.state.onNewSweep.connect(lambda *args: self.schedule_update())
+            if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
+                self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
+                self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
         self.update_plot()
 
     def schedule_update(self):
-        if not self.update_timer.isActive():
-            self.update_timer.start()
+        self._dirty = True
 
     def compute_unit_footprint(
         self,
@@ -407,7 +475,21 @@ class UnitFootprintView(QMainWindow):
         if hasattr(self, "update_timer") and self.update_timer.isActive():
             self.update_timer.stop()
 
-        self.figure.clear()
+        if self.is_view_culled():
+            self._dirty = True
+            return
+
+        self._dirty = False
+        self._do_update_plot()
+
+    def _do_update_plot(self):
+        if self.is_view_culled():
+            self._dirty = True
+            return
+
+        self.render_count = getattr(self, "render_count", 0) + 1
+        for ax in list(self.figure.axes):
+            ax.remove()
         self.ax_heat = None
         self.ax_bar = None
         self.current_channels = []
