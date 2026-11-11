@@ -59,6 +59,7 @@ from spikespy.processing import MultiAnalogSignal
 # import PySide6QtAds as QtAds
 from .mng_file_selector import QNeoSelector
 from .MultiTraceView import MultiTraceView
+from .MultiTracePGView import MultiTracePGView
 from .NeoSettingsView import NeoSettingsView
 from .SingleTraceView import SingleTraceView
 from .SpikeGroupTable import SpikeGroupTableView
@@ -76,6 +77,7 @@ mplstyle.use("fast")
 window_options = {
     # 'TraceAnnotation': TraceView,
     "MultiTrace": MultiTraceView,
+    "MultiTrace (PyQtGraph)": MultiTracePGView,
     "MultiTraceFixedView": MultiTraceFixedView,
     "UnitView": UnitView,
     "SpikeGroupTable": SpikeGroupTableView,
