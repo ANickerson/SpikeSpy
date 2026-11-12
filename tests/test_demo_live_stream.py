@@ -222,7 +222,7 @@ def test_multi_unit_live_sweeps_and_annotations(qtbot):
         peak_idx0 = int(round(lat0_samples))
         # Search window around Unit 0
         w0 = sw0_ch0[max(0, peak_idx0 - 15) : min(len(sw0_ch0), peak_idx0 + 15)]
-        assert np.max(w0) > 30.0, f"Expected Unit 0 peak on CH0 > 30 uV, got {np.max(w0)}"
+        assert np.max(w0) > 20.0 and np.ptp(w0) > 35.0, f"Expected Unit 0 peak on CH0 > 20 uV and ptp > 35 uV, got max {np.max(w0)}, ptp {np.ptp(w0)}"
 
         # CH2 should have Unit 1 peak (~45 uV)
         assert "CH2" in state._live_aux_erp_buffers

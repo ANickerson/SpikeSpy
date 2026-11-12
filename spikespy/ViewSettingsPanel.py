@@ -317,8 +317,8 @@ class ViewSettingsPanel(QWidget):
             self.grp_fixed.setVisible(True)
             self._populate_fixed(view)
 
-        # Detect UnitView / UnitFootprintView
-        elif "UnitView" in c_name or "UnitFootprintView" in c_name or "UnitPG" in c_name:
+        # Detect UnitView / UnitFootprint (Matplotlib or PG)
+        elif "UnitView" in c_name or "UnitFootprint" in c_name or "UnitPG" in c_name:
             self.grp_unit.setVisible(True)
             self._populate_unit(view)
 

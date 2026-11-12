@@ -181,7 +181,8 @@ class ChannelGroupContainerView(QMainWindow):
         m_units = menu.addMenu("Unit Analysis")
         m_units.addAction("UnitView (Matplotlib)", lambda: self.add_view_by_key("UnitView"))
         m_units.addAction("UnitView (PyQtGraph)", lambda: self.add_view_by_key("UnitPG"))
-        m_units.addAction("UnitFootprintView", lambda: self.add_view_by_key("UnitFootprintView"))
+        m_units.addAction("UnitFootprint (Matplotlib)", lambda: self.add_view_by_key("UnitFootprintView"))
+        m_units.addAction("UnitFootprint (PyQtGraph)", lambda: self.add_view_by_key("UnitFootprintPG"))
 
         # Nested Channel Group
         menu.addSeparator()
@@ -309,6 +310,7 @@ class ChannelGroupContainerView(QMainWindow):
             "SingleTracePG": "SingleTrace (PyQtGraph)",
             "MultiTraceFixedPG": "MultiTraceFixed (PyQtGraph)",
             "UnitPG": "UnitView (PyQtGraph)",
+            "UnitFootprintPG": "UnitFootprint (PyQtGraph)",
             "ChannelGroupContainer": "ChannelGroupContainer",
         }
         lookup = alias_map.get(key, key)
@@ -323,6 +325,8 @@ class ChannelGroupContainerView(QMainWindow):
                         from .MultiTracePGView import MultiTracePGView as cls
                     elif "SingleTrace" in key:
                         from .SingleTracePGView import SingleTracePGView as cls
+                    elif "UnitFootprint" in key or "Footprint" in key:
+                        from .UnitFootprintPGView import UnitFootprintPGView as cls
                     elif "Unit" in key:
                         from .UnitPGView import UnitPGView as cls
                 except Exception as e:

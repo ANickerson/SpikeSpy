@@ -3,12 +3,9 @@ from dataclasses import dataclass, field
 from re import I
 from typing import Any, List, Optional, Union
 
-import matplotlib.style as mplstyle
 import numpy as np
 import PySide6
 import quantities as pq
-from matplotlib.path import Path
-from matplotlib.widgets import PolygonSelector
 from PySide6.QtWidgets import (
     QApplication,
     QDoubleSpinBox,
@@ -26,8 +23,6 @@ from PySide6.QtWidgets import (
 from .basic_tracking import track_basic
 from .ViewerState import ViewerState
 from neo import Event
-
-mplstyle.use("fast")
 
 
 class TrackingView(QMainWindow):

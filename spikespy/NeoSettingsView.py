@@ -1,13 +1,10 @@
 from typing import Any, List, Optional, Union
 
-import matplotlib.style as mplstyle
 import neo
 import PySide6
 from PySide6.QtWidgets import QCheckBox, QComboBox, QFormLayout, QMainWindow, QWidget, QSpinBox
 import quantities as pq
 from .ViewerState import ViewerState
-
-mplstyle.use("fast")
 
 
 class NeoSettingsView(QMainWindow):

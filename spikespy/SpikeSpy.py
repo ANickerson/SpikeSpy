@@ -90,6 +90,7 @@ try:
     from .MultiTraceFixedPGView import MultiTraceFixedPGView
     from .SingleTracePGView import SingleTracePGView
     from .UnitPGView import UnitPGView
+    from .UnitFootprintPGView import UnitFootprintPGView
     _has_pg = True
 except Exception as _e:
     logging.warning(f"PyQtGraph views not loaded: {_e}")
@@ -121,6 +122,7 @@ if _has_pg:
             "MultiTraceFixed (PyQtGraph)": MultiTraceFixedPGView,
             "SingleTrace (PyQtGraph)": SingleTracePGView,
             "UnitView (PyQtGraph)": UnitPGView,
+            "UnitFootprint (PyQtGraph)": UnitFootprintPGView,
         }
     )
 
@@ -423,7 +425,9 @@ class MdiView(QMainWindow):
         menu_unit.addAction("UnitView (Matplotlib)", lambda: self.newWindow("UnitView"))
         if "UnitView (PyQtGraph)" in self.window_options:
             menu_unit.addAction("UnitView (PyQtGraph)", lambda: self.newWindow("UnitView (PyQtGraph)"))
-        menu_unit.addAction("UnitFootprintView", lambda: self.newWindow("UnitFootprintView"))
+        menu_unit.addAction("UnitFootprintView (Matplotlib)", lambda: self.newWindow("UnitFootprintView"))
+        if "UnitFootprint (PyQtGraph)" in self.window_options:
+            menu_unit.addAction("UnitFootprint (PyQtGraph)", lambda: self.newWindow("UnitFootprint (PyQtGraph)"))
 
         menu_channels = add_panel_menu.addMenu("Channel Groups")
         menu_channels.addAction("Channel Group Sub-Window", lambda: self.newWindow("ChannelGroupContainer"))
@@ -849,6 +853,7 @@ class MdiView(QMainWindow):
             "MultiTraceFixed (PyQtGraph)",
             "SingleTrace (PyQtGraph)",
             "UnitView (PyQtGraph)",
+            "UnitFootprint (PyQtGraph)",
         )
         should_wrap = wrap_in_channel_group or (
             wrap_in_channel_group is None and (target_unit is not None or channels is not None)
