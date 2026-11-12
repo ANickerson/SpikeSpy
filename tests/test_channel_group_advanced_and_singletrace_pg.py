@@ -240,3 +240,126 @@ def test_channel_group_container_settings_persistence(mock_multichannel_state):
     container.close()
     new_container.close()
     app.processEvents()
+
+
+def test_multitrace_pg_single_channel_heatmap_respects_group(mock_multichannel_state):
+    """Verify MultiTracePGView displays a heatmap of only one channel respecting its channel group."""
+    app = QApplication.instance() or QApplication([])
+
+    container = ChannelGroupContainerView(state=mock_multichannel_state, name="Heatmap Group")
+    mt_pg = MultiTracePGView(parent=container, state=mock_multichannel_state)
+    container.add_view(mt_pg, title="MultiTracePG")
+
+    # 1. Child's channel bar is deferred / hidden
+    assert hasattr(mt_pg, "channel_bar")
+    assert mt_pg.channel_bar.isHidden()
+
+    # 2. Bind container to single channel CH4
+    container.channel_bar.bind_to_channel("CH4")
+    app.processEvents()
+
+    # mt_pg should resolve primary channel as CH4
+    assert mt_pg.channel_bar.get_primary_channel() == "CH4"
+    erp = mt_pg.get_erp_signal()
+    assert erp is not None
+    erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
+    # CH4 has peak at sample 250 (value 60.0), whereas CH0 has peak at sample 100
+    assert np.argmax(erp_mag[0]) == 250
+    assert erp_mag[0, 250] == pytest.approx(60.0)
+    assert erp_mag[0, 100] == pytest.approx(0.0)
+
+    # 3. Bind container to a channel group with multiple channels (e.g. ["CH4", "CH5", "CH6"])
+    # and turn on Multi-Channel in container
+    mock_multichannel_state.add_channel_group("Group_456", ["CH4", "CH5", "CH6"])
+    container.channel_bar.bind_to_group("Group_456")
+    container.channel_bar.chk_multichannel.setChecked(True)
+    app.processEvents()
+
+    # MultiTracePGView must show a heatmap ONLY of one channel (primary channel CH4), not multi-channel blended
+    primary_ch = mt_pg.channel_bar.get_primary_channel()
+    assert primary_ch == "CH4"
+    erp_group = mt_pg.get_erp_signal()
+    assert erp_group.shape == (6, 5000)
+    erp_group_mag = erp_group.magnitude if hasattr(erp_group, "magnitude") else erp_group
+    assert np.argmax(erp_group_mag[0]) == 250
+    assert erp_group_mag[0, 250] == pytest.approx(60.0)
+
+    # 4. Switch container back to CH0
+    container.channel_bar.bind_to_channel("CH0")
+    app.processEvents()
+    assert mt_pg.channel_bar.get_primary_channel() == "CH0"
+    erp_ch0 = mt_pg.get_erp_signal()
+    erp_ch0_mag = erp_ch0.magnitude if hasattr(erp_ch0, "magnitude") else erp_ch0
+    assert np.argmax(erp_ch0_mag[0]) == 100
+    assert erp_ch0_mag[0, 100] == pytest.approx(50.0)
+
+    container.close()
+    app.processEvents()
+
+
+def test_multitrace_pg_tracked_unit_strictly_shows_bound_unit(mock_multichannel_state):
+    """Verify MultiTracePGView tracked unit only displays the bound unit and not all units."""
+    app = QApplication.instance() or QApplication([])
+
+    # Add a 3rd unit (unit_2) with distinct latency
+    times = mock_multichannel_state.event_signal.times
+    evt2 = neo.Event(times + (400 / 10000.0) * pq.s, name="unit_2", units=pq.s)
+    evt2.annotations["channel"] = "CH6"
+    u2 = tracked_neuron_unit(event=evt2, channel="CH6")
+    mock_multichannel_state.spike_groups.append(u2)
+    mock_multichannel_state.update_idx_arrs()
+
+    assert len(mock_multichannel_state.spike_groups) == 3
+
+    container = ChannelGroupContainerView(state=mock_multichannel_state, name="Units Test Group")
+    mt_pg = MultiTracePGView(parent=container, state=mock_multichannel_state)
+    container.add_view(mt_pg, title="MultiTracePG")
+
+    # Global active unit is Unit 0
+    mock_multichannel_state.cur_spike_group = 0
+
+    # 1. Bind container to Unit 1
+    container.channel_bar.bind_to_unit(1)
+    app.processEvents()
+
+    assert mt_pg.get_target_unit_idx() == 1
+    assert mt_pg.includeUnitCheckbox.isChecked() is True
+    assert mt_pg.includeAllUnitsCheckBox.isChecked() is False
+
+    # Check scatter data for tracked unit
+    tracked_data = mt_pg.tracked_unit_scatter.getData()
+    x_pts, y_pts = tracked_data[0], tracked_data[1]
+    assert len(x_pts) == 6  # 6 sweeps
+    # Unit 1's spikes are all around sample 250
+    assert np.all(x_pts == 250)
+    # Unit 0's spikes (sample 100) and Unit 2's spikes (sample 400) must NOT be in tracked_unit_scatter
+    assert not np.any(x_pts == 100)
+    assert not np.any(x_pts == 400)
+    assert len(mt_pg.other_unit_scatters) == 0
+
+    # 2. Switch container to Unit 2
+    container.channel_bar.bind_to_unit(2)
+    app.processEvents()
+
+    assert mt_pg.get_target_unit_idx() == 2
+    tracked_data2 = mt_pg.tracked_unit_scatter.getData()
+    x_pts2, y_pts2 = tracked_data2[0], tracked_data2[1]
+    assert len(x_pts2) == 6
+    # Unit 2's spikes are all at sample 400
+    assert np.all(x_pts2 == 400)
+    assert not np.any(x_pts2 == 100)
+    assert not np.any(x_pts2 == 250)
+
+    # 3. Enable "Others" checkbox
+    mt_pg.includeAllUnitsCheckBox.setChecked(True)
+    app.processEvents()
+
+    # Now other_unit_scatters should contain the other 2 units (Unit 0 and Unit 1)
+    assert len(mt_pg.other_unit_scatters) == 2
+    # But tracked_unit_scatter still strictly contains only Unit 2
+    tracked_data_still_u2 = mt_pg.tracked_unit_scatter.getData()
+    assert np.all(tracked_data_still_u2[0] == 400)
+
+    container.close()
+    app.processEvents()
+

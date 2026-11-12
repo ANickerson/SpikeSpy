@@ -653,6 +653,16 @@ class ChannelGroupBar(QToolBar):
             self.state.set_unit_channels(u_idx, channels)
             self.set_channel_mode_unit()
 
+    def bind_to_channel(self, channel: str):
+        """Programmatically select a single channel."""
+        self.bind_to_channels([str(channel)])
+
+    def bind_to_group(self, group_name: str):
+        """Programmatically select a saved channel group."""
+        idx = self.find_channel_data_index(self.MODE_GROUP, group_name)
+        if idx >= 0:
+            self.combo_channel.setCurrentIndex(idx)
+
     def bind_to_shared_set(self, set_name: str = "Shared Group A"):
         """Locks channel selection to a shared channel set and enables multi-channel display."""
         idx = self.find_channel_data_index(self.MODE_SHARED_SET, set_name)

@@ -26,6 +26,7 @@ import pyqtgraph as pg
 import matplotlib.pyplot as plt
 
 from .ViewerState import ViewerState, tracked_neuron_unit
+from .ChannelGroupBar import ChannelGroupBar
 from .MultiTraceView import DialogSignalSelect, DialogPolySelect, DialogDeleteRegion
 from .helpers import qsignal_throttle
 
@@ -314,7 +315,58 @@ class MultiTracePGView(QMainWindow):
         resetViewBtn.clicked.connect(self.update_axis)
         toolbar.addWidget(resetViewBtn)
 
+        # Independent channel group and unit binding toolbar
+        self.channel_bar = ChannelGroupBar(parent=self, state=self.state)
+        self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
+        self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+        self.addToolBarBreak()
         self.addToolBar(Qt.TopToolBarArea, toolbar)
+
+    def _on_channel_bar_changed(self):
+        self.update_window_title()
+        self.setup_figure()
+        self.render()
+
+    def update_window_title(self):
+        if hasattr(self, "channel_bar"):
+            summary = self.channel_bar.get_title_summary()
+            self.setWindowTitle(f"MultiTrace (PyQtGraph) {summary}")
+            p = self.parentWidget()
+            if p is not None and hasattr(p, "setWindowTitle"):
+                p.setWindowTitle(f"MultiTrace (PyQtGraph) {summary}")
+
+    def get_target_unit(self) -> Optional[tracked_neuron_unit]:
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            return self.channel_bar.get_target_unit()
+        if self.state and 0 <= self.state.cur_spike_group < len(self.state.spike_groups):
+            return self.state.spike_groups[self.state.cur_spike_group]
+        return None
+
+    def get_target_unit_idx(self) -> int:
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            return self.channel_bar.get_target_unit_idx()
+        return getattr(self.state, "cur_spike_group", 0) if self.state else 0
+
+    def get_erp_signal(self):
+        if self.state is None:
+            return None
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            primary_ch = self.channel_bar.get_primary_channel()
+            if primary_ch and hasattr(self.state, "get_channel_erp"):
+                erp = self.state.get_channel_erp(primary_ch)
+                if erp is not None and len(erp) > 0:
+                    return erp
+        return self.state.get_erp()
+
+    def get_live_buffer(self):
+        if self.state is None or not getattr(self.state, "is_streaming", False):
+            return None
+        primary = self.channel_bar.get_primary_channel() if hasattr(self, "channel_bar") and self.channel_bar is not None else getattr(getattr(self.state, "analog_signal", None), "name", None)
+        if hasattr(self.state, "_live_aux_erp_buffers") and primary in self.state._live_aux_erp_buffers:
+            return self.state._live_aux_erp_buffers[primary]
+        if self.state.analog_signal is not None and primary == self.state.analog_signal.name:
+            return getattr(self.state, "_live_erp_buffer", None)
+        return getattr(self.state, "_live_erp_buffer", None)
 
     def _on_lock_changed(self):
         self.lock_to_stim = self.lock_to_stimCheckBox.isChecked()
@@ -424,6 +476,8 @@ class MultiTracePGView(QMainWindow):
     def set_state(self, state: ViewerState):
         self.remove_references()
         self.state = state
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            self.channel_bar.setState(state)
         if self.state is None:
             return
 
@@ -447,6 +501,7 @@ class MultiTracePGView(QMainWindow):
 
         self.update_axis()
         self.reset_right_axes_data()
+        self.update_window_title()
 
     def on_new_sweep(self, stimno: Optional[int] = None):
         if self.is_view_culled():
@@ -455,14 +510,11 @@ class MultiTracePGView(QMainWindow):
         if self.state is None:
             return
 
-        primary = getattr(getattr(self.state, "analog_signal", None), "name", None)
-        live_buf = getattr(self.state, "_live_aux_erp_buffers", {}).get(
-            primary, getattr(self.state, "_live_erp_buffer", None)
-        )
-        if getattr(self.state, "is_streaming", False) and live_buf is not None and len(live_buf) > 0:
+        live_buf = self.get_live_buffer()
+        if live_buf is not None and len(live_buf) > 0:
             erp = live_buf.data
         else:
-            erp = self.state.get_erp()
+            erp = self.get_erp_signal()
 
         if erp is None or len(erp) == 0:
             return
@@ -552,7 +604,7 @@ class MultiTracePGView(QMainWindow):
     def update_axis(self):
         if self.state is None or self.state.analog_signal is None or self.state.event_signal is None:
             return
-        erp = self.state.analog_signal_erp
+        erp = self.get_erp_signal()
         if erp is None or len(erp) == 0:
             return
 
@@ -582,14 +634,11 @@ class MultiTracePGView(QMainWindow):
         if self.state is None or self.state.analog_signal is None or self.state.event_signal is None:
             return
 
-        primary = getattr(getattr(self.state, "analog_signal", None), "name", None)
-        live_buf = getattr(self.state, "_live_aux_erp_buffers", {}).get(
-            primary, getattr(self.state, "_live_erp_buffer", None)
-        )
-        if getattr(self.state, "is_streaming", False) and live_buf is not None and len(live_buf) > 0:
+        live_buf = self.get_live_buffer()
+        if live_buf is not None and len(live_buf) > 0:
             erp = live_buf.data
         else:
-            erp = self.state.get_erp()
+            erp = self.get_erp_signal()
 
         if erp is None or len(erp) == 0:
             return
@@ -646,7 +695,7 @@ class MultiTracePGView(QMainWindow):
             return
         self.stim_line.setValue(stimNo)
         if self.mode == "lines" and self.state is not None:
-            erp = self.state.get_erp()
+            erp = self.get_erp_signal()
             if erp is not None and len(erp) > stimNo >= 0:
                 erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
                 p90 = float(self.std.magnitude if hasattr(self.std, "magnitude") else self.std) * 10
@@ -660,24 +709,31 @@ class MultiTracePGView(QMainWindow):
             return
 
         for item in self.legend_items:
-            self.main_plot.removeItem(item)
+            try:
+                self.main_plot.removeItem(item)
+            except Exception:
+                pass
         self.legend_items.clear()
 
         for scat in self.other_unit_scatters:
-            self.main_plot.removeItem(scat)
+            try:
+                self.main_plot.removeItem(scat)
+            except Exception:
+                pass
         self.other_unit_scatters.clear()
 
-        # 1. Other Units
+        target_unit_idx = self.get_target_unit_idx()
+
+        # 1. Other Units (only if "Others" checkbox is checked)
         if self.includeAllUnitsCheckBox.isChecked():
             for i, unit in enumerate(self.state.spike_groups):
+                if i == target_unit_idx:
+                    continue
                 points = [(a[0], s_idx) for s_idx, a in enumerate(unit.idx_arr) if a is not None]
                 if not points:
                     continue
                 pts_arr = np.array(points)
                 c = SET2_COLORS[i % len(SET2_COLORS)]
-
-                if i == self.state.cur_spike_group:
-                    continue
 
                 scat = pg.ScatterPlotItem(
                     x=pts_arr[:, 0],
@@ -690,16 +746,16 @@ class MultiTracePGView(QMainWindow):
                 self.main_plot.addItem(scat)
                 self.other_unit_scatters.append(scat)
 
-                if self.showLegend.isChecked():
+                if hasattr(self, "showLegend") and self.showLegend.isChecked():
                     unit_name = unit.event.name or str(i)
                     lbl = pg.TextItem(text=unit_name, color=c, fill=pg.mkBrush(255, 255, 255, 220))
                     lbl.setPos(pts_arr[0, 0], pts_arr[0, 1])
                     self.main_plot.addItem(lbl)
                     self.legend_items.append(lbl)
 
-        # 2. Tracked Unit (Red)
-        if self.includeUnitCheckbox.isChecked() and self.state.cur_spike_group < len(self.state.spike_groups):
-            sg = self.state.getUnitGroup(self.state.cur_spike_group)
+        # 2. Tracked Unit (Red) - strictly target_unit_idx only
+        if self.includeUnitCheckbox.isChecked() and 0 <= target_unit_idx < len(self.state.spike_groups):
+            sg = self.state.spike_groups[target_unit_idx]
             points = [(a[0], s_idx) for s_idx, a in enumerate(sg.idx_arr) if a is not None]
             if points:
                 pts_arr = np.array(points)
@@ -713,8 +769,8 @@ class MultiTracePGView(QMainWindow):
                 )
                 self.tracked_unit_scatter.setVisible(True)
 
-                if self.showLegend.isChecked():
-                    unit_name = sg.event.name or str(self.state.cur_spike_group)
+                if hasattr(self, "showLegend") and self.showLegend.isChecked():
+                    unit_name = sg.event.name or str(target_unit_idx)
                     lbl = pg.TextItem(text=unit_name, color=(255, 0, 0), fill=pg.mkBrush(255, 255, 255, 220))
                     lbl.setPos(pts_arr[0, 0], pts_arr[0, 1])
                     self.main_plot.addItem(lbl)
@@ -739,7 +795,7 @@ class MultiTracePGView(QMainWindow):
         else:
             stimFreq_data = (np.array([]), np.array([]))
 
-        ug = self.state.getUnitGroup()
+        ug = self.get_target_unit()
         if ug is not None:
             latencies = ug.get_latencies(self.state.event_signal)
             idx_na = np.isnan(latencies)
@@ -881,10 +937,12 @@ class MultiTracePGView(QMainWindow):
 
         sr = float(self.state.analog_signal.sampling_rate.magnitude)
         window_size = int(sr * window_size_ms / 1000.0)
-        erp = self.state.get_erp()
+        erp = self.get_erp_signal()
         if erp is None:
             self.toggle_polySelector(False)
             return
+
+        target_unit_idx = self.get_target_unit_idx()
 
         out = []
         for i in range(len(xys) - 1):
@@ -915,7 +973,7 @@ class MultiTracePGView(QMainWindow):
         if len(out) > 0:
             out_arr = np.array(out)
             evt = self.state.stimno_offset_to_event(out_arr[:, 1].astype(int), out_arr[:, 0].astype(int))
-            self.state.updateUnit(evt, merge=True)
+            self.state.updateUnit(evt, merge=True, unitid=target_unit_idx)
 
         self.toggle_polySelector(False)
 
@@ -936,13 +994,14 @@ class MultiTracePGView(QMainWindow):
         start_event, end_event = self.dialogDeleteRegion.getValues()
         if self.state is None:
             return
-        erp = self.state.get_erp()
+        erp = self.get_erp_signal()
         if erp is None:
             return
+        target_unit_idx = self.get_target_unit_idx()
         for stimpos in range(int(start_event), int(end_event) + 1):
             if stimpos >= erp.shape[0]:
                 continue
-            self.state.setUnit(None, stimpos)
+            self.state.setUnit(None, stimpos, unit_idx=target_unit_idx)
 
     # --- Message and Display Toggles ---
 
@@ -984,7 +1043,7 @@ class MultiTracePGView(QMainWindow):
 
     def get_settings(self) -> Dict:
         x_range, y_range = self.main_plot.viewRange()
-        return {
+        res = {
             "xlim": x_range,
             "yrange": abs(y_range[1] - y_range[0]),
             "mode": self.mode,
@@ -992,8 +1051,13 @@ class MultiTracePGView(QMainWindow):
             "lock_to_stim": self.lock_to_stim,
             "percentiles": (self.lowerSpinBox.value(), self.upperSpinBox.value()),
         }
+        if hasattr(self, "channel_bar"):
+            res["channel_bar"] = self.channel_bar.get_settings()
+        return res
 
     def set_settings(self, values: Dict):
+        if "channel_bar" in values and hasattr(self, "channel_bar"):
+            self.channel_bar.set_settings(values["channel_bar"])
         if "xlim" in values:
             self.main_plot.setXRange(values["xlim"][0], values["xlim"][1], padding=0)
         if "mode" in values:
