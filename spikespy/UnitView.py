@@ -97,24 +97,20 @@ class UnitView(QMatplotlib):
         try:
             if getattr(self, "_user_hidden", False):
                 return True
-            if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+            win = self.window()
+            if win is not None and win.isMinimized():
                 return True
-            curr = self
-            while curr.parentWidget() is not None:
-                curr = curr.parentWidget()
-                if curr.isMinimized():
-                    return True
             if self.parentWidget() is not None and not self.isVisible():
                 return True
             if getattr(self, "_was_shown", False) and not self.isVisible():
                 return True
             return False
-        except RuntimeError:
-            return True
+        except Exception:
+            return False
 
     def _on_render_timer_tick(self):
         try:
-            if not self.isVisible() or not getattr(self, "_dirty", False):
+            if self.is_view_culled() or not getattr(self, "_dirty", False):
                 return
             self._dirty = False
             self._do_updateAll_core()
@@ -174,10 +170,13 @@ class UnitView(QMatplotlib):
         if hasattr(self.state, "onChannelChange"):
             self.state.onChannelChange.connect(self.updateAll)
         if hasattr(self.state, "onNewSweep"):
-            self.state.onNewSweep.connect(lambda *args: self.updateAll())
+            self.state.onNewSweep.connect(lambda *args: self.schedule_update())
         if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
             self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
             self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
+
+    def schedule_update(self):
+        self._dirty = True
 
     @Slot()
     def updateAll(self):

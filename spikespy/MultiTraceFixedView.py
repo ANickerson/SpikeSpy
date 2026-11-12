@@ -1,6 +1,14 @@
 import sys
 import numpy as np
-from PySide6.QtWidgets import QApplication, QToolBar, QSpinBox
+from PySide6.QtWidgets import (
+    QApplication,
+    QToolBar,
+    QSpinBox,
+    QWidget,
+    QHBoxLayout,
+    QLabel,
+    QDoubleSpinBox,
+)
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt
 from spikespy.QMatplotlib import QMatplotlib
@@ -17,15 +25,52 @@ mplstyle.use("fast")
 class MultiTraceFixedView(QMatplotlib):
     def __init__(self, parent=None, state: ViewerState = None):
         self.connections = []
-        super().__init__(parent=parent, state=state, include_matplotlib_toolbar=True)
         self.settings = {
             "n_lines_pre": 5,
             "n_lines_post": 5,
         }
-        self.channel_bar = ChannelGroupBar(parent=self, state=state)
+        self.channel_bar = ChannelGroupBar(parent=None, state=state)
+        super().__init__(parent=parent, state=state, include_matplotlib_toolbar=True)
+        self.channel_bar.setParent(self)
         self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
         self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+        if state is not None:
+            self.channel_bar.setState(state)
         self.update_window_title()
+
+    def is_view_culled(self) -> bool:
+        try:
+            if getattr(self, "_user_hidden", False):
+                return True
+            win = self.window()
+            if win is not None and win.isMinimized():
+                return True
+            if self.parentWidget() is not None and not self.isVisible():
+                return True
+            if getattr(self, "_was_shown", False) and not self.isVisible():
+                return True
+            return False
+        except Exception:
+            return False
+
+    def update_figure(self, should_clear=False):
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        self._dirty = False
+        super().update_figure(should_clear=should_clear)
+
+    def setVisible(self, visible: bool):
+        super().setVisible(visible)
+        if visible and getattr(self, "_dirty", False):
+            self._dirty = False
+            self.update_figure()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self.update_figure()
 
     def _on_channel_bar_changed(self):
         self.update_window_title()
@@ -61,13 +106,16 @@ class MultiTraceFixedView(QMatplotlib):
             return
         if self.state.event_signal is None or len(self.state.event_signal) == 0:
             return
-        if self.get_settings().get("scale") is None:
+        if hasattr(self, "channel_bar"):
+            primary_ch = self.channel_bar.get_primary_channel()
+            erp = self.state.get_channel_erp(primary_ch)
+        else:
             erp = self.state.get_erp()
-            if erp is None or len(erp) == 0 or erp.shape[0] == 0:
-                return
-            erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
-            ylim = float(np.std(np.abs(erp_mag)) or 1.0) * 8
-            self.settings["scale"] = float(np.round(1 / ylim, decimals=4))
+        if erp is None or len(erp) == 0 or erp.shape[0] == 0:
+            return
+        erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
+        ylim = float(np.std(np.abs(erp_mag)) or 1.0) * 8
+        self.settings["scale"] = float(np.round(1 / ylim, decimals=4))
 
     def onLoadNewFile(self):
         super().onLoadNewFile()
@@ -199,10 +247,27 @@ class MultiTraceFixedView(QMatplotlib):
 
         if erp is None or len(erp) == 0 or erp.shape[0] == 0:
             return False
+        if self.get_settings().get("scale") is None:
+            self.set_scale_setting()
+            if hasattr(self, "scale_spinner") and "scale" in self.settings:
+                self.scale_spinner.blockSignals(True)
+                self.scale_spinner.setValue(self.settings["scale"])
+                self.scale_spinner.blockSignals(False)
         n_lines_pre = self.get_settings().get("n_lines_pre", 10)
         n_lines_post = self.get_settings().get("n_lines_post", 10)
         scale = self.get_settings().get("scale", 1)
         scale = float(scale.magnitude if hasattr(scale, "magnitude") else scale)
+
+        sr = (
+            float(self.state.sampling_rate.rescale("Hz").magnitude)
+            if hasattr(self.state.sampling_rate, "rescale")
+            else float(self.state.sampling_rate)
+        )
+        total_time = erp.shape[-1] / sr
+        cur_xlim = self.ax.get_xlim()
+        if cur_xlim == (0.0, 0.5) or cur_xlim[1] != total_time:
+            self.ax.set_xlim(0, total_time)
+
         stimno = self.state.stimno
         start = max(stimno - n_lines_pre, 0)
         stop = min(start + n_lines_pre + n_lines_post + 1, len(erp))

@@ -317,7 +317,11 @@ class SingleTraceView(QMainWindow):
         erp = self.state.get_erp()
         if erp is None or erp.shape[0] == 0:
             return
+        if not getattr(self, "_setup_done", False) or self.trace_line_cache is None:
+            self.setupFigure()
+            self._setup_done = True
         self.updateFigure()
+
 
     @Slot()
     def view_clicked(self, e: MouseEvent):
@@ -344,6 +348,7 @@ class SingleTraceView(QMainWindow):
         if erp is None or erp.shape[0] == 0:
             return
 
+        self._setup_done = True
         self.ax.grid(True, which="both")
         if self.trace_line_cache is not None:
             self.trace_line_cache.remove()
@@ -693,24 +698,20 @@ class SingleTraceView(QMainWindow):
         try:
             if getattr(self, "_user_hidden", False):
                 return True
-            if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+            win = self.window()
+            if win is not None and win.isMinimized():
                 return True
-            curr = self
-            while curr.parentWidget() is not None:
-                curr = curr.parentWidget()
-                if curr.isMinimized():
-                    return True
             if self.parentWidget() is not None and not self.isVisible():
                 return True
             if getattr(self, "_was_shown", False) and not self.isVisible():
                 return True
             return False
-        except RuntimeError:
-            return True
+        except Exception:
+            return False
 
     def _on_render_timer_tick(self):
         try:
-            if not self.isVisible():
+            if self.is_view_culled():
                 return
             if not getattr(self, "_dirty", False):
                 return
@@ -733,6 +734,13 @@ class SingleTraceView(QMainWindow):
     def hideEvent(self, event):
         super().hideEvent(event)
         self._user_hidden = True
+        if hasattr(self, "view") and self.view is not None:
+            try:
+                self.view._draw_pending = False
+                from PySide6.QtCore import QCoreApplication
+                QCoreApplication.removePostedEvents(self.view)
+            except Exception:
+                pass
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -751,6 +759,10 @@ class SingleTraceView(QMainWindow):
             return
         if self.state.analog_signal is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
             return
+
+        if not getattr(self, "_setup_done", False) or self.trace_line_cache is None:
+            self.setupFigure()
+            self._setup_done = True
 
         if hasattr(self, "channel_bar"):
             primary_ch = self.channel_bar.get_primary_channel()
@@ -932,9 +944,12 @@ class SingleTraceView(QMainWindow):
                 self.topax.draw_artist(x)
         for x in self.topax_lines:
             self.topax.draw_artist(x)
-        # for x in self.topax.lines:
-        #     self.topax.draw_artist(x)
         self.view.update()
+        if getattr(self, "blit_data", None) is None:
+            try:
+                self.blit()
+            except Exception:
+                pass
 
     def blit(self):
         self.blit_data = self.fig.canvas.copy_from_bbox(self.ax.bbox)

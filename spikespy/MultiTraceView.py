@@ -634,6 +634,12 @@ class MultiTraceView(QMainWindow):
         self.update()
 
     def closeEvent(self, *args):
+        if hasattr(self, "view") and self.view is not None:
+            try:
+                self.view._draw_pending = False
+                QtCore.QCoreApplication.removePostedEvents(self.view)
+            except Exception:
+                pass
         self.remove_references()
         self.dialogPolySelect.close()
         self.settingsDialog.close()
@@ -719,20 +725,16 @@ class MultiTraceView(QMainWindow):
         try:
             if getattr(self, "_user_hidden", False):
                 return True
-            if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+            win = self.window()
+            if win is not None and win.isMinimized():
                 return True
-            curr = self
-            while curr.parentWidget() is not None:
-                curr = curr.parentWidget()
-                if curr.isMinimized():
-                    return True
             if self.parentWidget() is not None and not self.isVisible():
                 return True
             if getattr(self, "_was_shown", False) and not self.isVisible():
                 return True
             return False
-        except RuntimeError:
-            return True
+        except Exception:
+            return False
 
     def _on_render_timer_tick(self):
         try:
@@ -759,6 +761,12 @@ class MultiTraceView(QMainWindow):
     def hideEvent(self, event):
         super().hideEvent(event)
         self._user_hidden = True
+        if hasattr(self, "view") and self.view is not None:
+            try:
+                self.view._draw_pending = False
+                QtCore.QCoreApplication.removePostedEvents(self.view)
+            except Exception:
+                pass
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -775,13 +783,27 @@ class MultiTraceView(QMainWindow):
         self.render_count = getattr(self, "render_count", 0) + 1
         if self.state is None:
             return
-        erp = self.state.get_erp()
+
+        if hasattr(self, "channel_bar"):
+            chans = self.channel_bar.get_selected_channels()
+            if self.channel_bar.is_multichannel() and len(chans) > 1:
+                erp = self.state.get_multichannel_erp(chans, combine_mode="mean")
+                primary = chans[0] if chans else None
+            else:
+                primary = self.channel_bar.get_primary_channel()
+                erp = self.state.get_channel_erp(primary)
+        else:
+            primary = getattr(getattr(self.state, "analog_signal", None), "name", None)
+            erp = self.state.get_erp()
+
         if erp is not None and hasattr(erp, "magnitude"):
             erp = erp.magnitude
         if erp is None or erp.shape[0] == 0:
             return
 
-        live_buf = getattr(self.state, "_live_erp_buffer", None)
+        live_buf = getattr(self.state, "_live_aux_erp_buffers", {}).get(
+            primary, getattr(self.state, "_live_erp_buffer", None)
+        )
         has_buf_match = live_buf is not None and len(live_buf) == erp.shape[0]
 
         if not hasattr(self, "std") or self.std == 0 or self.std is None or erp.shape[0] <= 5:
@@ -793,7 +815,7 @@ class MultiTraceView(QMainWindow):
                 last_std = float(np.std(erp[-1])) or 1.0
             self.std = 0.95 * float(self.std) + 0.05 * last_std
 
-        if self.mode == "heatmap" and self.plotter.ax_track_cmap is not None:
+        if self.mode == "heatmap" and self.plotter.ax_track_cmap is not None and abs(self.ax.get_xlim()[1] - self.ax.get_xlim()[0]) > 1.0:
             if has_buf_match:
                 clipped_data = live_buf.clipped_data
             else:
@@ -817,12 +839,22 @@ class MultiTraceView(QMainWindow):
         else:
             self.setup_figure()
 
+        if abs(self.ax.get_xlim()[1] - self.ax.get_xlim()[0]) <= 1.0:
+            self.ax.set_xlim(0, erp.shape[1])
+            self.update_axis()
+
         if self.lock_to_stim:
             self.update_ylim(self.state.stimno)
         else:
             current_ylim = self.ax.get_ylim()
-            if abs(current_ylim[0] - (erp.shape[0] - 1)) <= 2 and erp.shape[0] != current_ylim[1]:
-                self.ax.set_ylim(erp.shape[0], current_ylim[1])
+            if (
+                getattr(self.state, "follow_live", True)
+                or abs(current_ylim[0] - erp.shape[0]) <= 5
+                or current_ylim == (0.0, 1.0)
+                or current_ylim[1] == 1.0
+            ):
+                top_lim = current_ylim[1] if (current_ylim[1] != 1.0 and current_ylim != (0.0, 1.0)) else 0
+                self.ax.set_ylim(erp.shape[0], top_lim)
 
         self.plotter.highlight_stim(self.ax, self.state.stimno, partial=False)
         self.plot_spikegroups()
@@ -896,8 +928,9 @@ class MultiTraceView(QMainWindow):
             except:
                 pass
 
-        if not self.rightPlots:
-            self.rightPlots = {k: True for k, v in self.right_ax_data.items()}
+        for k in self.right_ax_data.keys():
+            if k not in self.rightPlots:
+                self.rightPlots[k] = True
 
         cur_seg = getattr(self.state, "segment", None)
         if self.settingsDialog is None or self._last_settings_segment != cur_seg:
@@ -973,9 +1006,22 @@ class MultiTraceView(QMainWindow):
                 self.std * self.upperSpinBox.value(),
             ),
         )
-        self.ax.set_ylim(ylim)
-        self.ax.set_xlim(xlim)
+        xlim_init = abs(xlim[1] - xlim[0]) <= 1.0 or xlim == (0.0, 1.0)
+        if xlim_init:
+            self.ax.set_xlim(0, erp.shape[1])
+        else:
+            self.ax.set_xlim(xlim)
+
+        ylim_init = abs(ylim[1] - ylim[0]) <= 1.0 or ylim == (0.0, 1.0) or ylim == (1.0, 0.0)
+        if self.lock_to_stim:
+            self.update_ylim(self.state.stimno)
+        elif ylim_init:
+            self.ax.set_ylim(erp.shape[0], 0)
+        else:
+            self.ax.set_ylim(ylim)
+
         self.ax.set_autoscale_on(False)
+        self.update_axis()
 
         self.view.update()
         # self.blit()
@@ -1008,7 +1054,7 @@ class MultiTraceView(QMainWindow):
         colorwheel = itertools.cycle(iter(["r", "g", "b", "orange", "purple", "green"]))
         # self.fig.subfigures()
         for i, (label, data) in enumerate(
-            [(k, v) for k, v in self.right_ax_data.items() if self.rightPlots[k]]
+            [(k, v) for k, v in self.right_ax_data.items() if self.rightPlots.get(k, True)]
         ):
 
             self.ax_right.append(self.fig.add_subplot(gs00[0, i], sharey=self.ax))
@@ -1297,6 +1343,12 @@ class MultiTraceView(QMainWindow):
             self.messages = messages
 
     def __del__(self):
+        if hasattr(self, "view") and self.view is not None:
+            try:
+                self.view._draw_pending = False
+                QtCore.QCoreApplication.removePostedEvents(self.view)
+            except Exception:
+                pass
         self.remove_references()
         try:
             self.destroyed.disconnect(self.close_conn)

@@ -1465,6 +1465,7 @@ class ViewerState(QObject):
         is_2d = hasattr(sweep_waveform, "ndim") and sweep_waveform.ndim == 2
         pre_idx = int(round(pre_offset_s * sr_val)) if pre_offset_s > 0 else 0
 
+        new_channels_added = False
         if is_2d:
             n_ch = sweep_waveform.shape[0]
             for ch_i in range(n_ch):
@@ -1474,6 +1475,30 @@ class ViewerState(QObject):
                     else f"CH{ch_i}"
                 )
                 ch_wave = sweep_waveform[ch_i]
+
+                if hasattr(self, "_live_aux_erp_buffers") and ch_name not in self._live_aux_erp_buffers:
+                    w_samples = (
+                        self._live_erp_buffer.window_samples
+                        if self._live_erp_buffer is not None
+                        else int(sr_val * float(self.window_size.rescale(pq.s).magnitude if hasattr(self.window_size, "magnitude") else self.window_size))
+                    )
+                    self._live_aux_erp_buffers[ch_name] = LiveERPBuffer(
+                        window_samples=w_samples,
+                        units=units,
+                    )
+                    new_sig = MultiAnalogSignal()
+                    new_sig.name = ch_name
+                    new_sig.sampling_rate = sr
+                    new_sig.units = units
+                    if hasattr(self, "_live_channel_signals"):
+                        self._live_channel_signals[ch_name] = new_sig
+                    if self.segment is not None and hasattr(self.segment, "analogsignals"):
+                        if new_sig not in self.segment.analogsignals:
+                            self.segment.analogsignals.append(new_sig)
+                    if hasattr(self, "active_channel_names") and ch_name not in self.active_channel_names:
+                        self.active_channel_names.append(ch_name)
+                    new_channels_added = True
+
                 sig_slice = neo.AnalogSignal(
                     ch_wave,
                     units=units,
@@ -1524,11 +1549,34 @@ class ViewerState(QObject):
                 self._live_erp_buffer.append_sweep(erp_wave)
 
             # Handle aux sweeps if any
-            if aux_sweeps and hasattr(self, "_live_aux_erp_buffers") and self._live_aux_erp_buffers:
+            if aux_sweeps:
                 for aux_ch, aux_wave in aux_sweeps.items():
                     if aux_ch == cur_ch_name:
                         continue  # Do not double-append to primary
-                    if aux_ch in self._live_aux_erp_buffers:
+                    if hasattr(self, "_live_aux_erp_buffers"):
+                        if aux_ch not in self._live_aux_erp_buffers:
+                            w_samples = (
+                                self._live_erp_buffer.window_samples
+                                if self._live_erp_buffer is not None
+                                else int(sr_val * float(self.window_size.rescale(pq.s).magnitude if hasattr(self.window_size, "magnitude") else self.window_size))
+                            )
+                            self._live_aux_erp_buffers[aux_ch] = LiveERPBuffer(
+                                window_samples=w_samples,
+                                units=units,
+                            )
+                            new_sig = MultiAnalogSignal()
+                            new_sig.name = aux_ch
+                            new_sig.sampling_rate = sr
+                            new_sig.units = units
+                            if hasattr(self, "_live_channel_signals"):
+                                self._live_channel_signals[aux_ch] = new_sig
+                            if self.segment is not None and hasattr(self.segment, "analogsignals"):
+                                if new_sig not in self.segment.analogsignals:
+                                    self.segment.analogsignals.append(new_sig)
+                            if hasattr(self, "active_channel_names") and aux_ch not in self.active_channel_names:
+                                self.active_channel_names.append(aux_ch)
+                            new_channels_added = True
+
                         aux_buf = self._live_aux_erp_buffers[aux_ch]
                         erp_aux = aux_wave[pre_idx : pre_idx + aux_buf.window_samples]
                         aux_buf.append_sweep(erp_aux)
@@ -1543,6 +1591,9 @@ class ViewerState(QObject):
                         self._live_channel_signals[aux_ch].append_signal(aux_sig)
 
             primary_waveform = sweep_waveform[pre_idx :]
+
+        if new_channels_added and hasattr(self, "onChannelGroupsChanged"):
+            self.onChannelGroupsChanged.emit()
 
         # Incrementally computes peaks (find_peaks(d) and find_peaks(-d)) for this single new sweep
         if self._peaks is None:

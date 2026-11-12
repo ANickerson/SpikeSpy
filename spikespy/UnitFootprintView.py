@@ -169,24 +169,20 @@ class UnitFootprintView(QMainWindow):
         try:
             if getattr(self, "_user_hidden", False):
                 return True
-            if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+            win = self.window()
+            if win is not None and win.isMinimized():
                 return True
-            curr = self
-            while curr.parentWidget() is not None:
-                curr = curr.parentWidget()
-                if curr.isMinimized():
-                    return True
             if self.parentWidget() is not None and not self.isVisible():
                 return True
             if getattr(self, "_was_shown", False) and not self.isVisible():
                 return True
             return False
-        except RuntimeError:
-            return True
+        except Exception:
+            return False
 
     def _on_render_timer_tick(self):
         try:
-            if not self.isVisible() or not getattr(self, "_dirty", False):
+            if self.is_view_culled() or not getattr(self, "_dirty", False):
                 return
             self._dirty = False
             self._do_update_plot()
