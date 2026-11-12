@@ -19,7 +19,8 @@ from PySide6.QtWidgets import (
 )
 import pyqtgraph as pg
 
-from .ViewerState import ViewerState
+from .ViewerState import ViewerState, tracked_neuron_unit
+from .ChannelGroupBar import ChannelGroupBar
 
 
 class FixedTimeAxisItem(pg.AxisItem):
@@ -58,10 +59,49 @@ class MultiTraceFixedPGView(QMainWindow):
         self.highlight_segments = pg.PlotDataItem(pen=pg.mkPen(color="red", width=2), connect="finite")
         self.points_scatter = pg.ScatterPlotItem(size=8, symbol="o", brush=pg.mkBrush("black"), pen=None)
 
+        self._has_initialized_xrange: bool = False
+
+        # Independent channel group and unit binding toolbar
+        self.channel_bar = ChannelGroupBar(parent=self, state=state)
+        self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
+        self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+
         self._init_ui()
 
         if state is not None:
             self.set_state(state)
+
+    def _on_channel_bar_changed(self):
+        if hasattr(self, "channel_bar"):
+            summary = self.channel_bar.get_title_summary()
+            self.setWindowTitle(f"MultiTraceFixed (PyQtGraph) {summary}")
+            p = self.parentWidget()
+            if p is not None and hasattr(p, "setWindowTitle"):
+                p.setWindowTitle(f"MultiTraceFixed (PyQtGraph) {summary}")
+        self.update_figure()
+
+    def get_target_unit(self) -> Optional[tracked_neuron_unit]:
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            return self.channel_bar.get_target_unit()
+        if self.state and 0 <= self.state.cur_spike_group < len(self.state.spike_groups):
+            return self.state.spike_groups[self.state.cur_spike_group]
+        return None
+
+    def get_target_unit_idx(self) -> int:
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            return self.channel_bar.get_target_unit_idx()
+        return getattr(self.state, "cur_spike_group", 0) if self.state else 0
+
+    def get_erp_signal(self):
+        if self.state is None:
+            return None
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            primary_ch = self.channel_bar.get_primary_channel()
+            if primary_ch and hasattr(self.state, "get_channel_erp"):
+                erp = self.state.get_channel_erp(primary_ch)
+                if erp is not None and len(erp) > 0:
+                    return erp
+        return self.state.get_erp()
 
     def _init_ui(self):
         central = QWidget(self)
@@ -73,6 +113,7 @@ class MultiTraceFixedPGView(QMainWindow):
 
         self.time_axis = FixedTimeAxisItem(orientation="bottom")
         self.main_plot: pg.PlotItem = self.glw.addPlot(row=0, col=0, axisItems={"bottom": self.time_axis})
+        self.main_plot.getViewBox().disableAutoRange(pg.ViewBox.XAxis)
         self.main_plot.invertY(True)
         self.main_plot.setLabel("bottom", "Time", units="ms")
         self.main_plot.setLabel("left", "Stimulus Sweep")
@@ -139,28 +180,36 @@ class MultiTraceFixedPGView(QMainWindow):
     def set_state(self, state: ViewerState):
         self.unset_connections()
         self.state = state
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            self.channel_bar.setState(state)
         if self.state is None:
             return
 
         self.connections.append(self.state.onStimNoChange.connect(lambda x: self.update_figure()))
         self.connections.append(self.state.onUnitChange.connect(lambda x: self.update_figure()))
         self.connections.append(self.state.onUnitGroupChange.connect(lambda: self.update_figure()))
-        self.connections.append(self.state.onLoadNewFile.connect(lambda: self.update_figure()))
+        self.connections.append(self.state.onLoadNewFile.connect(self._on_load_new_file))
         if hasattr(self.state, "onNewSweep"):
             self.connections.append(self.state.onNewSweep.connect(self.on_new_sweep))
         if hasattr(self.state, "onNewSpikeEvents"):
             self.connections.append(self.state.onNewSpikeEvents.connect(lambda *args: self.update_figure()))
 
+        self._has_initialized_xrange = False
         self._auto_scale_needed = True
         self._auto_scale()
-        erp = self.state.get_erp()
+        erp = self.get_erp_signal()
         if erp is not None and len(erp) > 0:
             self._auto_scale_needed = False
         self.update_figure()
 
+    def _on_load_new_file(self):
+        self._has_initialized_xrange = False
+        self._auto_scale_needed = True
+        self.update_figure()
+
     def on_new_sweep(self, *args):
         if getattr(self, "_auto_scale_needed", True):
-            erp = self.state.get_erp() if self.state else None
+            erp = self.get_erp_signal() if self.state else None
             if erp is not None and len(erp) > 0:
                 self._auto_scale()
                 self._auto_scale_needed = False
@@ -201,7 +250,7 @@ class MultiTraceFixedPGView(QMainWindow):
         if self.state is None or self.state.analog_signal is None or self.state.event_signal is None:
             return
 
-        erp = self.state.get_erp()
+        erp = self.get_erp_signal()
         if erp is None or len(erp) == 0:
             return
 
@@ -253,8 +302,8 @@ class MultiTraceFixedPGView(QMainWindow):
         hl_y = []
         scat_pts = []
 
-        if self.state.cur_spike_group < len(self.state.spike_groups):
-            ug = self.state.spike_groups[self.state.cur_spike_group]
+        ug = self.get_target_unit()
+        if ug is not None:
             latencies = ug.get_latencies(self.state.event_signal[start:stop])
             r = 20
 
@@ -291,13 +340,39 @@ class MultiTraceFixedPGView(QMainWindow):
         ticks = [(i, str(start + i)) for i in range(n_display)]
         self.main_plot.getAxis("left").setTicks([ticks])
         self.main_plot.setYRange(-0.5, n_display - 0.5, padding=0)
-        self.main_plot.setXRange(0, (erp.shape[-1] - 1) / sr, padding=0)
+
+        # Only initialize X-range on first sweep or reset; preserve zoom and pan across live sweeps
+        if not self._has_initialized_xrange:
+            self.main_plot.setXRange(0, (erp.shape[-1] - 1) / sr, padding=0)
+            self._has_initialized_xrange = True
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_BracketLeft:  # Zoom out on X
+            self.main_plot.vb.scaleBy((1.2, 1.0))
+        elif e.key() == Qt.Key_BracketRight:  # Zoom in on X
+            self.main_plot.vb.scaleBy((0.8, 1.0))
+        elif e.key() in (Qt.Key_Home, Qt.Key_R):
+            erp = self.get_erp_signal()
+            if erp is not None and len(erp) > 0 and self.state is not None:
+                sr = float(self.state.sampling_rate.rescale("Hz").magnitude) if hasattr(self.state.sampling_rate, "rescale") else float(self.state.sampling_rate)
+                self.main_plot.setXRange(0, (erp.shape[-1] - 1) / sr, padding=0)
+        else:
+            super().keyPressEvent(e)
 
     def get_settings(self) -> Dict:
-        return self.settings
+        res = dict(self.settings)
+        res["xlim"] = self.main_plot.viewRange()[0]
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            res["channel_bar"] = self.channel_bar.get_settings()
+        return res
 
     def set_settings(self, values: Dict, update_spinners: bool = True):
         self.settings.update(values)
+        if "xlim" in values:
+            self.main_plot.setXRange(values["xlim"][0], values["xlim"][1], padding=0)
+            self._has_initialized_xrange = True
+        if "channel_bar" in values and hasattr(self, "channel_bar") and self.channel_bar is not None:
+            self.channel_bar.set_settings(values["channel_bar"])
         if update_spinners:
             if "n_lines_pre" in values:
                 self.pre_spinner.setValue(values["n_lines_pre"])

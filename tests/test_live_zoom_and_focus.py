@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication, QWidget, QPushButton
 from spikespy.ViewerState import ViewerState
 from spikespy.MultiTraceView import MultiTraceView
 from spikespy.MultiTracePGView import MultiTracePGView
+from spikespy.MultiTraceFixedPGView import MultiTraceFixedPGView
 from spikespy.SingleTraceView import SingleTraceView
 from spikespy.ViewSettingsPanel import ViewSettingsPanel
 from spikespy.SpikeSpy import MdiView
@@ -89,6 +90,39 @@ def test_multitrace_pgview_zoom_preserved_during_live_streaming(qtbot, streaming
     cur_x = view.main_plot.viewRange()[0]
     assert 200 <= cur_x[0] <= 300
     assert 400 <= cur_x[1] <= 500
+
+
+def test_multitrace_fixed_pgview_zoom_preserved_during_live_streaming(qtbot, streaming_state):
+    """
+    Test that zooming/panning in MultiTraceFixedPGView is preserved when sweeps arrive
+    and doesn't reset on each new stimulus in live mode.
+    """
+    view = MultiTraceFixedPGView(state=streaming_state)
+    qtbot.addWidget(view)
+    view.show()
+    qtbot.waitExposed(view)
+
+    # Append initial sweeps
+    for i in range(5):
+        w = np.random.randn(1000).astype(np.float32) * 20.0
+        streaming_state.append_sweep(i * 0.1, w)
+
+    view.update_figure()
+
+    # User zooms into a specific X range (0.02s to 0.05s)
+    view.main_plot.setXRange(0.02, 0.05, padding=0)
+
+    # Live sweeps continue arriving and stimno updates
+    for i in range(5, 12):
+        w = np.random.randn(1000).astype(np.float32) * 20.0
+        streaming_state.append_sweep(i * 0.1, w)
+
+    streaming_state.setStimNo(7)
+
+    # Check that user's X zoom is preserved and not reset to (0, 0.1)
+    cur_x = view.main_plot.viewRange()[0]
+    assert np.isclose(cur_x[0], 0.02, atol=1e-3)
+    assert np.isclose(cur_x[1], 0.05, atol=1e-3)
 
 
 def test_settings_panel_focus_tracking_ancestor_traversal(qtbot, synthetic_state):
