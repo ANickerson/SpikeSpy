@@ -13,10 +13,11 @@ import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import zmq
+from scipy import signal
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,7 @@ class MockOpenEphysServer:
         n_channels: int = 4,
         sample_rate: float = 30000.0,
         stim_freq_hz: float = 2.0,
+        adc_channel: Optional[int] = None,
     ):
         self.host = host
         self.data_port = data_port
@@ -129,6 +131,7 @@ class MockOpenEphysServer:
         self.n_channels = n_channels
         self.sample_rate = sample_rate
         self.stim_freq_hz = stim_freq_hz
+        self.adc_channel = adc_channel
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -139,7 +142,6 @@ class MockOpenEphysServer:
         self._sample_counter = 0
         self._stim_count = 0
         self._base_latency_s = 0.025  # 25 ms base latency for microneurography C-fibre
-        self._drift_s = 0.0
 
     def start(self):
         """Start both HTTP and ZMQ simulation servers."""
@@ -180,15 +182,48 @@ class MockOpenEphysServer:
     def received_processor_configs(self) -> List[Dict[str, Any]]:
         return self._httpd.received_processor_configs if self._httpd else []
 
-    def _generate_action_potential(self, n_pts: int = 60) -> np.ndarray:
-        """Generate a realistic triphasic extracellular action potential waveform (~2 ms)."""
-        t = np.linspace(-1.0, 1.0, n_pts)
-        # Ricker/Hermite-like triphasic spike
-        ap = -np.exp(-3 * t**2) * (1 - 4 * t**2) * 80.0  # ~80 uV amplitude
-        return ap.astype(np.float32)
+    def _generate_action_potential(self, sample_rate: float) -> Tuple[np.ndarray, int]:
+        """Generate a realistic asymmetric triphasic extracellular C-fibre action potential.
+
+        Returns (waveform, peak_index) where peak_index is the sample index of the primary positive peak.
+        """
+        n_pts = int(0.002 * sample_rate)  # 2.0 ms duration (60 samples at 30 kHz)
+        peak_idx = int(0.4 * n_pts)       # sample 24
+        t_ms = (np.arange(n_pts) - peak_idx) / (sample_rate / 1000.0)
+
+        # Realistic biophysical extracellular waveform components (uV):
+        # 1. Sharp depolarizing positive peak (aligned with SpikeSpy tracking and heatmap)
+        p_main = 100.0 * np.exp(-((t_ms) ** 2) / 0.08)
+        # 2. Initial negative capacitive approach dip
+        p_pre = -22.0 * np.exp(-((t_ms + 0.35) ** 2) / 0.05)
+        # 3. Repolarizing undershoot / after-hyperpolarization
+        p_post = -32.0 * np.exp(-((t_ms - 0.45) ** 2) / 0.18)
+        ap = (p_main + p_pre + p_post).astype(np.float32)
+
+        # Smooth cosine taper on the extreme edges
+        n_taper_start = min(6, n_pts // 5)
+        n_taper_end = min(10, n_pts // 3)
+        taper = np.ones(n_pts, dtype=np.float32)
+        taper[:n_taper_start] = np.sin(np.linspace(0, np.pi / 2, n_taper_start)) ** 2
+        taper[-n_taper_end:] = np.cos(np.linspace(0, np.pi / 2, n_taper_end)) ** 2
+        ap *= taper
+
+        actual_peak = int(np.argmax(ap))
+        return ap, actual_peak
+
+    def _generate_stim_artifact(self, sample_rate: float) -> np.ndarray:
+        """Generate a realistic electrical stimulus artifact (sharp transient + capacitive decay)."""
+        n_art = int(0.0012 * sample_rate)  # 1.2 ms duration (36 samples at 30 kHz)
+        t_art = np.arange(n_art) / (sample_rate / 1000.0)  # ms
+        art = (110.0 * np.exp(-t_art / 0.10) - 40.0 * np.exp(-t_art / 0.35)).astype(np.float32)
+        n_taper = min(8, n_art // 4)
+        taper = np.ones(n_art, dtype=np.float32)
+        taper[-n_taper:] = np.cos(np.linspace(0, np.pi / 2, n_taper)) ** 2
+        art *= taper
+        return art
 
     def _run_zmq(self):
-        """ZMQ publishing loop."""
+        """ZMQ publishing loop for continuous microneurography streaming."""
         context = zmq.Context()
         data_pub = context.socket(zmq.PUB)
         data_pub.setsockopt(zmq.LINGER, 0)
@@ -204,8 +239,47 @@ class MockOpenEphysServer:
         samples_between_stims = int(self.sample_rate / self.stim_freq_hz)
         next_stim_sample = samples_between_stims
 
-        spike_wf = self._generate_action_potential(int(0.002 * self.sample_rate))  # 2ms spike
-        spike_len = len(spike_wf)
+        spike_wf, peak_offset = self._generate_action_potential(self.sample_rate)
+        stim_art_wf = self._generate_stim_artifact(self.sample_rate)
+
+        # Overlay accumulator buffer to prevent edge truncation across chunk boundaries
+        overlay_len = max(chunk_size * 6, int(self.sample_rate * 0.5))
+        overlay_buf = np.zeros((self.n_channels, overlay_len), dtype=np.float32)
+
+        # Multi-channel propagation delay and distance attenuation profiles:
+        # Nearby channels record the same event offset by small conduction delay and amplitude decay
+        # (e.g. conduction velocity ~1 m/s, ~133 um electrode spacing = ~0.133 ms / ~4 samples delay per contact)
+        chan_delays = [int(round(c * (0.000133 * self.sample_rate))) for c in range(self.n_channels)]
+        chan_scales = [float(0.65 ** c) for c in range(self.n_channels)]
+        art_scales = [float(0.92 ** c) for c in range(self.n_channels)]
+
+        # Continuous colored noise filter states (IIR AR(1) state per channel)
+        noise_coeffs = []
+        noise_zi = []
+        for c in range(self.n_channels):
+            if c == 0:
+                # Primary channel: clean electrode thermal / 1/f noise (RMS ~7.5 uV)
+                a = 0.88
+                sigma = 7.0
+            elif c == 1:
+                # Neighbor 1: higher impedance with slow biological baseline drift (RMS ~10.5 uV)
+                a = 0.94
+                sigma = 9.0
+            elif c == 2:
+                # Neighbor 2: clean low-noise contact (RMS ~5.0 uV) with subtle 50 Hz hum
+                a = 0.78
+                sigma = 4.2
+            elif c == 3:
+                # Neighbor 3: broadband hash contact (RMS ~8.5 uV)
+                a = 0.65
+                sigma = 8.5
+            else:
+                a = 0.85
+                sigma = 7.0
+            b = [sigma * np.sqrt(1.0 - a ** 2)]
+            zi = signal.lfilter_zi(b, [1.0, -a]) * 0.0
+            noise_coeffs.append((b, [1.0, -a]))
+            noise_zi.append(zi)
 
         try:
             while self._running:
@@ -213,27 +287,74 @@ class MockOpenEphysServer:
                 cur_sample = self._sample_counter
                 self._sample_counter += chunk_size
 
-                # Continuous background recording noise (band-limited white noise)
-                raw_chunk = np.random.normal(0.0, 8.0, (self.n_channels, chunk_size)).astype(np.float32)
+                # 1. Generate distinct background noise per channel
+                raw_chunk = np.zeros((self.n_channels, chunk_size), dtype=np.float32)
+                t_chunk = (cur_sample + np.arange(chunk_size)) / self.sample_rate
 
-                # Check if stimulus falls within this chunk
-                if next_stim_sample >= cur_sample and next_stim_sample < cur_sample + chunk_size:
-                    stim_offset_in_chunk = next_stim_sample - cur_sample
+                for c in range(self.n_channels):
+                    b, a = noise_coeffs[c]
+                    w = np.random.normal(0.0, 1.0, chunk_size).astype(np.float64)
+                    filtered_noise, noise_zi[c] = signal.lfilter(b, a, w, zi=noise_zi[c])
+                    ch_noise = filtered_noise.astype(np.float32)
+
+                    # Distinct noise profile characteristics:
+                    if c == 1:
+                        # Baseline slow drift (~0.7 Hz, ~8 uV)
+                        ch_noise += (8.0 * np.sin(2 * np.pi * 0.7 * t_chunk)).astype(np.float32)
+                    elif c == 2:
+                        # Subtle 50 Hz mains hum harmonic (~3.0 uV)
+                        ch_noise += (3.0 * np.sin(2 * np.pi * 50.0 * t_chunk)).astype(np.float32)
+                    elif c == 3:
+                        # Sparse miniature background asynchronous spikes in hash
+                        if np.random.rand() < 0.25:
+                            mini_pos = np.random.randint(0, max(1, chunk_size - 10))
+                            ch_noise[mini_pos : mini_pos + 6] += np.random.uniform(4.0, 7.0)
+
+                    raw_chunk[c] = ch_noise
+
+                # 2. Check if a stimulus falls within this chunk
+                while next_stim_sample < cur_sample + chunk_size:
                     stim_sample = next_stim_sample
                     stim_timestamp = stim_sample / self.sample_rate
                     self._stim_count += 1
+                    n = self._stim_count
 
-                    # 1. Analog TTL pulse on channel 1 (simulating DS4 / ADC input)
-                    if self.n_channels > 1:
-                        pulse_len = min(60, chunk_size - stim_offset_in_chunk)
-                        raw_chunk[1, stim_offset_in_chunk : stim_offset_in_chunk + pulse_len] = 5.0  # 5V pulse
+                    # Activity-dependent slowing (ADS):
+                    # Repetitive C-fibre stimulation causes progressive latency slowing
+                    # with rapid early phase, asymptotic plateau, plus organic micro-jitter
+                    ads_drift = 0.016 * (1.0 - math.exp(-n / 25.0)) + (n * 0.00004)
+                    jitter = 0.00003 * math.sin(n * 2.3)
+                    evoked_latency_s = self._base_latency_s + ads_drift + jitter
+                    peak_sample = stim_sample + int(round(evoked_latency_s * self.sample_rate))
 
-                    # 2. Activity-dependent slowing: progressive latency drift (microneurography)
-                    self._drift_s += 0.0003  # +0.3 ms latency drift per stimulus
-                    evoked_latency_s = self._base_latency_s + self._drift_s
-                    evoked_sample = stim_sample + int(evoked_latency_s * self.sample_rate)
+                    # 2a. Inject Stimulus Artifact across all channels (at stim_sample)
+                    stim_offset_in_buf = stim_sample - cur_sample
+                    if 0 <= stim_offset_in_buf < overlay_len - len(stim_art_wf):
+                        for c in range(self.n_channels):
+                            overlay_buf[c, stim_offset_in_buf : stim_offset_in_buf + len(stim_art_wf)] += (
+                                stim_art_wf * art_scales[c]
+                            )
 
-                    # 3. Publish Digital TTL Event via Event socket (Event Broadcaster JSON format)
+                    # 2b. If ADC trigger channel is configured, place 5V pulse on it
+                    if self.adc_channel is not None and 0 <= self.adc_channel < self.n_channels:
+                        pulse_len = min(60, overlay_len - stim_offset_in_buf)
+                        if stim_offset_in_buf >= 0 and pulse_len > 0:
+                            overlay_buf[self.adc_channel, stim_offset_in_buf : stim_offset_in_buf + pulse_len] = 5.0
+
+                    # 2c. Inject Evoked Action Potential across all channels
+                    # Primary channel (CH0) peak is at peak_sample (start is peak_sample - peak_offset)
+                    # Nearby channels have propagation delay chan_delays[c] and amplitude decay chan_scales[c]
+                    spk_len = len(spike_wf)
+                    for c in range(self.n_channels):
+                        ch_peak_sample = peak_sample + chan_delays[c]
+                        ch_start_sample = ch_peak_sample - peak_offset
+                        ch_offset_in_buf = ch_start_sample - cur_sample
+                        if 0 <= ch_offset_in_buf < overlay_len - spk_len:
+                            overlay_buf[c, ch_offset_in_buf : ch_offset_in_buf + spk_len] += (
+                                spike_wf * chan_scales[c]
+                            )
+
+                    # 2d. Publish Digital TTL Event via Event socket
                     ttl_event = {
                         "type": "ttl",
                         "state": 1,
@@ -243,33 +364,25 @@ class MockOpenEphysServer:
                     }
                     event_pub.send_string(json.dumps(ttl_event))
 
-                    # 4. Schedule next stimulus
+                    # 2e. Publish upstream Spike Event (aligned with primary peak on CH0)
+                    spk_event = {
+                        "type": "spike",
+                        "electrode": 0,
+                        "unit_name": "unit_0",
+                        "sample_number": peak_sample,
+                        "timestamp": peak_sample / self.sample_rate,
+                    }
+                    event_pub.send_string(json.dumps(spk_event))
+
+                    # Schedule next stimulus
                     next_stim_sample += samples_between_stims
 
-                # Check if an evoked spike falls in this chunk
-                # Re-calculate spike location from last stim
-                if self._stim_count > 0:
-                    last_stim_sample = next_stim_sample - samples_between_stims
-                    evoked_sample = last_stim_sample + int((self._base_latency_s + self._drift_s) * self.sample_rate)
-                    if evoked_sample >= cur_sample and evoked_sample < cur_sample + chunk_size:
-                        spk_offset = evoked_sample - cur_sample
-                        valid_len = min(spike_len, chunk_size - spk_offset)
-                        # Add evoked spike to recording channel 0
-                        raw_chunk[0, spk_offset : spk_offset + valid_len] += spike_wf[:valid_len]
+                # 3. Add overlay buffer to current chunk and advance overlay buffer
+                raw_chunk += overlay_buf[:, :chunk_size]
+                overlay_buf = np.roll(overlay_buf, -chunk_size, axis=1)
+                overlay_buf[:, -chunk_size:] = 0.0
 
-                        # Also emit upstream Spike event on event socket
-                        spk_event = {
-                            "type": "spike",
-                            "electrode": 0,
-                            "unit_name": "unit_0",
-                            "sample_number": evoked_sample,
-                            "timestamp": evoked_sample / self.sample_rate,
-                        }
-                        event_pub.send_string(json.dumps(spk_event))
-
-                # Publish Open Ephys continuous data stream frame:
-                # Frame 0: JSON header
-                # Frame 1: Binary data buffer (interleaved float32 or planar)
+                # 4. Publish Open Ephys continuous data stream frame
                 header = {
                     "stream": "continuous",
                     "channel_count": self.n_channels,

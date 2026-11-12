@@ -227,3 +227,102 @@ def test_multichannel_streaming_and_channel_switching(qtbot):
     finally:
         server.stop()
 
+
+def test_realistic_microneurography_and_event_marker_alignment(qtbot):
+    """Verify realistic microneurography trace features:
+    1. Action potential with positive peak aligned with event markers in ERP.
+    2. Activity-dependent slowing: spike latency increases progressively over sweeps.
+    3. Multi-channel footprint: nearby channels CH1, CH2, CH3 have the same spike offset by conduction delay.
+    4. Distinct noise profiles across channels.
+    """
+    server = MockOpenEphysServer(
+        host="127.0.0.1",
+        data_port=5606,
+        event_port=5607,
+        http_port=37525,
+        n_channels=4,
+        sample_rate=30000.0,
+        stim_freq_hz=10.0,
+    )
+    server.start()
+
+    try:
+        state = ViewerState()
+        live_view = OpenEphysLiveView(state=state)
+        qtbot.addWidget(live_view)
+
+        live_view.spin_data_port.setValue(5606)
+        live_view.spin_event_port.setValue(5607)
+        live_view.spin_http_port.setValue(37525)
+        live_view.spin_window_ms.setValue(100.0)
+        live_view.spin_pre_ms.setValue(10.0)
+        live_view.edit_active_channels.setText("0-3")
+        live_view.spin_rec_chan.setValue(0)
+
+        live_view.start_stream()
+        # Collect at least 4 sweeps to measure slowing
+        qtbot.waitUntil(lambda: len(state.event_signal) >= 4, timeout=5000)
+
+        erp_ch0 = state.get_erp()
+        assert erp_ch0.shape[0] >= 4
+
+        # 1. Action potential morphology: clear positive peak (> 40 uV)
+        sweep0 = erp_ch0[0].magnitude if hasattr(erp_ch0[0], "magnitude") else erp_ch0[0]
+        # Peak should be around 25 ms (750 samples at 30 kHz)
+        search_window = sweep0[650:850]
+        peak_sample_sweep0 = 650 + int(np.argmax(search_window))
+        assert sweep0[peak_sample_sweep0] > 40.0, f"Expected positive peak > 40 uV, got {sweep0[peak_sample_sweep0]}"
+
+        # 2. Event marker alignment: verify unit_0 marker matches peak_sample_sweep0!
+        ug = state.getUnitGroup()
+        assert ug is not None
+        assert ug.idx_arr is not None and len(ug.idx_arr) >= 1
+        marked_lat = ug.idx_arr[0][0]
+        # Must be aligned within 5 samples (~0.16 ms, accounting for causal filter group delay)
+        assert abs(marked_lat - peak_sample_sweep0) <= 5, (
+            f"Event marker at sample {marked_lat} does not align with peak at {peak_sample_sweep0}!"
+        )
+
+        # 3. Activity-dependent slowing: sweep 3 peak should have shifted to the right (higher latency)
+        sweep3 = erp_ch0[3].magnitude if hasattr(erp_ch0[3], "magnitude") else erp_ch0[3]
+        search_window3 = sweep3[650:950]
+        peak_sample_sweep3 = 650 + int(np.argmax(search_window3))
+        assert peak_sample_sweep3 >= peak_sample_sweep0, (
+            f"Expected slowing: sweep 3 ({peak_sample_sweep3}) should be >= sweep 0 ({peak_sample_sweep0})"
+        )
+
+        # 4. Multi-channel footprint: CH1 should have the same spike offset by propagation delay
+        erp_ch1 = state._live_aux_erp_buffers["CH1"].data
+        sweep0_ch1 = erp_ch1[0].magnitude if hasattr(erp_ch1[0], "magnitude") else erp_ch1[0]
+        peak_ch1 = 650 + int(np.argmax(sweep0_ch1[650:850]))
+        # Conduction delay: CH1 is delayed relative to CH0 by ~4 samples (+0.133 ms)
+        assert peak_ch1 >= peak_sample_sweep0
+
+        # Spatial attenuation on sweep 0:
+        erp_ch2 = state._live_aux_erp_buffers["CH2"].data
+        sweep0_ch2 = erp_ch2[0].magnitude if hasattr(erp_ch2[0], "magnitude") else erp_ch2[0]
+        peak_ch2 = 650 + int(np.argmax(sweep0_ch2[650:850]))
+        assert peak_ch2 >= peak_ch1
+        # More distant channel CH2 shows clear spatial attenuation relative to primary CH0
+        assert sweep0[peak_sample_sweep0] > sweep0_ch2[peak_ch2]
+
+        # 5. Distinct noise profiles: CH0, CH2 (clean low-noise), and CH3 (broadband hash) have distinct noise profiles
+        # Measure noise in baseline period (samples 100:600)
+        std_ch0 = np.std(sweep0[100:600])
+        erp_ch2 = state._live_aux_erp_buffers["CH2"].data
+        sweep0_ch2 = erp_ch2[0].magnitude if hasattr(erp_ch2[0], "magnitude") else erp_ch2[0]
+        std_ch2 = np.std(sweep0_ch2[100:600])
+        erp_ch3 = state._live_aux_erp_buffers["CH3"].data
+        sweep0_ch3 = erp_ch3[0].magnitude if hasattr(erp_ch3[0], "magnitude") else erp_ch3[0]
+        std_ch3 = np.std(sweep0_ch3[100:600])
+
+        # CH2 is a low-noise contact (significantly lower RMS than CH0)
+        assert std_ch2 < std_ch0 - 0.5
+        # CH3 is a broadband hash contact (significantly higher RMS than CH0)
+        assert std_ch3 > std_ch0 + 0.5
+
+        live_view.stop_stream()
+    finally:
+        server.stop()
+
+

@@ -136,7 +136,7 @@ class OpenEphysLiveView(QWidget):
 
         self.spin_pre_ms = QDoubleSpinBox()
         self.spin_pre_ms.setRange(0.0, 500.0)
-        self.spin_pre_ms.setValue(50.0)
+        self.spin_pre_ms.setValue(0.0)
         self.spin_pre_ms.setSuffix(" ms")
 
         self.chk_online_filter = QCheckBox("Online Bandpass (500 – 7000 Hz)")
@@ -442,11 +442,13 @@ class OpenEphysLiveView(QWidget):
 
         if hasattr(self.state, "append_sweep"):
             if not getattr(self.state, "is_streaming", False) or self.state.event_signal is None:
+                active_chans = self._parse_active_channels()
                 self.state.start_live_session(
                     sampling_rate=sample_rate,
                     window_size_ms=self.spin_window_ms.value(),
                     channel_name=f"CH{self.spin_rec_chan.value()}",
                     units=pq.uV,
+                    aux_channels=[f"CH{c}" for c in active_chans],
                 )
             self.state.follow_live = self.chk_follow_live.isChecked()
             self.state.append_sweep(
@@ -512,9 +514,20 @@ class OpenEphysLiveView(QWidget):
                 break
 
         if target_sg is None:
+            active_chans = self._parse_active_channels()
+            primary_ch = f"CH{self.spin_rec_chan.value()}"
+            neighbors = [f"CH{c}" for c in active_chans if c != self.spin_rec_chan.value()]
             evt = Event(np.array([spike_time_s]) * pq.s, name=unit_name)
             evt.annotations["type"] = "unit"
-            target_sg = tracked_neuron_unit(event=evt)
+            evt.annotations["channel"] = primary_ch
+            evt.annotations["neighbor_channels"] = neighbors
+            evt.annotations["fibre_type"] = "C-fibre"
+            target_sg = tracked_neuron_unit(
+                event=evt,
+                channel=primary_ch,
+                neighbor_channels=neighbors,
+                fibre_type="C-fibre",
+            )
             self.state.spike_groups.append(target_sg)
         else:
             old_times = list(target_sg.event.rescale(pq.s).magnitude)

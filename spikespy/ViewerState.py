@@ -1201,7 +1201,13 @@ class ViewerState(QObject):
             else self.sampling_rate
         )
 
+        sr_val = (
+            float(self.sampling_rate.rescale(pq.Hz).magnitude)
+            if hasattr(self.sampling_rate, "rescale")
+            else float(self.sampling_rate or 30000.0)
+        )
         is_2d = hasattr(sweep_waveform, "ndim") and sweep_waveform.ndim == 2
+        pre_idx = int(round(pre_offset_s * sr_val)) if pre_offset_s > 0 else 0
 
         if is_2d:
             n_ch = sweep_waveform.shape[0]
@@ -1216,7 +1222,7 @@ class ViewerState(QObject):
                     ch_wave,
                     units=units,
                     sampling_rate=sr,
-                    t_start=stim_ts_q + (pre_offset_s * pq.s),
+                    t_start=stim_ts_q - (pre_offset_s * pq.s),
                     name=ch_name,
                 )
                 if hasattr(self, "_live_channel_signals") and ch_name in self._live_channel_signals:
@@ -1226,9 +1232,11 @@ class ViewerState(QObject):
 
                 if hasattr(self, "_live_aux_erp_buffers") and ch_name in self._live_aux_erp_buffers:
                     aux_buf = self._live_aux_erp_buffers[ch_name]
-                    aux_buf.append_sweep(ch_wave[: aux_buf.window_samples])
+                    erp_wave = ch_wave[pre_idx : pre_idx + aux_buf.window_samples]
+                    aux_buf.append_sweep(erp_wave)
                 elif ch_name == getattr(self.analog_signal, "name", "") and self._live_erp_buffer is not None:
-                    self._live_erp_buffer.append_sweep(ch_wave[: self._live_erp_buffer.window_samples])
+                    erp_wave = ch_wave[pre_idx : pre_idx + self._live_erp_buffer.window_samples]
+                    self._live_erp_buffer.append_sweep(erp_wave)
 
             primary_waveform = (
                 sweep_waveform[0]
@@ -1241,7 +1249,7 @@ class ViewerState(QObject):
                 sweep_waveform,
                 units=units,
                 sampling_rate=sr,
-                t_start=stim_ts_q + (pre_offset_s * pq.s),
+                t_start=stim_ts_q - (pre_offset_s * pq.s),
                 name=self.analog_signal.name if self.analog_signal is not None else "rd.0",
             )
             if hasattr(self, "_live_channel_signals") and getattr(self.analog_signal, "name", "") in self._live_channel_signals:
@@ -1249,16 +1257,15 @@ class ViewerState(QObject):
             elif isinstance(self.analog_signal, MultiAnalogSignal):
                 self.analog_signal.append_signal(sig_slice)
 
-            # Appends the [0, window_samples] portion to primary buffer
+            # Stimulus-locked ERP buffer starts at t=0 (offset by pre_idx)
             cur_ch_name = getattr(self.analog_signal, "name", "")
             if hasattr(self, "_live_aux_erp_buffers") and cur_ch_name in self._live_aux_erp_buffers:
-                self._live_aux_erp_buffers[cur_ch_name].append_sweep(
-                    sweep_waveform[: self._live_aux_erp_buffers[cur_ch_name].window_samples]
-                )
+                aux_buf = self._live_aux_erp_buffers[cur_ch_name]
+                erp_wave = sweep_waveform[pre_idx : pre_idx + aux_buf.window_samples]
+                aux_buf.append_sweep(erp_wave)
             elif self._live_erp_buffer is not None:
-                self._live_erp_buffer.append_sweep(
-                    sweep_waveform[: self._live_erp_buffer.window_samples]
-                )
+                erp_wave = sweep_waveform[pre_idx : pre_idx + self._live_erp_buffer.window_samples]
+                self._live_erp_buffer.append_sweep(erp_wave)
 
             # Handle aux sweeps if any
             if aux_sweeps and hasattr(self, "_live_aux_erp_buffers") and self._live_aux_erp_buffers:
@@ -1267,18 +1274,19 @@ class ViewerState(QObject):
                         continue  # Do not double-append to primary
                     if aux_ch in self._live_aux_erp_buffers:
                         aux_buf = self._live_aux_erp_buffers[aux_ch]
-                        aux_buf.append_sweep(aux_wave[: aux_buf.window_samples])
+                        erp_aux = aux_wave[pre_idx : pre_idx + aux_buf.window_samples]
+                        aux_buf.append_sweep(erp_aux)
                     if hasattr(self, "_live_channel_signals") and aux_ch in self._live_channel_signals:
                         aux_sig = neo.AnalogSignal(
                             aux_wave,
                             units=units,
                             sampling_rate=sr,
-                            t_start=stim_ts_q + (pre_offset_s * pq.s),
+                            t_start=stim_ts_q - (pre_offset_s * pq.s),
                             name=aux_ch,
                         )
                         self._live_channel_signals[aux_ch].append_signal(aux_sig)
 
-            primary_waveform = sweep_waveform
+            primary_waveform = sweep_waveform[pre_idx :]
 
         # Incrementally computes peaks (find_peaks(d) and find_peaks(-d)) for this single new sweep
         if self._peaks is None:
@@ -1383,12 +1391,20 @@ class ViewerState(QObject):
                     name=unit_name,
                     units=pq.s,
                 )
+                primary_ch = getattr(self.analog_signal, "name", "CH0")
+                neighbors = [c for c in getattr(self, "active_channel_names", []) if c != primary_ch]
                 evt.annotations["type"] = "unit"
                 evt.annotations["unit"] = len(self.spike_groups)
                 evt.annotations["notes"] = ""
-                evt.annotations["fibre_type"] = ""
+                evt.annotations["fibre_type"] = "C-fibre"
+                evt.annotations["channel"] = primary_ch
+                evt.annotations["neighbor_channels"] = neighbors
                 sg = tracked_neuron_unit(
                     event=evt,
+                    channel=primary_ch,
+                    neighbor_channels=neighbors,
+                    fibre_type="C-fibre",
+                    notes="",
                     idx_arr=[None]
                     * (
                         len(self.event_signal)
