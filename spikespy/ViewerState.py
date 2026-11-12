@@ -722,6 +722,13 @@ class ViewerState(QObject):
             return
         if stimno is None:
             stimno = self.stimno
+        if (
+            self.event_signal is None
+            or len(self.event_signal) == 0
+            or stimno < 0
+            or stimno >= len(self.event_signal)
+        ):
+            return
 
         sg = self.spike_groups[unit_idx]
         evt = sg.event
@@ -758,6 +765,8 @@ class ViewerState(QObject):
         if latency is None:
             sg.idx_arr[stimno] = None
         else:
+            if latency < 0 and latency not in (-1, -2):
+                latency = 0
             if (
                 latency == -1
             ):  # if latency is -1, we want to find the previous spike and use that as the latency

@@ -325,11 +325,16 @@ class SingleTraceView(QMainWindow):
 
     @Slot()
     def view_clicked(self, e: MouseEvent):
-        if self.toolbar.mode != "" or e.button != 1:
+        if self.toolbar.mode != "" or e.button != 1 or e.inaxes != self.ax or e.xdata is None:
             return
 
-        if e.inaxes == self.ax:
-            self.set_cur_pos(e.xdata * self.state.sampling_rate)
+        try:
+            if np.isnan(e.xdata):
+                return
+            sr = float(self.state.sampling_rate) if self.state and self.state.sampling_rate is not None else 10000.0
+            self.set_cur_pos(e.xdata * sr)
+        except Exception:
+            pass
 
     @Slot()
     def setupFigure(self):
@@ -956,15 +961,30 @@ class SingleTraceView(QMainWindow):
         self.blit_data_topax = self.fig.canvas.copy_from_bbox(self.topax.bbox)
 
     def set_cur_pos(self, x):
-        x = round(x)
-        dpts = self.state.get_erp()[self.state.stimno]
-        if self.select_local_maxima_width > 1:
-            w = self.select_local_maxima_width
-            if x < 0 + w or x > self.state.analog_signal_erp.shape[1] - w:
-                return
+        if x is None or np.isnan(x) or self.state is None:
+            return
+        erp = self.state.get_erp()
+        if erp is None or self.state.stimno < 0 or self.state.stimno >= len(erp):
+            return
+        dpts = erp[self.state.stimno]
+        if hasattr(dpts, "magnitude"):
+            dpts = dpts.magnitude
+        n_pts = len(dpts)
+        if n_pts == 0:
+            return
+
+        x_idx = max(0, min(n_pts - 1, int(round(x))))
+        w = int(self.select_local_maxima_width)
+        if w > 1:
+            start_w = max(0, x_idx - w)
+            end_w = min(n_pts, x_idx + w + 1)
+            if end_w > start_w:
+                sub_slice = np.abs(dpts[start_w:end_w])
+                if len(sub_slice) > 0:
+                    x_idx = start_w + int(np.argmax(sub_slice))
 
         target_unit_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group
-        self.state.setUnit(x, unitid=target_unit_idx)
+        self.state.setUnit(x_idx, unitid=target_unit_idx)
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Z:  # Although the zoom works, it can't be undone...

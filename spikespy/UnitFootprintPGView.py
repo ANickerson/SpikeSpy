@@ -67,6 +67,7 @@ class UnitFootprintPGView(QMainWindow):
         # Central Graphics Layout Widget
         self.glw = pg.GraphicsLayoutWidget()
         self.glw.setBackground("w")
+        self.glw.scene().sigMouseClicked.connect(self._on_scene_clicked)
 
         central_widget = QWidget(self)
         layout = QVBoxLayout(central_widget)
@@ -303,7 +304,7 @@ class UnitFootprintPGView(QMainWindow):
         valid_samples = []
 
         if getattr(sg, "idx_arr", None) is not None and len(sg.idx_arr) > 0:
-            for s_idx, a in enumerate(sg.idx_arr):
+            for s_idx, a in enumerate(list(sg.idx_arr)):
                 if a is not None and len(a) > 0 and a[0] is not None:
                     valid_sweeps.append(s_idx)
                     valid_samples.append(int(a[0]))
@@ -679,9 +680,6 @@ class UnitFootprintPGView(QMainWindow):
         self.glw.ci.layout.setColumnStretchFactor(0, 4)
         self.glw.ci.layout.setColumnStretchFactor(1, 1)
 
-        # Interactive click handler
-        heat_plot.scene().sigMouseClicked.connect(self._on_plot_clicked)
-
     def _plot_multi_unit_grid(self):
         units = [
             sg
@@ -789,21 +787,36 @@ class UnitFootprintPGView(QMainWindow):
                 else f"Unit {u_idx}"
             )
             plot.setTitle(f"<b>{unit_name}</b> (N={fp['n_events']}, Best: {best_ch})")
-            plot.scene().sigMouseClicked.connect(self._on_grid_plot_clicked)
+
+    def _on_scene_clicked(self, event):
+        """Unified click handler dispatching to composite or grid mode handler."""
+        if getattr(event, "button", None) != Qt.LeftButton:
+            return
+        if self.combo_mode.currentIndex() == 0:
+            self._on_plot_clicked(event)
+        elif self.combo_mode.currentIndex() == 1:
+            self._on_grid_plot_clicked(event)
 
     def _on_plot_clicked(self, event):
         """Click handler for selecting primary channel in Single Unit Composite mode."""
         if self.combo_mode.currentIndex() != 0 or not self.current_channels:
             return
         plot_item = self.glw.getItem(0, 0)
-        if plot_item is None:
+        if plot_item is None or not hasattr(plot_item, "vb"):
             return
-        pos = plot_item.vb.mapSceneToView(event.scenePos())
-        ch_idx = int(round(pos.y()))
-        if 0 <= ch_idx < len(self.current_channels):
-            clicked_ch = self.current_channels[ch_idx]
-            if self.state is not None and hasattr(self.state, "set_active_channel"):
-                self.state.set_active_channel(clicked_ch)
+        if not plot_item.sceneBoundingRect().contains(event.scenePos()):
+            return
+        try:
+            pos = plot_item.vb.mapSceneToView(event.scenePos())
+            if np.isnan(pos.y()):
+                return
+            ch_idx = int(round(pos.y()))
+            if 0 <= ch_idx < len(self.current_channels):
+                clicked_ch = self.current_channels[ch_idx]
+                if self.state is not None and hasattr(self.state, "set_active_channel"):
+                    self.state.set_active_channel(clicked_ch)
+        except Exception:
+            pass
 
     def _on_grid_plot_clicked(self, event):
         """Click handler for jumping to unit and channel in Multi-Unit Grid mode."""

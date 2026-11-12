@@ -16,6 +16,7 @@ import pyqtgraph as pg
 
 from .ViewerState import ViewerState
 from .ChannelGroupBar import ChannelGroupBar
+from .helpers import qsignal_throttle
 
 
 class UnitPGView(QMainWindow):
@@ -37,6 +38,10 @@ class UnitPGView(QMainWindow):
         self.connections: List = []
         self.lines: Dict[int, np.ndarray] = {}
         self.w: int = 0
+        self._dirty: bool = False
+        self._was_shown: bool = False
+        self._user_hidden: bool = False
+        self.on_new_sweep_throttled = qsignal_throttle(self._on_new_sweep_core, 50)
 
         # Plot items
         self.all_snippets_curve = pg.PlotDataItem(pen=pg.mkPen(color=(160, 160, 160, 80), width=1), connect="finite")
@@ -99,14 +104,58 @@ class UnitPGView(QMainWindow):
         self.connections.append(self.state.onUnitGroupChange.connect(self.update_all))
         self.connections.append(self.state.onLoadNewFile.connect(self.update_all))
         if hasattr(self.state, "onNewSweep"):
-            self.connections.append(self.state.onNewSweep.connect(self.on_new_sweep))
+            self.connections.append(self.state.onNewSweep.connect(self.on_new_sweep_throttled))
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.connections.append(self.state.onNewSpikeEvents.connect(lambda *args: self.update_all()))
+            self.connections.append(self.state.onNewSpikeEvents.connect(self.on_new_sweep_throttled))
 
+        self.update_all()
+
+    def is_view_culled(self) -> bool:
+        try:
+            if getattr(self, "_user_hidden", False):
+                return True
+            win = self.window()
+            if win is not None and win.isMinimized():
+                return True
+            if self.parentWidget() is not None and not self.isVisible():
+                return True
+            if getattr(self, "_was_shown", False) and not self.isVisible():
+                return True
+            return False
+        except Exception:
+            return False
+
+    def setVisible(self, visible: bool):
+        if not visible:
+            self._user_hidden = True
+        else:
+            self._user_hidden = False
+            self._was_shown = True
+        super().setVisible(visible)
+        if visible and getattr(self, "_dirty", False):
+            self._dirty = False
+            self.update_all()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._user_hidden = True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._was_shown = True
+        self._user_hidden = False
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self.update_all()
+
+    def _on_new_sweep_core(self, *args):
         self.update_all()
 
     def on_new_sweep(self, *args):
-        self.update_all()
+        if hasattr(self, "on_new_sweep_throttled"):
+            self.on_new_sweep_throttled(*args)
+        else:
+            self._on_new_sweep_core(*args)
 
     def unset_connections(self):
         if self.state is not None:
@@ -119,6 +168,11 @@ class UnitPGView(QMainWindow):
 
     @Slot()
     def update_all(self):
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        self._dirty = False
+
         if self.state is None or self.state.analog_signal is None:
             return
 
@@ -144,20 +198,24 @@ class UnitPGView(QMainWindow):
         min_y = -0.1
         max_y = 0.1
 
-        for i, idx, d in zip(range(len(sig_erp)), idx_arr, sig_erp):
+        if idx_arr is None:
+            self.all_snippets_curve.clear()
+            self.mean_curve.clear()
+            self.selected_curve.clear()
+            return
+
+        idx_arr_list = list(idx_arr)
+        for i, idx, d in zip(range(len(sig_erp)), idx_arr_list, sig_erp):
             if idx is None:
                 continue
 
-            w_span = [-self.w, self.w]
             xmin = idx[0] - self.w
-            if xmin < 0:
-                w_span[0] = abs(xmin) + 1
-                xmin = 0
-
             xmax = idx[0] + self.w
-            if xmax > len(d):
-                w_span[1] = abs(xmax - len(d))
-                xmax = len(d)
+            w_left = max(0, -xmin)
+            w_right = max(0, xmax - len(d))
+            w_span = [-self.w + w_left, self.w - w_right]
+            xmin = max(0, xmin)
+            xmax = min(len(d), xmax)
 
             ydata = d[xmin:xmax]
             if hasattr(ydata, "magnitude"):
@@ -211,34 +269,34 @@ class UnitPGView(QMainWindow):
     def _on_click(self, event):
         if event.button() != Qt.LeftButton or not self.lines or self.state is None:
             return
+        if not hasattr(self.main_plot, "vb") or not self.main_plot.sceneBoundingRect().contains(event.scenePos()):
+            return
 
         pos = self.main_plot.vb.mapSceneToView(event.scenePos())
         xdata = pos.x()
         ydata = pos.y()
+        if np.isnan(xdata) or np.isnan(ydata):
+            return
 
         closest_line = None
         closest_dist = float("inf")
 
-        # Find closest snippet trace to mouse click
+        # Fast O(N) lookup by vertical distance near clicked sample
+        target_sample = int(round(xdata))
         for i, line in self.lines.items():
-            for j in range(len(line) - 1):
-                p1, p2 = line[j], line[j + 1]
-                line_vec = p2 - p1
-                point_vec = np.array([xdata, ydata]) - p1
-                line_len = np.dot(line_vec, line_vec)
-                if line_len == 0:
-                    dist = float(np.linalg.norm(point_vec))
-                else:
-                    t = max(0.0, min(1.0, float(np.dot(point_vec, line_vec) / line_len)))
-                    projection = p1 + t * line_vec
-                    dist = float(np.linalg.norm(np.array([xdata, ydata]) - projection))
-
+            if len(line) == 0:
+                continue
+            x_col = line[:, 0]
+            idx = np.argmin(np.abs(x_col - target_sample))
+            if abs(x_col[idx] - target_sample) <= 3:
+                dist = abs(line[idx, 1] - ydata)
                 if dist < closest_dist:
                     closest_dist = dist
                     closest_line = i
 
-        if closest_line is not None:
-            self.state.setStimNo(closest_line)
+        if closest_line is not None and self.state.event_signal is not None:
+            if 0 <= closest_line < len(self.state.event_signal):
+                self.state.setStimNo(closest_line)
 
     def closeEvent(self, event):
         self.unset_connections()

@@ -1305,11 +1305,18 @@ class MultiTraceView(QMainWindow):
             self.view.draw_idle()
 
     def view_clicked(self, e: MouseEvent):
-        if self.toolbar.mode != "" or e.button != 1:
+        if self.toolbar.mode != "" or e.button != 1 or e.inaxes != self.ax or e.ydata is None:
             return
 
-        # if e.inaxes == self.ax:
-        self.state.setStimNo(round(e.ydata))
+        try:
+            if np.isnan(e.ydata):
+                return
+            stimno = int(round(e.ydata))
+            if self.state and self.state.event_signal is not None:
+                if 0 <= stimno < len(self.state.event_signal):
+                    self.state.setStimNo(stimno)
+        except Exception:
+            pass
 
     def toggleMaxMean(self):
         if self.toggleMaxMeanButton.isChecked():

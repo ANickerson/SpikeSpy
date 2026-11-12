@@ -26,6 +26,7 @@ import PySide6QtAds as QtAds
 
 from .ChannelGroupBar import ChannelGroupBar
 from .ViewerState import ViewerState
+from .helpers import qsignal_throttle
 
 
 class SubViewCard(QFrame):
@@ -105,6 +106,7 @@ class ChannelGroupContainerView(QMainWindow):
         self._current_orientation: str = "vertical"
         self._current_layout: str = "vertical"
         self._connections: List = []
+        self._on_new_sweep_throttled = qsignal_throttle(self._on_new_sweep_core, 50)
 
         # 1. Advanced Docking Manager for nested sub-windows
         self.dock_manager = QtAds.CDockManager(self)
@@ -277,9 +279,15 @@ class ChannelGroupContainerView(QMainWindow):
             self.chk_follow_live.blockSignals(False)
         self._sync_all_children()
 
-    def _on_new_sweep(self, stimno: Optional[int] = None):
+    def _on_new_sweep_core(self, stimno: Optional[int] = None):
         if self.is_following_live():
             self._sync_all_children()
+
+    def _on_new_sweep(self, stimno: Optional[int] = None):
+        if hasattr(self, "_on_new_sweep_throttled"):
+            self._on_new_sweep_throttled(stimno)
+        else:
+            self._on_new_sweep_core(stimno)
 
     def set_state(self, state: ViewerState):
         self.state = state
@@ -298,7 +306,7 @@ class ChannelGroupContainerView(QMainWindow):
         self._connections.clear()
 
         if self.state is not None and hasattr(self.state, "onNewSweep"):
-            self._connections.append(self.state.onNewSweep.connect(self._on_new_sweep))
+            self._connections.append(self.state.onNewSweep.connect(self._on_new_sweep_throttled))
 
     def add_view_by_key(self, key: str) -> Optional[QWidget]:
         """Creates a child view by string key and adds it into this container."""
@@ -429,8 +437,14 @@ class ChannelGroupContainerView(QMainWindow):
 
     def _sync_all_children(self):
         """Propagates channel / unit binding changes to all embedded children."""
-        for child in self.sub_views:
-            self._sync_child(child)
+        if getattr(self, "_is_syncing_children", False):
+            return
+        self._is_syncing_children = True
+        try:
+            for child in self.sub_views:
+                self._sync_child(child)
+        finally:
+            self._is_syncing_children = False
 
     def _sync_child(self, child: QWidget):
         """Synchronizes an individual child view's channel / unit binding to this container."""

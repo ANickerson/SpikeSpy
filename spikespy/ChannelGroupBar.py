@@ -635,8 +635,10 @@ class ChannelGroupBar(QToolBar):
 
     def bind_to_unit(self, unit_idx: int):
         """Programmatically locks this component to the specified unit."""
+        if self.get_bound_unit() == unit_idx:
+            return
         idx = self.find_unit_data_index(unit_idx)
-        if idx >= 0:
+        if idx >= 0 and self.combo_unit.currentIndex() != idx:
             self.combo_unit.setCurrentIndex(idx)
 
     def bind_to_channels(self, channels: List[str]):

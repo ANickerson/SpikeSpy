@@ -81,9 +81,13 @@ class LiveTrackingManager(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._active_workers: List[AsyncTrackingWorker] = []
+        self._active_task_count: int = 0
 
     def _on_spike_detected(self, unit_idx: int, detected_sample: int, stimno: int):
         self.spike_tracked.emit(unit_idx, detected_sample, stimno)
+
+    def _on_worker_finished(self):
+        self._active_task_count = max(0, getattr(self, "_active_task_count", 1) - 1)
 
     def track_stimulus_async(
         self,
@@ -94,6 +98,9 @@ class LiveTrackingManager(QObject):
         """Dispatches background tracking tasks for all enabled units for the given stimulus sweep.
         Returns the number of tracking tasks dispatched.
         """
+        if getattr(self, "_active_task_count", 0) >= 12:
+            return 0
+
         if (
             state is None
             or state.event_signal is None
@@ -197,6 +204,8 @@ class LiveTrackingManager(QObject):
             )
             # Connect worker signal to manager slot
             worker.signals.spike_detected.connect(self._on_spike_detected)
+            worker.signals.finished.connect(self._on_worker_finished)
+            self._active_task_count = getattr(self, "_active_task_count", 0) + 1
             QThreadPool.globalInstance().start(worker)
             dispatched += 1
 

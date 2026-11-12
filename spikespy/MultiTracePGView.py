@@ -393,10 +393,11 @@ class MultiTracePGView(QMainWindow):
 
         # Normal mode: single left-click selects stimulus sweep
         if event.button() == Qt.LeftButton:
-            stimno = int(round(pos.y()))
-            if self.state and self.state.event_signal is not None:
-                if 0 <= stimno < len(self.state.event_signal):
-                    self.state.setStimNo(stimno)
+            if not np.isnan(pos.y()):
+                stimno = int(round(pos.y()))
+                if self.state and self.state.event_signal is not None:
+                    if 0 <= stimno < len(self.state.event_signal):
+                        self.state.setStimNo(stimno)
 
     def _on_plot_mouse_moved(self, scene_pos):
         """Draw dynamic preview from the last point to cursor when selector is active."""
@@ -727,7 +728,7 @@ class MultiTracePGView(QMainWindow):
         # 1. Other Units (only if "Others" checkbox is checked)
         if self.includeAllUnitsCheckBox.isChecked():
             for i, unit in enumerate(self.state.spike_groups):
-                if i == target_unit_idx:
+                if i == target_unit_idx or getattr(unit, "idx_arr", None) is None:
                     continue
                 points = [(a[0], s_idx) for s_idx, a in enumerate(unit.idx_arr) if a is not None]
                 if not points:
@@ -756,7 +757,11 @@ class MultiTracePGView(QMainWindow):
         # 2. Tracked Unit (Red) - strictly target_unit_idx only
         if self.includeUnitCheckbox.isChecked() and 0 <= target_unit_idx < len(self.state.spike_groups):
             sg = self.state.spike_groups[target_unit_idx]
-            points = [(a[0], s_idx) for s_idx, a in enumerate(sg.idx_arr) if a is not None]
+            points = (
+                [(a[0], s_idx) for s_idx, a in enumerate(sg.idx_arr) if a is not None]
+                if getattr(sg, "idx_arr", None) is not None
+                else []
+            )
             if points:
                 pts_arr = np.array(points)
                 self.tracked_unit_scatter.setData(
@@ -864,11 +869,12 @@ class MultiTracePGView(QMainWindow):
         if self.settingsDialog is None:
             self.settingsDialog = DialogSignalSelect(options=self.rightPlots)
 
-        def updateView(k, v):
-            self.rightPlots[k] = v
-            self.plot_right_axis()
+            def updateView(k, v):
+                self.rightPlots[k] = v
+                self.plot_right_axis()
 
-        self.settingsDialog.changeSelection.connect(updateView)
+            self.settingsDialog.changeSelection.connect(updateView)
+
         self.plot_right_axis()
 
     def plot_right_axis(self):

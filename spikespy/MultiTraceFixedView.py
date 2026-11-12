@@ -92,7 +92,9 @@ class MultiTraceFixedView(QMatplotlib):
         con = self.state.onStimNoChange.connect(lambda x: self.update_figure())
         self.connections.append(con)
         if hasattr(self.state, "onNewSweep"):
-            con2 = self.state.onNewSweep.connect(lambda *args: self.update_figure())
+            from spikespy.helpers import qsignal_throttle
+            self._throttled_update = qsignal_throttle(self.update_figure, 40)
+            con2 = self.state.onNewSweep.connect(lambda *args: self._throttled_update())
             self.connections.append(con2)
         if hasattr(self.state, "onNewSpikeEvents"):
             con3 = self.state.onNewSpikeEvents.connect(lambda *args: self.update_figure())

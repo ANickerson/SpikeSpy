@@ -18,6 +18,7 @@ import pyqtgraph as pg
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .processing import create_erp_signals
 from .ChannelGroupBar import ChannelGroupBar
+from .helpers import qsignal_throttle
 
 
 class SingleTraceTimeAxisItem(pg.AxisItem):
@@ -106,6 +107,11 @@ class SingleTracePGView(QMainWindow):
         self.closest_pos: int = 0
         self.conv: Optional[np.ndarray] = None
         self.task: Optional[PGUpdateConv] = None
+        self._dirty: bool = False
+        self._was_shown: bool = False
+        self._user_hidden: bool = False
+        self.on_new_sweep_throttled = qsignal_throttle(self._on_new_sweep_core, 40)
+        self.update_histogram_throttled = qsignal_throttle(self._update_histogram_core, 500)
 
         # Graphics items
         self.top_lines: List[pg.InfiniteLine] = []
@@ -225,12 +231,50 @@ class SingleTracePGView(QMainWindow):
         if hasattr(self.state, "onNewSweep"):
             self.connections.append(self.state.onNewSweep.connect(self.on_new_sweep))
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.connections.append(self.state.onNewSpikeEvents.connect(lambda *args: self.update_figure()))
+            self.connections.append(self.state.onNewSpikeEvents.connect(self.on_new_sweep))
 
         self._setup_done = False
         self.setup_figure()
 
-    def on_new_sweep(self, stimno: Optional[int] = None):
+    def is_view_culled(self) -> bool:
+        try:
+            if getattr(self, "_user_hidden", False):
+                return True
+            win = self.window()
+            if win is not None and win.isMinimized():
+                return True
+            if self.parentWidget() is not None and not self.isVisible():
+                return True
+            if getattr(self, "_was_shown", False) and not self.isVisible():
+                return True
+            return False
+        except Exception:
+            return False
+
+    def setVisible(self, visible: bool):
+        if not visible:
+            self._user_hidden = True
+        else:
+            self._user_hidden = False
+            self._was_shown = True
+        super().setVisible(visible)
+        if visible and getattr(self, "_dirty", False):
+            self._dirty = False
+            self.update_figure()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._user_hidden = True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._was_shown = True
+        self._user_hidden = False
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self.update_figure()
+
+    def _on_new_sweep_core(self, stimno: Optional[int] = None):
         if self.state is None:
             return
         erp = self.get_erp_signal()
@@ -240,6 +284,14 @@ class SingleTracePGView(QMainWindow):
             self.setup_figure()
             self._setup_done = True
         self.update_figure()
+
+    def on_new_sweep(self, stimno: Optional[int] = None):
+        if not getattr(self, "_setup_done", False):
+            self._on_new_sweep_core(stimno)
+        elif hasattr(self, "on_new_sweep_throttled"):
+            self.on_new_sweep_throttled(stimno)
+        else:
+            self._on_new_sweep_core(stimno)
 
     def unset_connections(self):
         if self.state is not None:
@@ -267,10 +319,16 @@ class SingleTracePGView(QMainWindow):
             self.main_plot.setYRange(-ylim, ylim, padding=0)
 
         self._setup_done = True
-        self.update_histogram()
+        self._update_histogram_core()
         self.update_figure()
 
     def update_histogram(self):
+        if hasattr(self, "update_histogram_throttled"):
+            self.update_histogram_throttled()
+        else:
+            self._update_histogram_core()
+
+    def _update_histogram_core(self):
         if self.state is None or self.state.event_signal is None:
             return
 
@@ -314,6 +372,11 @@ class SingleTracePGView(QMainWindow):
         self.update_figure()
 
     def update_figure(self):
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        self._dirty = False
+
         if self.state is None or self.state.event_signal is None:
             return
 
@@ -428,22 +491,39 @@ class SingleTracePGView(QMainWindow):
     def _on_plot_clicked(self, event):
         if event.button() != Qt.LeftButton or self.state is None:
             return
+        if not hasattr(self.main_plot, "vb") or not self.main_plot.sceneBoundingRect().contains(event.scenePos()):
+            return
         pos = self.main_plot.vb.mapSceneToView(event.scenePos())
-        sample_x = pos.x() * float(self.state.sampling_rate)
+        if np.isnan(pos.x()):
+            return
+        sr = float(self.state.sampling_rate) if self.state.sampling_rate is not None else 10000.0
+        sample_x = pos.x() * sr
         self.set_cur_pos(sample_x)
 
     def set_cur_pos(self, x: float):
-        x_idx = int(round(x))
+        if np.isnan(x):
+            return
         erp = self.get_erp_signal()
-        if erp is None or self.state.stimno >= len(erp):
+        if erp is None or self.state is None or self.state.stimno < 0 or self.state.stimno >= len(erp):
             return
         dpts = erp[self.state.stimno]
-        w = self.select_local_maxima_width
+        if hasattr(dpts, "magnitude"):
+            dpts = dpts.magnitude
+        n_pts = len(dpts)
+        if n_pts == 0:
+            return
+
+        # Clamp x_idx to valid positive range within waveform bounds
+        x_idx = max(0, min(n_pts - 1, int(round(x))))
+        w = int(self.select_local_maxima_width)
 
         if w > 1:
-            if x_idx < w or x_idx > len(dpts) - w:
-                return
-            x_idx += int(np.argmax(np.abs(dpts[x_idx - w : x_idx + w]))) - w
+            start_w = max(0, x_idx - w)
+            end_w = min(n_pts, x_idx + w + 1)
+            if end_w > start_w:
+                sub_slice = np.abs(dpts[start_w:end_w])
+                if len(sub_slice) > 0:
+                    x_idx = start_w + int(np.argmax(sub_slice))
 
         target_unit_idx = self.get_target_unit_idx()
         self.state.setUnit(x_idx, unitid=target_unit_idx)

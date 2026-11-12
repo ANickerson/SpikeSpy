@@ -510,6 +510,10 @@ class UnitFootprintView(QMainWindow):
             self._dirty = True
             return
 
+        if hasattr(self, "matplotlib_toolbar") and self.matplotlib_toolbar is not None and self.matplotlib_toolbar.mode != "":
+            self._dirty = True
+            return
+
         self.render_count = getattr(self, "render_count", 0) + 1
         for ax in list(self.figure.axes):
             ax.remove()
@@ -845,6 +849,8 @@ class UnitFootprintView(QMainWindow):
 
     def on_click(self, event):
         """Interactive click handler for channel selection and unit jumping."""
+        if getattr(event, "button", None) != 1:
+            return
         if hasattr(self, "matplotlib_toolbar") and self.matplotlib_toolbar is not None:
             if self.matplotlib_toolbar.mode != "":
                 return

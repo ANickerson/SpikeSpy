@@ -21,6 +21,7 @@ import pyqtgraph as pg
 
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
+from .helpers import qsignal_throttle
 
 
 class FixedTimeAxisItem(pg.AxisItem):
@@ -60,6 +61,10 @@ class MultiTraceFixedPGView(QMainWindow):
         self.points_scatter = pg.ScatterPlotItem(size=8, symbol="o", brush=pg.mkBrush("black"), pen=None)
 
         self._has_initialized_xrange: bool = False
+        self._dirty: bool = False
+        self._was_shown: bool = False
+        self._user_hidden: bool = False
+        self.on_new_sweep_throttled = qsignal_throttle(self._on_new_sweep_core, 40)
 
         # Independent channel group and unit binding toolbar
         self.channel_bar = ChannelGroupBar(parent=self, state=state)
@@ -192,7 +197,7 @@ class MultiTraceFixedPGView(QMainWindow):
         if hasattr(self.state, "onNewSweep"):
             self.connections.append(self.state.onNewSweep.connect(self.on_new_sweep))
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.connections.append(self.state.onNewSpikeEvents.connect(lambda *args: self.update_figure()))
+            self.connections.append(self.state.onNewSpikeEvents.connect(self.on_new_sweep))
 
         self._has_initialized_xrange = False
         self._auto_scale_needed = True
@@ -202,18 +207,64 @@ class MultiTraceFixedPGView(QMainWindow):
             self._auto_scale_needed = False
         self.update_figure()
 
+    def is_view_culled(self) -> bool:
+        try:
+            if getattr(self, "_user_hidden", False):
+                return True
+            win = self.window()
+            if win is not None and win.isMinimized():
+                return True
+            if self.parentWidget() is not None and not self.isVisible():
+                return True
+            if getattr(self, "_was_shown", False) and not self.isVisible():
+                return True
+            return False
+        except Exception:
+            return False
+
+    def setVisible(self, visible: bool):
+        if not visible:
+            self._user_hidden = True
+        else:
+            self._user_hidden = False
+            self._was_shown = True
+        super().setVisible(visible)
+        if visible and getattr(self, "_dirty", False):
+            self._dirty = False
+            self.update_figure()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._user_hidden = True
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._was_shown = True
+        self._user_hidden = False
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self.update_figure()
+
     def _on_load_new_file(self):
         self._has_initialized_xrange = False
         self._auto_scale_needed = True
         self.update_figure()
 
-    def on_new_sweep(self, *args):
+    def _on_new_sweep_core(self, *args):
         if getattr(self, "_auto_scale_needed", True):
             erp = self.get_erp_signal() if self.state else None
             if erp is not None and len(erp) > 0:
                 self._auto_scale()
                 self._auto_scale_needed = False
         self.update_figure()
+
+    def on_new_sweep(self, *args):
+        if getattr(self, "_auto_scale_needed", True):
+            self._on_new_sweep_core(*args)
+        elif hasattr(self, "on_new_sweep_throttled"):
+            self.on_new_sweep_throttled(*args)
+        else:
+            self._on_new_sweep_core(*args)
 
     def unset_connections(self):
         if self.state is not None:
@@ -238,15 +289,32 @@ class MultiTraceFixedPGView(QMainWindow):
     def _on_click(self, event):
         if event.button() != Qt.LeftButton or self.state is None:
             return
-        pos = self.main_plot.vb.mapSceneToView(event.scenePos())
-        y_val = pos.y()
-        stimno = self.state.stimno
-        start = max(stimno - self.settings.get("n_lines_pre", 5), 0)
-        target_stim = int(round(y_val) + start)
-        if 0 <= target_stim < len(self.state.event_signal):
-            self.state.setStimNo(target_stim)
+        if not hasattr(self.main_plot, "vb") or not self.main_plot.sceneBoundingRect().contains(event.scenePos()):
+            return
+        try:
+            pos = self.main_plot.vb.mapSceneToView(event.scenePos())
+            y_val = pos.y()
+            if np.isnan(y_val):
+                return
+            stimno = self.state.stimno
+            pre = self.settings.get("n_lines_pre", 5)
+            post = self.settings.get("n_lines_post", 1)
+            n_lines = pre + post + 1
+            if y_val < -0.5 or y_val >= n_lines - 0.5:
+                return
+            start = max(stimno - pre, 0)
+            target_stim = int(round(y_val) + start)
+            if self.state.event_signal is not None and 0 <= target_stim < len(self.state.event_signal):
+                self.state.setStimNo(target_stim)
+        except Exception:
+            pass
 
     def update_figure(self):
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        self._dirty = False
+
         if self.state is None or self.state.analog_signal is None or self.state.event_signal is None:
             return
 

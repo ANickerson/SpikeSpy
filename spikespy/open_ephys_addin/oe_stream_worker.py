@@ -322,8 +322,22 @@ class OpenEphysStreamWorker(QThread):
                             poller_hb.register(heartbeat_req, zmq.POLLIN)
                             if poller_hb.poll(50):
                                 heartbeat_req.recv()
+                            else:
+                                try:
+                                    poller_hb.unregister(heartbeat_req)
+                                    heartbeat_req.close(linger=0)
+                                    heartbeat_req = ctx.socket(zmq.REQ)
+                                    heartbeat_req.connect(f"tcp://{self.host}:{self.event_port}")
+                                except Exception:
+                                    pass
                         except Exception as e:
                             logger.debug("Heartbeat error: %s", e)
+                            try:
+                                heartbeat_req.close(linger=0)
+                                heartbeat_req = ctx.socket(zmq.REQ)
+                                heartbeat_req.connect(f"tcp://{self.host}:{self.event_port}")
+                            except Exception:
+                                pass
                         last_heartbeat_time = now
 
                 # Poll sockets
@@ -513,13 +527,7 @@ class OpenEphysStreamWorker(QThread):
                     bv = float(meta["bit_volts"])
                     data = data.astype(np.float32) * bv
 
-                # Expand ring buffer channels if necessary
-                if data.shape[0] > self.ring_buffer.n_channels:
-                    new_cap = self.ring_buffer.capacity
-                    new_rb = RingBuffer(data.shape[0], new_cap)
-                    self.ring_buffer = new_rb
-
-                # Append to circular ring buffer
+                # Append to circular ring buffer (RingBuffer handles channel expansion thread-safely)
                 self.ring_buffer.append(data, start_sample)
 
                 # Check analog TTL trigger if configured
@@ -623,8 +631,8 @@ class OpenEphysStreamWorker(QThread):
         )
 
         with self._pending_lock:
-            # Keep queue manageable
-            if len(self._pending_sweeps) > 100:
+            # Bound pending queue to prevent unbounded memory growth in extreme stalls
+            if len(self._pending_sweeps) > 2000:
                 self._pending_sweeps.pop(0)
             self._pending_sweeps.append(pending)
 
@@ -633,68 +641,82 @@ class OpenEphysStreamWorker(QThread):
         with self._pending_lock:
             if not self._pending_sweeps:
                 return
+            sweeps_snapshot = list(self._pending_sweeps)
 
-            remaining = []
-            for sweep in self._pending_sweeps:
-                start_samp = sweep.stim_sample - sweep.pre_samples
-                end_samp = sweep.stim_sample + sweep.window_samples
+        ready_items = []
+        remaining = []
 
-                sliced_all = self.ring_buffer.slice(start_samp, end_samp, channel=None)
+        for sweep in sweeps_snapshot:
+            start_samp = sweep.stim_sample - sweep.pre_samples
+            end_samp = sweep.stim_sample + sweep.window_samples
 
-                if sliced_all is not None:
-                    # Slicing complete!
-                    target_chans = sweep.aux_chans if sweep.aux_chans else list(self.active_channels)
-                    if sweep.rec_chan not in target_chans:
-                        target_chans = sorted(list(set(target_chans + [sweep.rec_chan])))
-
-                    valid_chans = [ch for ch in target_chans if 0 <= ch < sliced_all.shape[0]]
-                    if valid_chans:
-                        active_matrix = sliced_all[valid_chans, :].copy()
-                    else:
-                        valid_chans = [min(sweep.rec_chan, sliced_all.shape[0] - 1)]
-                        active_matrix = sliced_all[valid_chans, :].copy()
-
-                    if self.apply_filter:
-                        active_matrix = self.bandpass_filter.process(active_matrix)
-
-                    if sweep.rec_chan in valid_chans:
-                        rec_idx = valid_chans.index(sweep.rec_chan)
-                        primary_waveform = active_matrix[rec_idx]
-                    else:
-                        primary_waveform = active_matrix[0]
-
-                    aux_sweeps = {
-                        f"CH{ch}": ch_waveform
-                        for ch, ch_waveform in zip(valid_chans, active_matrix)
-                    }
-
-                    payload = {
-                        "stim_timestamp_s": sweep.stim_timestamp_s,
-                        "waveform": primary_waveform,
-                        "pre_offset_s": sweep.pre_samples / self.sample_rate,
-                        "spike_latencies_s": sweep.spike_latencies,
-                        "aux_sweeps": aux_sweeps,
-                        "channel_waveforms": aux_sweeps,
-                        "sample_rate": self.sample_rate,
-                    }
-                    self._sweeps_count += 1
-                    self.sweepReady.emit(payload)
+            sliced_all = self.ring_buffer.slice(start_samp, end_samp, channel=None)
+            if sliced_all is not None:
+                ready_items.append((sweep, sliced_all))
+            else:
+                # Check if sweep has expired (overwritten or before first_sample_index)
+                if self.ring_buffer.total_samples_written == 0 or self.ring_buffer.first_sample_index is None:
+                    remaining.append(sweep)
+                    continue
+                latest_samp = int(
+                    self.ring_buffer.timestamps[(self.ring_buffer.write_idx - 1) % self.ring_buffer.capacity]
+                )
+                earliest_samp = (
+                    latest_samp - self.ring_buffer.capacity + 1
+                    if self.ring_buffer.total_samples_written >= self.ring_buffer.capacity
+                    else self.ring_buffer.first_sample_index
+                )
+                if start_samp >= earliest_samp:
+                    remaining.append(sweep)
                 else:
-                    # Not yet available; check if it has expired (overwritten or before first_sample_index)
-                    if self.ring_buffer.total_samples_written == 0 or self.ring_buffer.first_sample_index is None:
-                        remaining.append(sweep)
-                        continue
-                    latest_samp = int(
-                        self.ring_buffer.timestamps[(self.ring_buffer.write_idx - 1) % self.ring_buffer.capacity]
-                    )
-                    earliest_samp = (
-                        latest_samp - self.ring_buffer.capacity + 1
-                        if self.ring_buffer.total_samples_written >= self.ring_buffer.capacity
-                        else self.ring_buffer.first_sample_index
-                    )
-                    if start_samp >= earliest_samp:
-                        remaining.append(sweep)
-                    else:
-                        logger.warning("Sweep at sample %d dropped (before earliest_samp %d)", sweep.stim_sample, earliest_samp)
+                    logger.warning("Sweep at sample %d dropped (before earliest_samp %d)", sweep.stim_sample, earliest_samp)
 
-            self._pending_sweeps = remaining
+        # Update pending list inside lock
+        with self._pending_lock:
+            ready_set = set(id(s) for s, _ in ready_items)
+            self._pending_sweeps = [
+                s for s in self._pending_sweeps
+                if id(s) not in ready_set and (s in remaining or s not in sweeps_snapshot)
+            ]
+
+        # Process and emit ready sweeps outside the lock
+        for sweep, sliced_all in ready_items:
+            target_chans = sweep.aux_chans if sweep.aux_chans else list(self.active_channels)
+            if sweep.rec_chan not in target_chans:
+                target_chans = sorted(list(set(target_chans + [sweep.rec_chan])))
+
+            valid_chans = [ch for ch in target_chans if 0 <= ch < sliced_all.shape[0]]
+            if valid_chans:
+                active_matrix = sliced_all[valid_chans, :].copy()
+            else:
+                valid_chans = [min(sweep.rec_chan, sliced_all.shape[0] - 1)]
+                active_matrix = sliced_all[valid_chans, :].copy()
+
+            if self.apply_filter and hasattr(self, "bandpass_filter") and hasattr(self.bandpass_filter, "sos"):
+                try:
+                    active_matrix = signal.sosfiltfilt(self.bandpass_filter.sos, active_matrix, axis=-1).astype(np.float32)
+                except Exception:
+                    pass
+
+            if sweep.rec_chan in valid_chans:
+                rec_idx = valid_chans.index(sweep.rec_chan)
+                primary_waveform = active_matrix[rec_idx]
+            else:
+                primary_waveform = active_matrix[0]
+
+            aux_sweeps = {
+                f"CH{ch}": ch_waveform
+                for ch, ch_waveform in zip(valid_chans, active_matrix)
+            }
+
+            payload = {
+                "stim_timestamp_s": sweep.stim_timestamp_s,
+                "waveform": primary_waveform,
+                "pre_offset_s": sweep.pre_samples / self.sample_rate,
+                "spike_latencies_s": sweep.spike_latencies,
+                "aux_sweeps": aux_sweeps,
+                "channel_waveforms": aux_sweeps,
+                "sample_rate": self.sample_rate,
+            }
+            self._sweeps_count += 1
+            self.sweepReady.emit(payload)
