@@ -15,8 +15,9 @@ from PySide6.QtWidgets import (
 )
 import pyqtgraph as pg
 
-from .ViewerState import ViewerState
+from .ViewerState import ViewerState, tracked_neuron_unit
 from .processing import create_erp_signals
+from .ChannelGroupBar import ChannelGroupBar
 
 
 class SingleTraceTimeAxisItem(pg.AxisItem):
@@ -108,6 +109,12 @@ class SingleTracePGView(QMainWindow):
 
         # Graphics items
         self.top_lines: List[pg.InfiniteLine] = []
+        self.aux_curves: List[pg.PlotDataItem] = []
+
+        # Independent channel group and unit binding toolbar
+        self.channel_bar = ChannelGroupBar(parent=self, state=self.state)
+        self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
+        self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
 
         self._init_ui()
 
@@ -168,9 +175,44 @@ class SingleTracePGView(QMainWindow):
         layout.addWidget(self.glw)
         self.setCentralWidget(central)
 
+    def _on_channel_bar_changed(self):
+        if hasattr(self, "channel_bar"):
+            summary = self.channel_bar.get_title_summary()
+            self.setWindowTitle(f"SingleTrace (PyQtGraph) {summary}")
+            p = self.parentWidget()
+            if p is not None and hasattr(p, "setWindowTitle"):
+                p.setWindowTitle(f"SingleTrace (PyQtGraph) {summary}")
+        self._setup_done = False
+        self.setup_figure()
+        self.update_histogram()
+        self.update_figure()
+
+    def get_target_unit(self) -> Optional[tracked_neuron_unit]:
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            return self.channel_bar.get_target_unit()
+        return self.state.getUnitGroup() if self.state else None
+
+    def get_target_unit_idx(self) -> int:
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            return self.channel_bar.get_target_unit_idx()
+        return getattr(self.state, "cur_spike_group", 0) if self.state else 0
+
+    def get_erp_signal(self):
+        if self.state is None:
+            return None
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            primary_ch = self.channel_bar.get_primary_channel()
+            if primary_ch and hasattr(self.state, "get_channel_erp"):
+                erp = self.state.get_channel_erp(primary_ch)
+                if erp is not None and len(erp) > 0:
+                    return erp
+        return self.state.get_erp()
+
     def set_state(self, state: ViewerState):
         self.unset_connections()
         self.state = state
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            self.channel_bar.setState(state)
         if self.state is None:
             return
 
@@ -191,7 +233,7 @@ class SingleTracePGView(QMainWindow):
     def on_new_sweep(self, stimno: Optional[int] = None):
         if self.state is None:
             return
-        erp = self.state.get_erp()
+        erp = self.get_erp_signal()
         if erp is None or len(erp) == 0:
             return
         if not getattr(self, "_setup_done", False):
@@ -211,7 +253,7 @@ class SingleTracePGView(QMainWindow):
     def setup_figure(self):
         if self.state is None or self.state.analog_signal is None:
             return
-        erp = self.state.get_erp()
+        erp = self.get_erp_signal()
         if erp is None or len(erp) == 0:
             return
 
@@ -232,7 +274,7 @@ class SingleTracePGView(QMainWindow):
         if self.state is None or self.state.event_signal is None:
             return
 
-        sg = self.state.getUnitGroup()
+        sg = self.get_target_unit()
         if sg is None or len(sg.event) == 0:
             self.histogram_curve.clear()
             return
@@ -240,7 +282,7 @@ class SingleTracePGView(QMainWindow):
         if self.task is not None:
             self.task.signals.cancel.emit()
 
-        erp = self.state.get_erp()
+        erp = self.get_erp_signal()
         if erp is not None and len(erp) > 0 and self.state.analog_signal is not None:
             self.task = PGUpdateConv(self.state.analog_signal, sg, erp)
             self.task.signals.result.connect(self._on_conv_done)
@@ -276,7 +318,7 @@ class SingleTracePGView(QMainWindow):
             return
 
         stimno = self.state.stimno
-        erp = self.state.get_erp()
+        erp = self.get_erp_signal()
         if erp is None or stimno >= len(erp) or stimno < 0:
             return
 
@@ -287,6 +329,27 @@ class SingleTracePGView(QMainWindow):
 
         # Update waveform curve
         self.trace_curve.setData(x_sec, dpts_mag)
+
+        # Multichannel overlay
+        for c in self.aux_curves:
+            self.main_plot.removeItem(c)
+        self.aux_curves.clear()
+
+        if hasattr(self, "channel_bar") and self.channel_bar.is_multichannel():
+            primary_name = self.channel_bar.get_primary_channel()
+            selected = self.channel_bar.get_selected_channels()
+            aux_chans = [c for c in selected if c != primary_name]
+            colors = [(100, 149, 237, 180), (220, 20, 60, 180), (46, 139, 87, 180), (255, 140, 0, 180)]
+            for i, ch_name in enumerate(aux_chans):
+                if hasattr(self.state, "get_channel_erp"):
+                    ch_erp = self.state.get_channel_erp(ch_name)
+                    if ch_erp is not None and stimno < len(ch_erp):
+                        ch_dpts = ch_erp[stimno]
+                        ch_mag = ch_dpts.magnitude if hasattr(ch_dpts, "magnitude") else ch_dpts
+                        pen_col = colors[i % len(colors)]
+                        aux_c = pg.PlotDataItem(x_sec[:len(ch_mag)], ch_mag, pen=pg.mkPen(color=pen_col, width=1.2, style=Qt.DashLine))
+                        self.main_plot.addItem(aux_c)
+                        self.aux_curves.append(aux_c)
 
         # Update sweep label text
         if len(self.state.event_signal.times) > stimno:
@@ -303,7 +366,7 @@ class SingleTracePGView(QMainWindow):
             self.top_plot.removeItem(line)
         self.top_lines.clear()
 
-        sg = self.state.getUnitGroup()
+        sg = self.get_target_unit()
         if sg is not None and getattr(sg, "idx_arr", None) is not None:
             idxs = [i for i, x in enumerate(sg.idx_arr) if x is not None]
             values = [x[0] / sr for x in sg.idx_arr if x is not None]
@@ -371,7 +434,7 @@ class SingleTracePGView(QMainWindow):
 
     def set_cur_pos(self, x: float):
         x_idx = int(round(x))
-        erp = self.state.get_erp()
+        erp = self.get_erp_signal()
         if erp is None or self.state.stimno >= len(erp):
             return
         dpts = erp[self.state.stimno]
@@ -382,12 +445,15 @@ class SingleTracePGView(QMainWindow):
                 return
             x_idx += int(np.argmax(np.abs(dpts[x_idx - w : x_idx + w]))) - w
 
-        self.state.setUnit(x_idx)
+        target_unit_idx = self.get_target_unit_idx()
+        self.state.setUnit(x_idx, unitid=target_unit_idx)
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Z and self.state is not None:
             # Zoom to current spike
-            ug = self.state.getUnitGroup()
+            ug = self.get_target_unit()
+            if ug is None:
+                return
             cur_ev = self.state.event_signal[self.state.stimno]
             lat = ug.get_latencies([cur_ev.magnitude] * self.state.event_signal.units)[0].rescale("s")
 
@@ -412,7 +478,9 @@ class SingleTracePGView(QMainWindow):
             and (e.modifiers() & Qt.ShiftModifier)
             and self.conv is not None
         ):
-            ug = self.state.getUnitGroup()
+            ug = self.get_target_unit()
+            if ug is None:
+                return
             cur_stimpos = ug.idx_arr[self.state.stimno][0]
             conv_row = self.conv[self.state.stimno]
             if len(conv_row) > 2000:
@@ -427,7 +495,8 @@ class SingleTracePGView(QMainWindow):
                         closest_idx -= 1
 
                     if 0 <= closest_idx < len(peaks):
-                        self.state.setUnit(int(peaks[closest_idx]))
+                        target_unit_idx = self.get_target_unit_idx()
+                        self.state.setUnit(int(peaks[closest_idx]), unitid=target_unit_idx)
 
         elif e.key() == Qt.Key_BracketLeft:  # Zoom out
             self.main_plot.vb.scaleBy((1.2, 1.2))
@@ -437,11 +506,16 @@ class SingleTracePGView(QMainWindow):
             super().keyPressEvent(e)
 
     def get_settings(self) -> Dict:
-        return {"xlim": self.main_plot.viewRange()[0]}
+        res = {"xlim": self.main_plot.viewRange()[0]}
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            res["channel_bar"] = self.channel_bar.get_settings()
+        return res
 
     def set_settings(self, values: Dict):
         if "xlim" in values:
             self.main_plot.setXRange(values["xlim"][0], values["xlim"][1], padding=0)
+        if "channel_bar" in values and hasattr(self, "channel_bar") and self.channel_bar is not None:
+            self.channel_bar.set_settings(values["channel_bar"])
 
     def closeEvent(self, event):
         self.unset_connections()

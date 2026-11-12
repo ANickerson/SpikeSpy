@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg
 
 from .ViewerState import ViewerState
+from .ChannelGroupBar import ChannelGroupBar
 
 
 class UnitPGView(QMainWindow):
@@ -43,10 +44,24 @@ class UnitPGView(QMainWindow):
         self.selected_curve = pg.PlotDataItem(pen=pg.mkPen("purple", width=2.5))
         self.zero_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen("black", width=1, style=Qt.DashLine))
 
+        # Independent channel group and unit binding toolbar
+        self.channel_bar = ChannelGroupBar(parent=self, state=state)
+        self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
+        self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+
         self._init_ui()
 
         if state is not None:
             self.set_state(state)
+
+    def _on_channel_bar_changed(self):
+        if hasattr(self, "channel_bar"):
+            summary = self.channel_bar.get_title_summary()
+            self.setWindowTitle(f"UnitView (PyQtGraph) {summary}")
+            p = self.parentWidget()
+            if p is not None and hasattr(p, "setWindowTitle"):
+                p.setWindowTitle(f"UnitView (PyQtGraph) {summary}")
+        self.update_all()
 
     def _init_ui(self):
         central = QWidget(self)
@@ -74,6 +89,8 @@ class UnitPGView(QMainWindow):
     def set_state(self, state: ViewerState):
         self.unset_connections()
         self.state = state
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            self.channel_bar.setState(state)
         if self.state is None:
             return
 
@@ -109,10 +126,11 @@ class UnitPGView(QMainWindow):
         self.w = int(sr * 0.002)
         xarr = np.arange(-self.w, self.w)
 
-        sg = self.state.getUnitGroup()
+        sg = self.channel_bar.get_target_unit() if hasattr(self, "channel_bar") else self.state.getUnitGroup()
         if sg is None:
             return
-        sig_erp = self.state.get_erp()
+        primary_name = self.channel_bar.get_primary_channel() if hasattr(self, "channel_bar") else getattr(self.state.analog_signal, "name", "")
+        sig_erp = self.state.get_channel_erp(primary_name) if hasattr(self.state, "get_channel_erp") else self.state.get_erp()
         if sig_erp is None or len(sig_erp) == 0:
             return
 

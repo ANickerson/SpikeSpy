@@ -232,6 +232,7 @@ class ChannelGroupBar(QToolBar):
     bindingChanged = Signal()
 
     MODE_FOLLOW_GLOBAL = "__global__"
+    MODE_FOLLOW_LIVE = "__live__"
     MODE_FOLLOW_UNIT = "__unit__"
     MODE_GROUP = "__group__"
     MODE_SINGLE = "__single__"
@@ -327,6 +328,8 @@ class ChannelGroupBar(QToolBar):
                 self.state.onChannelChange.connect(self._on_global_channel_changed)
             if hasattr(self.state, "onSharedChannelSetChanged"):
                 self.state.onSharedChannelSetChanged.connect(self._on_shared_set_changed)
+            if hasattr(self.state, "onNewSweep"):
+                self.state.onNewSweep.connect(self._on_new_sweep)
         self.refresh_all()
 
     def _build_group_menu(self):
@@ -402,6 +405,7 @@ class ChannelGroupBar(QToolBar):
 
         # Dynamic options
         self.combo_channel.addItem("(Follow Global Channel)", userData=(self.MODE_FOLLOW_GLOBAL, None))
+        self.combo_channel.addItem("(📡 Follow Live Input)", userData=(self.MODE_FOLLOW_LIVE, None))
         self.combo_channel.addItem("(Bound Unit Channels)", userData=(self.MODE_FOLLOW_UNIT, None))
         self.combo_channel.addItem("(🔗 Shared Group A)", userData=(self.MODE_SHARED_SET, "Shared Group A"))
         self.combo_channel.addItem("(🔗 Shared Group B)", userData=(self.MODE_SHARED_SET, "Shared Group B"))
@@ -459,6 +463,15 @@ class ChannelGroupBar(QToolBar):
         mode, val = self.get_channel_mode()
         if mode == self.MODE_FOLLOW_GLOBAL:
             self.bindingChanged.emit()
+
+    def _on_new_sweep(self, stimno=None):
+        mode, val = self.get_channel_mode()
+        if mode == self.MODE_FOLLOW_LIVE:
+            curr_channels = getattr(self, "_last_live_channels", None)
+            new_channels = self.get_selected_channels()
+            if curr_channels != new_channels:
+                self._last_live_channels = new_channels
+                self.bindingChanged.emit()
 
     # Public Getters & Binding API
 
@@ -530,6 +543,26 @@ class ChannelGroupBar(QToolBar):
                         res.append(c)
                 return res or avail[:4]
             return [global_name] if global_name else (avail[:1] if avail else [])
+
+        elif mode == self.MODE_FOLLOW_LIVE:
+            live_primary = (
+                getattr(self.state.analog_signal, "name", "")
+                if self.state.analog_signal is not None
+                else ""
+            )
+            live_aux = list(getattr(self.state, "_live_aux_erp_buffers", {}).keys())
+            if not live_primary and live_aux:
+                live_primary = live_aux[0]
+            if not live_primary and avail:
+                live_primary = avail[0]
+
+            if self.is_multichannel():
+                res = [live_primary] if live_primary else []
+                for c in live_aux:
+                    if c and c not in res:
+                        res.append(c)
+                return res or avail[:4]
+            return [live_primary] if live_primary else (avail[:1] if avail else [])
 
         elif mode == self.MODE_FOLLOW_UNIT:
             u_idx = self.get_target_unit_idx()
@@ -634,6 +667,18 @@ class ChannelGroupBar(QToolBar):
         if idx >= 0:
             self.combo_channel.setCurrentIndex(idx)
             self.chk_multichannel.setChecked(True)
+
+    def set_channel_mode_global(self):
+        """Sets channel selection to '(Follow Global Channel)'."""
+        idx = self.find_channel_data_index(self.MODE_FOLLOW_GLOBAL)
+        if idx >= 0:
+            self.combo_channel.setCurrentIndex(idx)
+
+    def set_channel_mode_live(self):
+        """Sets channel selection to '(Follow Live Input)'."""
+        idx = self.find_channel_data_index(self.MODE_FOLLOW_LIVE)
+        if idx >= 0:
+            self.combo_channel.setCurrentIndex(idx)
 
     def shift_group_by_span(self, direction: int = 1):
         """Shifts channel selection by the span (number of selected channels) in the given direction (+1 or -1)."""

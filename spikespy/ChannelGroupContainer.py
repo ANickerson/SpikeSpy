@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+import PySide6QtAds as QtAds
 
 from .ChannelGroupBar import ChannelGroupBar
 from .ViewerState import ViewerState
@@ -29,7 +31,7 @@ from .ViewerState import ViewerState
 class SubViewCard(QFrame):
     """
     Sub-window frame within a ChannelGroupContainer.
-    Wraps a child view with a compact header bar (title and close button).
+    Maintained for backward compatibility.
     """
 
     closeRequested = Signal(QWidget)
@@ -73,10 +75,15 @@ class SubViewCard(QFrame):
 class ChannelGroupContainerView(QMainWindow):
     """
     Sub-window container representing a Channel Group within SpikeSpy.
-    Can host multiple nested sub-windows (e.g. MultiTrace, SingleTrace, UnitView).
-    
-    Frames placed inside this container defer their channel / unit selection
-    to this container's ChannelGroupBar, hiding their own individual channel selectors.
+    Can host multiple nested sub-windows (e.g. MultiTrace, SingleTrace, UnitView)
+    using the advanced QtAds docking system.
+
+    Features:
+    - Nested advanced window management: Drag-and-drop docking, horizontal/vertical splits,
+      grid arrangements, and tabbed grouping within each channel group window.
+    - Follow Live Inputs option: dynamically tracks live streaming channels.
+    - Deferral of child channel / unit selection to this container's ChannelGroupBar.
+    - Ability to nest channel group containers within other channel group containers.
     """
 
     viewAdded = Signal(QWidget)
@@ -93,33 +100,70 @@ class ChannelGroupContainerView(QMainWindow):
         self.state = state
         self.container_name = name
         self.sub_views: List[QWidget] = []
-        self._cards: List[SubViewCard] = []
+        self._cards: List[Any] = []
+        self._dock_map: Dict[QWidget, QtAds.CDockWidget] = {}
+        self._current_orientation: str = "vertical"
+        self._current_layout: str = "vertical"
+        self._connections: List = []
 
-        # 1. Top Channel Group Bar
+        # 1. Advanced Docking Manager for nested sub-windows
+        self.dock_manager = QtAds.CDockManager(self)
+
+        # 2. Top Channel Group Bar
         self.channel_bar = ChannelGroupBar(parent=self, state=state)
-        self.channel_bar.bindingChanged.connect(self._sync_all_children)
+        self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
         self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
 
-        # 2. Controls Toolbar for adding child views & arranging layout
+        # 3. Controls Toolbar for adding child views, arrangements, and live input tracking
         self.control_bar = QToolBar("Sub-Views", self)
+
+        # Add Sub-View button
         self.btn_add_subview = QToolButton(self)
         self.btn_add_subview.setText("+ Add Sub-View ▾")
         self.btn_add_subview.setPopupMode(QToolButton.InstantPopup)
         self._build_add_menu()
         self.control_bar.addWidget(self.btn_add_subview)
 
+        # Layout arrangements dropdown
+        self.btn_layouts = QToolButton(self)
+        self.btn_layouts.setText("📐 Layout ▾")
+        self.btn_layouts.setPopupMode(QToolButton.InstantPopup)
+        self._build_layout_menu()
+        self.control_bar.addWidget(self.btn_layouts)
+
         # Split orientation toggle button
         self.btn_orient = QPushButton("⬍ Horizontal / Vertical", self)
-        self.btn_orient.setToolTip("Toggle splitter layout orientation")
+        self.btn_orient.setToolTip("Toggle horizontal or vertical arrangement of sub-windows")
         self.btn_orient.clicked.connect(self._toggle_orientation)
         self.control_bar.addWidget(self.btn_orient)
 
+        # Follow Live Input checkbox
+        self.chk_follow_live = QCheckBox("📡 Follow Live", self)
+        self.chk_follow_live.setToolTip(
+            "When checked, this channel group automatically follows live streaming inputs."
+        )
+        self.chk_follow_live.toggled.connect(self._on_follow_live_toggled)
+        self.control_bar.addWidget(self.chk_follow_live)
+
         self.addToolBar(Qt.TopToolBarArea, self.control_bar)
 
-        # 3. Central splitter for hosting nested views
-        self.splitter = QSplitter(Qt.Vertical, self)
-        self.splitter.setChildrenCollapsible(False)
-        self.setCentralWidget(self.splitter)
+        if state is not None:
+            self.set_state(state)
+
+    @property
+    def splitter(self):
+        """Compatibility proxy for code or tests accessing .splitter.orientation()."""
+        container = self
+
+        class _SplitterCompat:
+            def orientation(self):
+                return Qt.Horizontal if container._current_orientation == "horizontal" else Qt.Vertical
+
+            def setOrientation(self, orient):
+                mode = "horizontal" if orient == Qt.Horizontal else "vertical"
+                container.arrange_layout(mode)
+
+        return _SplitterCompat()
 
     def _build_add_menu(self):
         menu = QMenu(self.btn_add_subview)
@@ -145,11 +189,96 @@ class ChannelGroupContainerView(QMainWindow):
 
         self.btn_add_subview.setMenu(menu)
 
+    def _build_layout_menu(self):
+        menu = QMenu(self.btn_layouts)
+        menu.addAction("Vertical Split (Stacked)", lambda: self.arrange_layout("vertical"))
+        menu.addAction("Horizontal Split (Side by Side)", lambda: self.arrange_layout("horizontal"))
+        menu.addAction("Grid (2x2)", lambda: self.arrange_layout("grid"))
+        menu.addAction("Tabbed (All Tabs)", lambda: self.arrange_layout("tabbed"))
+        self.btn_layouts.setMenu(menu)
+
     def _toggle_orientation(self):
-        if self.splitter.orientation() == Qt.Vertical:
-            self.splitter.setOrientation(Qt.Horizontal)
+        new_mode = "horizontal" if self._current_orientation == "vertical" else "vertical"
+        self.arrange_layout(new_mode)
+
+    def arrange_layout(self, mode: str = "vertical"):
+        """
+        Arranges the child dock widgets into a specific layout arrangement:
+        - 'vertical': Stacked vertically
+        - 'horizontal': Side by side horizontally
+        - 'grid': 2-column grid
+        - 'tabbed': All tabbed into one central area
+        """
+        self._current_layout = mode
+        mode_lower = mode.lower()
+        if mode_lower in ("horizontal", "vertical"):
+            self._current_orientation = mode_lower
+
+        docks = [self._dock_map[v] for v in self.sub_views if v in self._dock_map]
+        if not docks:
+            return
+
+        if mode_lower == "horizontal":
+            self._current_orientation = "horizontal"
+            for i, d in enumerate(docks):
+                if i == 0:
+                    self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, d)
+                else:
+                    self.dock_manager.addDockWidget(QtAds.RightDockWidgetArea, d)
+
+        elif mode_lower == "vertical":
+            self._current_orientation = "vertical"
+            for i, d in enumerate(docks):
+                if i == 0:
+                    self.dock_manager.addDockWidget(QtAds.TopDockWidgetArea, d)
+                else:
+                    self.dock_manager.addDockWidget(QtAds.BottomDockWidgetArea, d)
+
+        elif mode_lower == "tabbed":
+            for i, d in enumerate(docks):
+                if i == 0:
+                    self.dock_manager.addDockWidget(QtAds.CenterDockWidgetArea, d)
+                else:
+                    self.dock_manager.addDockWidgetTab(QtAds.CenterDockWidgetArea, d)
+
+        elif mode_lower == "grid":
+            for i, d in enumerate(docks):
+                if i == 0:
+                    self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, d)
+                elif i == 1:
+                    self.dock_manager.addDockWidget(QtAds.RightDockWidgetArea, d)
+                elif i % 2 == 0:
+                    self.dock_manager.addDockWidget(QtAds.BottomDockWidgetArea, d)
+                else:
+                    self.dock_manager.addDockWidget(QtAds.BottomDockWidgetArea, d)
+
+    def is_following_live(self) -> bool:
+        """Returns True if this channel group container is set to follow live streaming inputs."""
+        return self.chk_follow_live.isChecked()
+
+    def set_follow_live(self, enable: bool = True):
+        """Enables or disables following live inputs."""
+        self.chk_follow_live.setChecked(enable)
+
+    def _on_follow_live_toggled(self, checked: bool):
+        if checked:
+            self.channel_bar.set_channel_mode_live()
         else:
-            self.splitter.setOrientation(Qt.Vertical)
+            self.channel_bar.set_channel_mode_global()
+        self._sync_all_children()
+
+    def _on_channel_bar_changed(self):
+        mode, _ = self.channel_bar.get_channel_mode()
+        is_live = mode == ChannelGroupBar.MODE_FOLLOW_LIVE
+        if self.chk_follow_live.isChecked() != is_live:
+            self.chk_follow_live.blockSignals(True)
+            self.chk_follow_live.setChecked(is_live)
+            self.chk_follow_live.blockSignals(False)
+        self._sync_all_children()
+
+    def _on_new_sweep(self, stimno: Optional[int] = None):
+        if self.is_following_live():
+            self._sync_all_children()
 
     def set_state(self, state: ViewerState):
         self.state = state
@@ -159,6 +288,16 @@ class ChannelGroupContainerView(QMainWindow):
                 v.set_state(state)
             elif hasattr(v, "setState"):
                 v.setState(state)
+
+        for c in self._connections:
+            try:
+                self.state.disconnect(c)
+            except Exception:
+                pass
+        self._connections.clear()
+
+        if self.state is not None and hasattr(self.state, "onNewSweep"):
+            self._connections.append(self.state.onNewSweep.connect(self._on_new_sweep))
 
     def add_view_by_key(self, key: str) -> Optional[QWidget]:
         """Creates a child view by string key and adds it into this container."""
@@ -199,9 +338,9 @@ class ChannelGroupContainerView(QMainWindow):
         self.add_view(child, title=key)
         return child
 
-    def add_view(self, child: QWidget, title: Optional[str] = None):
+    def add_view(self, child: QWidget, title: Optional[str] = None, pos: int = QtAds.TopDockWidgetArea):
         """
-        Embeds a child view into this container.
+        Embeds a child view into this container using the nested docking manager.
         Hides the child's own channel selector toolbar and binds it
         to this container's ChannelGroupBar.
         """
@@ -212,25 +351,41 @@ class ChannelGroupContainerView(QMainWindow):
         if hasattr(child, "channel_bar") and child.channel_bar is not None:
             child.channel_bar.setVisible(False)
 
-        # Wrap in a card with close button
-        card = SubViewCard(title=title, child_widget=child, parent=self.splitter)
-        card.closeRequested.connect(self._on_card_close_requested)
+        # Wrap in CDockWidget for advanced nested window management
+        dock = QtAds.CDockWidget(title)
+        dock.setWidget(child)
+        dock.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, True)
+        dock.closeRequested.connect(lambda: self.remove_view(child))
+        dock.closed.connect(lambda: self._on_dock_closed(child))
 
         self.sub_views.append(child)
-        self._cards.append(card)
-        self.splitter.addWidget(card)
+        self._cards.append(child)
+        self._dock_map[child] = dock
+
+        # Determine dock placement
+        if len(self.sub_views) > 1:
+            if self._current_orientation == "horizontal":
+                area = QtAds.RightDockWidgetArea
+            else:
+                area = QtAds.BottomDockWidgetArea
+        else:
+            area = pos
+
+        self.dock_manager.addDockWidget(area, dock)
 
         # Synchronize child to this container's channel/unit settings immediately
         self._sync_child(child)
 
         self.viewAdded.emit(child)
 
+    def _on_dock_closed(self, child: QWidget):
+        if child in self.sub_views:
+            self.remove_view(child)
+
     def remove_view(self, child: QWidget):
         """Removes a child view from this container."""
         if child not in self.sub_views:
             return
-        idx = self.sub_views.index(child)
-        card = self._cards[idx]
 
         for c_attr in ("view", "canvas", "figure_canvas"):
             cv = getattr(child, c_attr, None)
@@ -242,14 +397,22 @@ class ChannelGroupContainerView(QMainWindow):
                     pass
 
         self.sub_views.remove(child)
-        self._cards.remove(card)
+        if child in self._cards:
+            self._cards.remove(child)
 
-        card.setParent(None)
-        card.deleteLater()
+        dock = self._dock_map.pop(child, None)
+        if dock is not None:
+            try:
+                self.dock_manager.removeDockWidget(dock)
+                dock.closeDockWidget()
+                dock.deleteLater()
+            except Exception:
+                pass
+
         self.viewRemoved.emit(child)
 
     def closeEvent(self, event):
-        for child in self.sub_views:
+        for child in list(self.sub_views):
             for c_attr in ("view", "canvas", "figure_canvas"):
                 cv = getattr(child, c_attr, None)
                 if cv is not None:
@@ -259,10 +422,6 @@ class ChannelGroupContainerView(QMainWindow):
                     except Exception:
                         pass
         super().closeEvent(event)
-
-    def _on_card_close_requested(self, card: SubViewCard):
-        child = card.child_widget
-        self.remove_view(child)
 
     def _sync_all_children(self):
         """Propagates channel / unit binding changes to all embedded children."""
@@ -278,22 +437,27 @@ class ChannelGroupContainerView(QMainWindow):
             bound_unit = self.channel_bar.get_bound_unit()
             cbar.bind_to_unit(bound_unit)
 
-            # Sync shared set or channel selection
-            shared_set = self.channel_bar.get_bound_shared_set()
-            if shared_set:
-                cbar.bind_to_shared_set(shared_set)
+            # Sync live mode, shared set, or channel selection
+            if self.is_following_live():
+                cbar.set_channel_mode_live()
             else:
-                sel_mode = self.channel_bar.combo_channel.currentData()
-                if isinstance(sel_mode, (tuple, list)) and len(sel_mode) == 2:
-                    mode, val = sel_mode
-                    if mode == ChannelGroupBar.MODE_FOLLOW_UNIT:
-                        cbar.set_channel_mode_unit()
-                    elif mode == ChannelGroupBar.MODE_FOLLOW_GLOBAL:
-                        idx = cbar.find_channel_data_index(ChannelGroupBar.MODE_FOLLOW_GLOBAL)
-                        if idx >= 0:
-                            cbar.combo_channel.setCurrentIndex(idx)
-                    elif mode in (ChannelGroupBar.MODE_GROUP, ChannelGroupBar.MODE_SINGLE):
-                        cbar.bind_to_channels(self.channel_bar.get_selected_channels())
+                shared_set = self.channel_bar.get_bound_shared_set()
+                if shared_set:
+                    cbar.bind_to_shared_set(shared_set)
+                else:
+                    sel_mode = self.channel_bar.combo_channel.currentData()
+                    if isinstance(sel_mode, (tuple, list)) and len(sel_mode) == 2:
+                        mode, val = sel_mode
+                        if mode == ChannelGroupBar.MODE_FOLLOW_UNIT:
+                            cbar.set_channel_mode_unit()
+                        elif mode == ChannelGroupBar.MODE_FOLLOW_GLOBAL:
+                            idx = cbar.find_channel_data_index(ChannelGroupBar.MODE_FOLLOW_GLOBAL)
+                            if idx >= 0:
+                                cbar.combo_channel.setCurrentIndex(idx)
+                        elif mode == ChannelGroupBar.MODE_FOLLOW_LIVE:
+                            cbar.set_channel_mode_live()
+                        elif mode in (ChannelGroupBar.MODE_GROUP, ChannelGroupBar.MODE_SINGLE):
+                            cbar.bind_to_channels(self.channel_bar.get_selected_channels())
 
             # Sync multichannel checkbox
             cbar.chk_multichannel.setChecked(self.channel_bar.is_multichannel())
@@ -301,7 +465,11 @@ class ChannelGroupContainerView(QMainWindow):
         elif isinstance(child, ChannelGroupContainerView):
             # Propagate to nested container
             child.channel_bar.bind_to_unit(self.channel_bar.get_bound_unit())
-            child.channel_bar.bind_to_channels(self.channel_bar.get_selected_channels())
+            if self.is_following_live():
+                child.set_follow_live(True)
+            else:
+                child.set_follow_live(False)
+                child.channel_bar.bind_to_channels(self.channel_bar.get_selected_channels())
             child.channel_bar.chk_multichannel.setChecked(self.channel_bar.is_multichannel())
 
     def get_child_views(self) -> List[QWidget]:
@@ -320,7 +488,9 @@ class ChannelGroupContainerView(QMainWindow):
 
         return {
             "channel_bar": self.channel_bar.get_settings(),
-            "orientation": "horizontal" if self.splitter.orientation() == Qt.Horizontal else "vertical",
+            "orientation": self._current_orientation,
+            "layout": self._current_layout,
+            "follow_live": self.is_following_live(),
             "children": children_settings,
         }
 
@@ -329,8 +499,11 @@ class ChannelGroupContainerView(QMainWindow):
         if "channel_bar" in values:
             self.channel_bar.set_settings(values["channel_bar"])
         if "orientation" in values:
-            orient = Qt.Horizontal if values["orientation"] == "horizontal" else Qt.Vertical
-            self.splitter.setOrientation(orient)
+            self.arrange_layout(values["orientation"])
+        if "layout" in values:
+            self.arrange_layout(values["layout"])
+        if "follow_live" in values:
+            self.set_follow_live(bool(values["follow_live"]))
         if "children" in values:
             for c_info in values["children"]:
                 child = self.add_view_by_key(c_info.get("class", ""))
