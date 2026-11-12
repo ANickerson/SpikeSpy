@@ -110,6 +110,7 @@ class SingleTracePGView(QMainWindow):
         self._dirty: bool = False
         self._was_shown: bool = False
         self._user_hidden: bool = False
+        self._last_render_key = None
         self.on_new_sweep_throttled = qsignal_throttle(self._on_new_sweep_core, 40)
         self.update_histogram_throttled = qsignal_throttle(self._update_histogram_core, 500)
 
@@ -191,7 +192,13 @@ class SingleTracePGView(QMainWindow):
         self._setup_done = False
         self.setup_figure()
         self.update_histogram()
-        self.update_figure()
+        self.update_figure(force=True)
+
+    def _on_channel_change_event(self, *args):
+        self._setup_done = False
+        self.setup_figure()
+        self.update_histogram()
+        self.update_figure(force=True)
 
     def get_target_unit(self) -> Optional[tracked_neuron_unit]:
         if hasattr(self, "channel_bar") and self.channel_bar is not None:
@@ -228,10 +235,12 @@ class SingleTracePGView(QMainWindow):
         self.connections.append(self.state.onUnitGroupChange.connect(self.update_figure))
         self.connections.append(self.state.onUnitChange.connect(self.update_histogram))
         self.connections.append(self.state.onUnitGroupChange.connect(self.update_histogram))
+        if hasattr(self.state, "onChannelChange"):
+            self.connections.append(self.state.onChannelChange.connect(self._on_channel_change_event))
         if hasattr(self.state, "onNewSweep"):
             self.connections.append(self.state.onNewSweep.connect(self.on_new_sweep))
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.connections.append(self.state.onNewSpikeEvents.connect(self.on_new_sweep))
+            self.connections.append(self.state.onNewSpikeEvents.connect(lambda *args: (self.update_histogram(), self.update_figure())))
 
         self._setup_done = False
         self.setup_figure()
@@ -371,7 +380,7 @@ class SingleTracePGView(QMainWindow):
         self.conv = conv_result
         self.update_figure()
 
-    def update_figure(self):
+    def update_figure(self, force: bool = False):
         if self.is_view_culled():
             self._dirty = True
             return
@@ -384,6 +393,21 @@ class SingleTracePGView(QMainWindow):
         erp = self.get_erp_signal()
         if erp is None or stimno >= len(erp) or stimno < 0:
             return
+
+        if not getattr(self, "_setup_done", False):
+            self.setup_figure()
+            self._setup_done = True
+
+        ug = self.get_target_unit()
+        ug_spikes = len(ug.event) if ug and hasattr(ug, "event") and ug.event is not None else 0
+        ug_idx = self.get_target_unit_idx()
+        primary_ch = self.channel_bar.get_primary_channel() if hasattr(self, "channel_bar") else ""
+        aux_chans = tuple(sorted(self.channel_bar.get_selected_channels())) if hasattr(self, "channel_bar") else ()
+
+        render_key = (stimno, len(erp), primary_ch, aux_chans, ug_idx, ug_spikes)
+        if not force and getattr(self, "_last_render_key", None) == render_key:
+            return
+        self._last_render_key = render_key
 
         dpts = erp[stimno]
         dpts_mag = dpts.magnitude if hasattr(dpts, "magnitude") else dpts

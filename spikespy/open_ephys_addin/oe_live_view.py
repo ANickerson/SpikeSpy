@@ -549,7 +549,7 @@ class OpenEphysLiveView(QWidget):
 
             if self.chk_follow_live.isChecked() and self.state.event_signal is not None:
                 total_sweeps = len(self.state.event_signal)
-                if total_sweeps > 0:
+                if total_sweeps > 0 and self.state.stimno != total_sweeps - 1:
                     self.state.setStimNo(total_sweeps - 1)
 
     def _fallback_append_sweep(self, waveform: np.ndarray, stim_ts: float, sample_rate: float):

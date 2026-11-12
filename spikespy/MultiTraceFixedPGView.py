@@ -64,6 +64,7 @@ class MultiTraceFixedPGView(QMainWindow):
         self._dirty: bool = False
         self._was_shown: bool = False
         self._user_hidden: bool = False
+        self._last_render_key = None
         self.on_new_sweep_throttled = qsignal_throttle(self._on_new_sweep_core, 40)
 
         # Independent channel group and unit binding toolbar
@@ -83,7 +84,7 @@ class MultiTraceFixedPGView(QMainWindow):
             p = self.parentWidget()
             if p is not None and hasattr(p, "setWindowTitle"):
                 p.setWindowTitle(f"MultiTraceFixed (PyQtGraph) {summary}")
-        self.update_figure()
+        self.update_figure(force=True)
 
     def get_target_unit(self) -> Optional[tracked_neuron_unit]:
         if hasattr(self, "channel_bar") and self.channel_bar is not None:
@@ -194,10 +195,12 @@ class MultiTraceFixedPGView(QMainWindow):
         self.connections.append(self.state.onUnitChange.connect(lambda x: self.update_figure()))
         self.connections.append(self.state.onUnitGroupChange.connect(lambda: self.update_figure()))
         self.connections.append(self.state.onLoadNewFile.connect(self._on_load_new_file))
+        if hasattr(self.state, "onChannelChange"):
+            self.connections.append(self.state.onChannelChange.connect(lambda *args: self.update_figure(force=True)))
         if hasattr(self.state, "onNewSweep"):
             self.connections.append(self.state.onNewSweep.connect(self.on_new_sweep))
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.connections.append(self.state.onNewSpikeEvents.connect(self.on_new_sweep))
+            self.connections.append(self.state.onNewSpikeEvents.connect(lambda *args: self.update_figure()))
 
         self._has_initialized_xrange = False
         self._auto_scale_needed = True
@@ -309,7 +312,7 @@ class MultiTraceFixedPGView(QMainWindow):
         except Exception:
             pass
 
-    def update_figure(self):
+    def update_figure(self, force: bool = False):
         if self.is_view_culled():
             self._dirty = True
             return
@@ -326,6 +329,15 @@ class MultiTraceFixedPGView(QMainWindow):
         n_lines_post = self.settings.get("n_lines_post", 5)
         scale = float(self.settings.get("scale", 1.0))
         stimno = self.state.stimno
+        primary_ch = self.channel_bar.get_primary_channel() if hasattr(self, "channel_bar") else ""
+        ug = self.get_target_unit()
+        ug_spikes = len(ug.event) if ug and hasattr(ug, "event") and ug.event is not None else 0
+        ug_idx = self.get_target_unit_idx()
+
+        render_key = (stimno, len(erp), scale, n_lines_pre, n_lines_post, primary_ch, ug_idx, ug_spikes)
+        if not force and getattr(self, "_last_render_key", None) == render_key:
+            return
+        self._last_render_key = render_key
 
         start = max(stimno - n_lines_pre, 0)
         stop = min(start + n_lines_pre + n_lines_post + 1, len(erp))

@@ -668,17 +668,12 @@ class MultiTraceView(QMainWindow):
         self.references.append(self.state.onLoadNewFile.connect(self.setup_figure))
         self.references.append(self.state.onLoadNewFile.connect(self.update_axis))
 
-        self.references.append(
-            self.state.onUnitGroupChange.connect(lambda *args: self.render())
-        )
-        self.references.append(
-            self.state.onUnitChange.connect(lambda *args: self.render())
-        )
-        self.references.append(
-            self.state.onUnitGroupChange.connect(
-                lambda *args: self.reset_right_axes_data()
-            )
-        )
+        def _on_unit_updated(*args):
+            self.render()
+            self.reset_right_axes_data()
+
+        self.references.append(self.state.onUnitGroupChange.connect(_on_unit_updated))
+        self.references.append(self.state.onUnitChange.connect(_on_unit_updated))
 
         self.references.append(self.state.onStimNoChange.connect(self.update_ylim))
         self.references.append(
@@ -686,9 +681,9 @@ class MultiTraceView(QMainWindow):
                 lambda *args: self.plot_curstim_line(self.state.stimno)
             )
         )
-        self.references.append(
-            self.state.onUnitChange.connect(lambda x: self.reset_right_axes_data())
-        )
+
+        if hasattr(self.state, "onChannelChange"):
+            self.references.append(self.state.onChannelChange.connect(self._on_channel_bar_changed))
 
         if hasattr(self.state, "onNewSweep"):
             self.on_new_sweep_throttled = qsignal_throttle(lambda: self.on_new_sweep(self.state.stimno), 40)
@@ -1282,7 +1277,12 @@ class MultiTraceView(QMainWindow):
         #     self.fig.canvas.draw()
         # self.view.update()
 
-    def plot_curstim_line(self, stimNo=None):
+    def plot_curstim_line(self, stimNo=None, force=False):
+        if stimNo is None:
+            return
+        if not force and getattr(self, "_last_curstim_line", None) == stimNo:
+            return
+        self._last_curstim_line = stimNo
         self.plotter.highlight_stim(self.ax, stimNo, partial=False)
         self.view.draw_idle()
 

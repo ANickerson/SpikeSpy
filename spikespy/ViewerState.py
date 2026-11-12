@@ -979,9 +979,14 @@ class ViewerState(QObject):
     @Slot(int)
     def setStimNo(self, stimno: int):
         if self.event_signal is None or len(self.event_signal) == 0:
-            self.stimno = 0
+            if self.stimno != 0:
+                self.stimno = 0
+                self.onStimNoChange.emit(0)
             return
-        self.stimno = max(min(stimno, len(self.event_signal) - 1), 0)
+        new_stim = max(min(stimno, len(self.event_signal) - 1), 0)
+        if self.stimno == new_stim:
+            return
+        self.stimno = new_stim
         self.onStimNoChange.emit(self.stimno)
 
     @Slot(str, str)

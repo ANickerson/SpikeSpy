@@ -58,6 +58,19 @@ class MultiTraceFixedView(QMatplotlib):
             self._dirty = True
             return
         self._dirty = False
+        if self.state is None:
+            return
+
+        ug_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else getattr(self.state, "cur_spike_group", 0)
+        ug_spikes = len(self.state.spike_groups[ug_idx].idx_arr) if (self.state.spike_groups and 0 <= ug_idx < len(self.state.spike_groups) and getattr(self.state.spike_groups[ug_idx], "idx_arr", None) is not None) else 0
+        primary_ch = self.channel_bar.get_primary_channel() if hasattr(self, "channel_bar") else getattr(getattr(self.state, "analog_signal", None), "name", "")
+        erp = self.state.get_channel_erp(primary_ch) if hasattr(self.state, "get_channel_erp") else self.state.get_erp()
+        n_sweeps = len(erp) if erp is not None else 0
+        render_key = (self.state.stimno, n_sweeps, self.settings.get("scale"), self.settings.get("n_lines_pre"), self.settings.get("n_lines_post"), primary_ch, ug_idx, ug_spikes, should_clear)
+        if not should_clear and getattr(self, "_last_render_key", None) == render_key:
+            return
+        self._last_render_key = render_key
+
         super().update_figure(should_clear=should_clear)
 
     def setVisible(self, visible: bool):
@@ -91,6 +104,9 @@ class MultiTraceFixedView(QMatplotlib):
         self.unsetCons()
         con = self.state.onStimNoChange.connect(lambda x: self.update_figure())
         self.connections.append(con)
+        if hasattr(self.state, "onChannelChange"):
+            con_ch = self.state.onChannelChange.connect(lambda *args: self.update_figure())
+            self.connections.append(con_ch)
         if hasattr(self.state, "onNewSweep"):
             from spikespy.helpers import qsignal_throttle
             self._throttled_update = qsignal_throttle(self.update_figure, 40)

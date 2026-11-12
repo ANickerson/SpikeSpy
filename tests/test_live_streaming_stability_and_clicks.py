@@ -324,3 +324,66 @@ def test_channel_group_container_live_streaming_stability(qtbot, populated_state
     # Process events and verify container and children remain stable
     QApplication.processEvents()
     assert container.isVisible()
+
+
+def test_visual_components_no_redundant_redraw_on_active_trace(qtbot, populated_state):
+    """Verify that setting the active trace or receiving live sweeps deduplicates redraws."""
+    mtf = MultiTraceFixedPGView(state=populated_state)
+    st = SingleTracePGView(state=populated_state)
+    mt = MultiTracePGView(state=populated_state)
+    u = UnitPGView(state=populated_state)
+
+    for v in (mtf, st, mt, u):
+        qtbot.addWidget(v)
+        v.show()
+
+    QApplication.processEvents()
+
+    # Initial render keys should be established
+    assert getattr(mtf, "_last_render_key", None) is not None
+    assert getattr(st, "_last_render_key", None) is not None
+    assert getattr(u, "_last_render_key", None) is not None
+
+    key_mtf_before = mtf._last_render_key
+    key_st_before = st._last_render_key
+    key_u_before = u._last_render_key
+
+    # Calling update_figure/update_all again with the same active trace should not change key or re-allocate
+    mtf.update_figure()
+    st.update_figure()
+    u.update_all()
+
+    assert mtf._last_render_key == key_mtf_before
+    assert st._last_render_key == key_st_before
+    assert u._last_render_key == key_u_before
+
+    # ViewerState.setStimNo with the same stimno should be a no-op
+    cur_stim = populated_state.stimno
+    emitted = []
+    populated_state.onStimNoChange.connect(lambda s: emitted.append(s))
+    populated_state.setStimNo(cur_stim)
+    assert len(emitted) == 0, "setStimNo with the same stimno must not re-emit onStimNoChange"
+
+
+def test_visual_components_rerender_on_channel_change(qtbot, populated_state):
+    """Verify that changing channel appropriately updates and re-renders visual components."""
+    mtf = MultiTraceFixedPGView(state=populated_state)
+    st = SingleTracePGView(state=populated_state)
+    mt = MultiTracePGView(state=populated_state)
+    u = UnitPGView(state=populated_state)
+
+    for v in (mtf, st, mt, u):
+        qtbot.addWidget(v)
+        v.show()
+
+    QApplication.processEvents()
+
+    # Switch channel on populated_state
+    populated_state.set_active_channel("CH1")
+    QApplication.processEvents()
+
+    # Ensure views responded to channel change
+    assert mtf._last_render_key[5] == "CH1"
+    assert st._last_render_key[2] == "CH1"
+    assert u._last_render_key[0] == "CH1"
+

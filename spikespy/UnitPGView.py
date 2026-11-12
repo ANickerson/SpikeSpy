@@ -103,6 +103,8 @@ class UnitPGView(QMainWindow):
         self.connections.append(self.state.onUnitChange.connect(self.update_all))
         self.connections.append(self.state.onUnitGroupChange.connect(self.update_all))
         self.connections.append(self.state.onLoadNewFile.connect(self.update_all))
+        if hasattr(self.state, "onChannelChange"):
+            self.connections.append(self.state.onChannelChange.connect(self.update_all))
         if hasattr(self.state, "onNewSweep"):
             self.connections.append(self.state.onNewSweep.connect(self.on_new_sweep_throttled))
         if hasattr(self.state, "onNewSpikeEvents"):
@@ -167,7 +169,7 @@ class UnitPGView(QMainWindow):
         self.connections.clear()
 
     @Slot()
-    def update_all(self):
+    def update_all(self, force: bool = False):
         if self.is_view_culled():
             self._dirty = True
             return
@@ -189,6 +191,14 @@ class UnitPGView(QMainWindow):
             return
 
         idx_arr = sg.idx_arr
+        ug_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else getattr(self.state, "cur_spike_group", 0)
+        ug_spikes = len(idx_arr) if idx_arr is not None else 0
+        render_key = (primary_name, ug_idx, ug_spikes, len(sig_erp))
+        if not force and getattr(self, "_last_render_key", None) == render_key:
+            self.update_curstim_line(self.state.stimno)
+            return
+        self._last_render_key = render_key
+
         self.lines = {}
         all_x = []
         all_y = []
@@ -254,10 +264,13 @@ class UnitPGView(QMainWindow):
         self.main_plot.setXRange(-self.w, self.w, padding=0.05)
         self.main_plot.setYRange(min_y, max_y, padding=0.05)
 
-        self.update_curstim_line(self.state.stimno)
+        self.update_curstim_line(self.state.stimno, force=True)
 
     @Slot(int)
-    def update_curstim_line(self, stimno: int):
+    def update_curstim_line(self, stimno: int, force: bool = False):
+        if not force and getattr(self, "_last_highlighted_stim", None) == stimno:
+            return
+        self._last_highlighted_stim = stimno
         if stimno in self.lines:
             line_data = self.lines[stimno]
             self.selected_curve.setData(line_data[:, 0], line_data[:, 1])

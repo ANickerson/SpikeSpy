@@ -323,9 +323,12 @@ class MultiTracePGView(QMainWindow):
         self.addToolBar(Qt.TopToolBarArea, toolbar)
 
     def _on_channel_bar_changed(self):
+        self._on_channel_change()
+
+    def _on_channel_change(self):
         self.update_window_title()
         self.setup_figure()
-        self.render()
+        self.reset_right_axes_data()
 
     def update_window_title(self):
         if hasattr(self, "channel_bar"):
@@ -486,13 +489,18 @@ class MultiTracePGView(QMainWindow):
         self.references.append(self.state.onLoadNewFile.connect(self.setup_figure))
         self.references.append(self.state.onLoadNewFile.connect(self.update_axis))
 
-        self.references.append(self.state.onUnitGroupChange.connect(lambda *args: self.render()))
-        self.references.append(self.state.onUnitChange.connect(lambda *args: self.render()))
-        self.references.append(self.state.onUnitGroupChange.connect(lambda *args: self.reset_right_axes_data()))
+        def _on_unit_updated(*args):
+            self.render()
+            self.reset_right_axes_data()
+
+        self.references.append(self.state.onUnitGroupChange.connect(_on_unit_updated))
+        self.references.append(self.state.onUnitChange.connect(_on_unit_updated))
 
         self.references.append(self.state.onStimNoChange.connect(self.update_ylim))
         self.references.append(self.state.onStimNoChange.connect(lambda *args: self.plot_curstim_line(self.state.stimno)))
-        self.references.append(self.state.onUnitChange.connect(lambda x: self.reset_right_axes_data()))
+
+        if hasattr(self.state, "onChannelChange"):
+            self.references.append(self.state.onChannelChange.connect(self._on_channel_change))
 
         if hasattr(self.state, "onNewSweep"):
             self.on_new_sweep_throttled = qsignal_throttle(lambda: self.on_new_sweep(self.state.stimno if self.state else 0), 40)
@@ -691,9 +699,13 @@ class MultiTracePGView(QMainWindow):
         self.plot_spikegroups()
         self.plot_right_axis()
 
-    def plot_curstim_line(self, stimNo: Optional[int] = None):
+    def plot_curstim_line(self, stimNo: Optional[int] = None, force: bool = False):
         if stimNo is None:
             return
+        if not force and getattr(self, "_last_curstim_line", None) == stimNo and getattr(self, "_last_curstim_mode", None) == self.mode:
+            return
+        self._last_curstim_line = stimNo
+        self._last_curstim_mode = self.mode
         self.stim_line.setValue(stimNo)
         if self.mode == "lines" and self.state is not None:
             erp = self.get_erp_signal()
@@ -878,14 +890,30 @@ class MultiTracePGView(QMainWindow):
         self.plot_right_axis()
 
     def plot_right_axis(self):
+        active_axes = [(k, v) for k, v in self.right_ax_data.items() if self.rightPlots.get(k, False)]
+        if not active_axes:
+            for p in self.right_plots.values():
+                self.glw.removeItem(p)
+            self.right_plots.clear()
+            self.glw.ci.layout.setColumnStretchFactor(0, 1)
+            return
+
+        active_labels = [label for label, data in active_axes]
+        if list(self.right_plots.keys()) == active_labels:
+            for label, data in active_axes:
+                p = self.right_plots[label]
+                x_data = data[0].magnitude if hasattr(data[0], "magnitude") else data[0]
+                y_data = data[1].magnitude if hasattr(data[1], "magnitude") else data[1]
+                items = p.listDataItems()
+                if items:
+                    items[0].setData(x=x_data, y=y_data)
+                else:
+                    p.plot(x=x_data, y=y_data)
+            return
+
         for p in self.right_plots.values():
             self.glw.removeItem(p)
         self.right_plots.clear()
-
-        active_axes = [(k, v) for k, v in self.right_ax_data.items() if self.rightPlots.get(k, False)]
-        if not active_axes:
-            self.glw.ci.layout.setColumnStretchFactor(0, 1)
-            return
 
         self.glw.ci.layout.setColumnStretchFactor(0, 3)
         colorwheel = itertools.cycle(["#d95f02", "#7570b3", "#e7298a", "#66a61e", "#e6ab02", "#a6761d"])
