@@ -582,7 +582,8 @@ class OpenEphysStreamWorker(QThread):
                     start_s = sweep.stim_sample - sweep.pre_samples
                     end_s = sweep.stim_sample + sweep.window_samples
                     if start_s <= sample_num <= end_s:
-                        sweep.spike_latencies[unit_name] = (sample_num - sweep.stim_sample) / self.sample_rate
+                        if unit_name not in sweep.spike_latencies:
+                            sweep.spike_latencies[unit_name] = (sample_num - sweep.stim_sample) / self.sample_rate
 
         # 3. Protocol / MessageCenter text event (e.g. APTrack stimulus protocol, setStimVoltage)
         elif evt_type in ("message", "text", "protocol") or "text" in evt:

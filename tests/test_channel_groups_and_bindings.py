@@ -456,7 +456,15 @@ def test_layout_presets_and_named_perspectives(qtbot, mock_multichannel_state):
     # 3. Dual Unit Compare
     spy.apply_default_layout("Dual Unit Compare")
     dock_widgets3 = spy.dock_manager.dockWidgets()
-    multi_views = [dw.widget() for dw in dock_widgets3 if isinstance(dw.widget(), MultiTraceView)]
+    multi_views = []
+    for dw in dock_widgets3:
+        w = dw.widget()
+        if isinstance(w, MultiTraceView):
+            multi_views.append(w)
+        elif hasattr(w, "get_child_views") and w.get_child_views():
+            c0 = w.get_child_views()[0]
+            if isinstance(c0, MultiTraceView):
+                multi_views.append(w)  # Channel group container represents the view
     assert len(multi_views) >= 2
     assert multi_views[0].channel_bar.get_target_unit_idx() == 0
     assert multi_views[1].channel_bar.get_target_unit_idx() == 1

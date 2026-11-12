@@ -131,6 +131,10 @@ class tracked_neuron_unit:
     def idx_arr(self, value):
         self._idx_arr = value
 
+    @idx_arr.deleter
+    def idx_arr(self):
+        self._idx_arr = None
+
     def get_number_of_events(self, event_signal=None, window_size=None):
         if self.event is not None and len(self.event) > 0:
             if event_signal is not None and len(event_signal) > 0 and window_size is not None:
@@ -1330,7 +1334,7 @@ class ViewerState(QObject):
                     **sg.event.annotations,
                 )
                 sg.idx_arr = []
-                if sg.event not in self.segment.events:
+                if not any(e is sg.event or getattr(e, "name", "") == sg.event.name for e in self.segment.events):
                     self.segment.events.append(sg.event)
         else:
             evt = neo.Event(

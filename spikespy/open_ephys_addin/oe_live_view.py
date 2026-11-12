@@ -214,6 +214,27 @@ class OpenEphysLiveView(QWidget):
         diag_layout.addRow("Spikes Detected:", self.lbl_spikes_count)
         diag_layout.addRow("Stimulus Frequency:", self.lbl_stim_freq)
 
+        # Demo stream parameter controls
+        self.spin_demo_stim_freq = QDoubleSpinBox()
+        self.spin_demo_stim_freq.setRange(0.5, 50.0)
+        self.spin_demo_stim_freq.setValue(5.0)
+        self.spin_demo_stim_freq.setSingleStep(0.5)
+        self.spin_demo_stim_freq.setSuffix(" Hz")
+        self.spin_demo_stim_freq.valueChanged.connect(self._on_demo_stim_freq_changed)
+
+        self.combo_demo_units = QComboBox()
+        self.combo_demo_units.addItems(
+            [
+                "1 Unit (Fast A-beta)",
+                "2 Units (A-beta + A-delta)",
+                "3 Units (A-beta, A-delta, C-fiber)",
+            ]
+        )
+        self.combo_demo_units.setCurrentIndex(2)
+
+        diag_layout.addRow("Stimulation Frequency (Hz):", self.spin_demo_stim_freq)
+        diag_layout.addRow("Demo Units:", self.combo_demo_units)
+
         self.btn_start_demo = QPushButton("Start Built-in Demo Stream")
         self.btn_start_demo.setStyleSheet("background-color: #2b5c8f; color: white; font-weight: bold; padding: 6px;")
         self.btn_start_demo.clicked.connect(self.start_demo_stream)
@@ -249,6 +270,8 @@ class OpenEphysLiveView(QWidget):
             "window_ms": self.spin_window_ms.value(),
             "online_filter": self.chk_online_filter.isChecked(),
             "sync_annotations": self.chk_sync_annotations.isChecked(),
+            "demo_stim_freq": self.spin_demo_stim_freq.value(),
+            "demo_units": self.combo_demo_units.currentIndex(),
         }
 
     def set_settings(self, settings: Dict[str, Any]):
@@ -277,6 +300,16 @@ class OpenEphysLiveView(QWidget):
             self.chk_online_filter.setChecked(bool(settings["online_filter"]))
         if "sync_annotations" in settings:
             self.chk_sync_annotations.setChecked(bool(settings["sync_annotations"]))
+        if "demo_stim_freq" in settings:
+            self.spin_demo_stim_freq.setValue(float(settings["demo_stim_freq"]))
+        if "demo_units" in settings:
+            self.combo_demo_units.setCurrentIndex(int(settings["demo_units"]))
+
+    @Slot(float)
+    def _on_demo_stim_freq_changed(self, val: float):
+        """Update running demo server's stimulation frequency dynamically."""
+        if self._demo_server_process is not None and self._demo_server_process.is_running():
+            self._demo_server_process.set_stim_freq(val)
 
     @Slot()
     def toggle_stream(self):
@@ -410,11 +443,17 @@ class OpenEphysLiveView(QWidget):
         demo_event_port = 5567
         demo_http_port = 37499
 
+        demo_freq = self.spin_demo_stim_freq.value()
+        num_units = self.combo_demo_units.currentIndex() + 1
+        n_channels = max(6, num_units * 2)
+
         self._demo_server_process = MockOpenEphysServer(
             data_port=demo_data_port,
             event_port=demo_event_port,
             http_port=demo_http_port,
-            stim_freq_hz=4.0,
+            stim_freq_hz=demo_freq,
+            num_units=num_units,
+            n_channels=n_channels,
             sample_rate=30000.0,
         )
         self._demo_server_process.start()
@@ -423,6 +462,41 @@ class OpenEphysLiveView(QWidget):
         self.spin_data_port.setValue(demo_data_port)
         self.spin_event_port.setValue(demo_event_port)
         self.spin_http_port.setValue(demo_http_port)
+
+        # Ensure active channels and window accommodate simulated units
+        active_set_str = f"0-{n_channels - 1}"
+        self.edit_active_channels.setText(active_set_str)
+        if self.spin_window_ms.value() < 120.0:
+            self.spin_window_ms.setValue(150.0)
+
+        # Automatically initialize state with corresponding spike_groups for active demo units
+        unit_meta = [
+            ("unit_0", "CH0", ["CH1"], "Fast A-fiber (A-beta)"),
+            ("unit_1", "CH2", ["CH3"], "Medium A-delta fiber"),
+            ("unit_2", "CH4", ["CH5"], "Slow C-fiber"),
+        ][:num_units]
+
+        sgs = []
+        for i, (uname, ch, neighbors, ftype) in enumerate(unit_meta):
+            evt = Event(np.array([], dtype=float) * pq.s, name=uname)
+            evt.annotations["type"] = "unit"
+            evt.annotations["unit"] = i
+            evt.annotations["channel"] = ch
+            evt.annotations["neighbor_channels"] = neighbors
+            evt.annotations["fibre_type"] = ftype
+            sg = tracked_neuron_unit(
+                event=evt,
+                channel=ch,
+                neighbor_channels=neighbors,
+                fibre_type=ftype,
+                idx_arr=[],
+            )
+            sgs.append(sg)
+
+        self.state.spike_groups = sgs
+        self.state.cur_spike_group = 0
+        self.state.update_idx_arrs()
+        self.state.onUnitGroupChange.emit()
 
         self.btn_start_demo.setText("Stop Built-in Demo Stream")
         self.btn_start_demo.setStyleSheet("background-color: #d9534f; color: white; font-weight: bold; padding: 6px;")

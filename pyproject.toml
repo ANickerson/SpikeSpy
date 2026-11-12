@@ -22,6 +22,7 @@ dependencies = [
     "pywavelets>=1.8.0",
     "scipy>=1.15.2",
     "pyzmq>=25.0",
+    "pyqtgraph>=0.14.0",
 ]
 
 [project.scripts]

@@ -294,14 +294,16 @@ def test_realistic_microneurography_and_event_marker_alignment(qtbot):
         # 4. Multi-channel footprint: CH1 should have the same spike offset by propagation delay
         erp_ch1 = state._live_aux_erp_buffers["CH1"].data
         sweep0_ch1 = erp_ch1[0].magnitude if hasattr(erp_ch1[0], "magnitude") else erp_ch1[0]
-        peak_ch1 = 650 + int(np.argmax(sweep0_ch1[650:850]))
+        w_start = max(0, peak_sample_sweep0 - 5)
+        w_end = min(len(sweep0_ch1), peak_sample_sweep0 + 25)
+        peak_ch1 = w_start + int(np.argmax(sweep0_ch1[w_start:w_end]))
         # Conduction delay: CH1 is delayed relative to CH0 by ~4 samples (+0.133 ms)
         assert peak_ch1 >= peak_sample_sweep0
 
         # Spatial attenuation on sweep 0:
         erp_ch2 = state._live_aux_erp_buffers["CH2"].data
         sweep0_ch2 = erp_ch2[0].magnitude if hasattr(erp_ch2[0], "magnitude") else erp_ch2[0]
-        peak_ch2 = 650 + int(np.argmax(sweep0_ch2[650:850]))
+        peak_ch2 = w_start + int(np.argmax(sweep0_ch2[w_start:w_end]))
         assert peak_ch2 >= peak_ch1
         # More distant channel CH2 shows clear spatial attenuation relative to primary CH0
         assert sweep0[peak_sample_sweep0] > sweep0_ch2[peak_ch2]

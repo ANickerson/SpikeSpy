@@ -482,6 +482,16 @@ class ChannelGroupBar(QToolBar):
         """Returns True if the view is locked to a specific unit (not following active)."""
         return self.combo_unit.currentData() is not None
 
+    def get_bound_unit(self) -> Optional[int]:
+        """Returns the unit index if locked to a unit, else None."""
+        data = self.combo_unit.currentData()
+        return data if isinstance(data, int) else None
+
+    def get_bound_shared_set(self) -> Optional[str]:
+        """Returns the shared channel group name if bound to one, else None."""
+        mode, val = self.get_channel_mode()
+        return val if mode == self.MODE_SHARED_SET else None
+
     def get_channel_mode(self) -> Tuple[str, Any]:
         """Returns (mode, value) tuple for the current channel dropdown selection."""
         data = self.combo_channel.currentData()

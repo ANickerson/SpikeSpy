@@ -79,8 +79,20 @@ from .UnitSuggestor import UnitSuggestor
 from .open_ephys_addin import OpenEphysLiveView
 from .ChannelGroupBar import ChannelGroupBar, ChannelGroupDialog
 from .SharedChannelPanel import SharedChannelPanel
+from .ChannelGroupContainer import ChannelGroupContainerView
+from .ViewSettingsPanel import ViewSettingsPanel
 import PySide6QtAds as QtAds
 from typing import Dict
+
+try:
+    from .MultiTracePGView import MultiTracePGView
+    from .MultiTraceFixedPGView import MultiTraceFixedPGView
+    from .SingleTracePGView import SingleTracePGView
+    from .UnitPGView import UnitPGView
+    _has_pg = True
+except Exception as _e:
+    logging.warning(f"PyQtGraph views not loaded: {_e}")
+    _has_pg = False
 
 mplstyle.use("fast")
 
@@ -98,7 +110,19 @@ window_options = {
     "Events": EventView,
     "OpenEphysLive": OpenEphysLiveView,
     "SharedChannelPanel": SharedChannelPanel,
+    "ChannelGroupContainer": ChannelGroupContainerView,
+    "ViewSettings": ViewSettingsPanel,
 }
+if _has_pg:
+    window_options.update(
+        {
+            "MultiTrace (PyQtGraph)": MultiTracePGView,
+            "MultiTraceFixed (PyQtGraph)": MultiTraceFixedPGView,
+            "SingleTrace (PyQtGraph)": SingleTracePGView,
+            "UnitView (PyQtGraph)": UnitPGView,
+        }
+    )
+
 suggestors: Dict[str, UnitSuggestor] = {}
 
 
@@ -109,7 +133,19 @@ class MdiView(QMainWindow):
     def clear_dock_area(self):
         """Closes all open dock widgets and clears the dock area."""
         for dw in list(self.dock_manager.dockWidgets()):
+            w = dw.widget()
+            # Cancel pending idle draws on canvases before close/deletion
+            for target in ([w] + (w.get_child_views() if hasattr(w, "get_child_views") else [])):
+                for c_attr in ("view", "canvas", "figure_canvas"):
+                    cv = getattr(target, c_attr, None)
+                    if cv is not None:
+                        try:
+                            cv._draw_pending = False
+                            PySide6.QtCore.QCoreApplication.removePostedEvents(cv)
+                        except Exception:
+                            pass
             dw.closeDockWidget()
+            self.dock_manager.removeDockWidget(dw)
         self.cur_windows.clear()
 
     def save_perspective_as(self, name: str):
@@ -216,6 +252,23 @@ class MdiView(QMainWindow):
                 return dw.widget()
         return self.newWindow("SharedChannelPanel", pos=QtAds.BottomDockWidgetArea)
 
+    def open_or_show_view_settings_panel(self):
+        """Opens or brings to front the View Settings side panel."""
+        if hasattr(self, "dock_settings") and self.dock_settings is not None:
+            if self.dock_settings.isClosed() or not self.dock_settings.isVisible():
+                self.dock_settings.toggleView(True)
+                self.dock_manager.addDockWidget(QtAds.RightDockWidgetArea, self.dock_settings)
+            self.dock_settings.show()
+            self.dock_settings.raise_()
+            return self.dock_settings.widget()
+        return None
+
+    def _on_focused_dock_widget_changed(self, old, new):
+        if new and new.widget():
+            w = new.widget()
+            if hasattr(self, "settings_panel") and self.settings_panel is not None:
+                self.settings_panel.setActiveView(w)
+
     def apply_default_layout(self, layout_name: str):
         """
         Applies a predefined multi-panel dock layout.
@@ -304,8 +357,18 @@ class MdiView(QMainWindow):
                 f"SpikeSpy ({version}) - {Path(self.state.title).name}"
             )
         )
+        self._open_ephys_live_dock = None
         self.dock_manager = QtAds.CDockManager(self)
         self.dock_manager.addPerspective("main")
+
+        # Active View Settings Side Panel (follows focused window)
+        self.settings_panel = ViewSettingsPanel(parent=self, state=self.state)
+        self.dock_settings = QtAds.CDockWidget("View Settings")
+        self.dock_settings.setWidget(self.settings_panel)
+        self.dock_settings.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
+        self.dock_manager.addDockWidget(QtAds.RightDockWidgetArea, self.dock_settings)
+        self.dock_manager.focusedDockWidgetChanged.connect(self._on_focused_dock_widget_changed)
+
         self.mdi = QMdiArea()
         # self.setCentralWidget(self.mdi)
 
@@ -327,17 +390,30 @@ class MdiView(QMainWindow):
         add_panel_menu = QMenu(self.btn_add_panel)
 
         menu_traces = add_panel_menu.addMenu("Trace & Heatmap Views")
-        menu_traces.addAction("MultiTrace", lambda: self.newWindow("MultiTrace"))
-        menu_traces.addAction("MultiTraceFixedView", lambda: self.newWindow("MultiTraceFixedView"))
-        menu_traces.addAction("SingleTraceView", lambda: self.newWindow("SingleTraceView"))
+        menu_traces.addAction("MultiTrace (Matplotlib)", lambda: self.newWindow("MultiTrace"))
+        if "MultiTrace (PyQtGraph)" in self.window_options:
+            menu_traces.addAction("MultiTrace (PyQtGraph)", lambda: self.newWindow("MultiTrace (PyQtGraph)"))
+        menu_traces.addAction("MultiTraceFixedView (Matplotlib)", lambda: self.newWindow("MultiTraceFixedView"))
+        if "MultiTraceFixed (PyQtGraph)" in self.window_options:
+            menu_traces.addAction("MultiTraceFixed (PyQtGraph)", lambda: self.newWindow("MultiTraceFixed (PyQtGraph)"))
+        menu_traces.addAction("SingleTraceView (Matplotlib)", lambda: self.newWindow("SingleTraceView"))
+        if "SingleTrace (PyQtGraph)" in self.window_options:
+            menu_traces.addAction("SingleTrace (PyQtGraph)", lambda: self.newWindow("SingleTrace (PyQtGraph)"))
         menu_traces.addAction("TrackingView", lambda: self.newWindow("TrackingView"))
         menu_traces.addAction("OpenEphysLive", lambda: self.newWindow("OpenEphysLive"))
 
         menu_unit = add_panel_menu.addMenu("Unit Analysis")
-        menu_unit.addAction("UnitView", lambda: self.newWindow("UnitView"))
+        menu_unit.addAction("UnitView (Matplotlib)", lambda: self.newWindow("UnitView"))
+        if "UnitView (PyQtGraph)" in self.window_options:
+            menu_unit.addAction("UnitView (PyQtGraph)", lambda: self.newWindow("UnitView (PyQtGraph)"))
         menu_unit.addAction("UnitFootprintView", lambda: self.newWindow("UnitFootprintView"))
 
+        menu_channels = add_panel_menu.addMenu("Channel Groups")
+        menu_channels.addAction("Channel Group Sub-Window", lambda: self.newWindow("ChannelGroupContainer"))
+        menu_channels.addAction("Shared Channel Controller", lambda: self.open_or_show_shared_channel_panel())
+
         menu_tables = add_panel_menu.addMenu("Tables & Controllers")
+        menu_tables.addAction("View Settings Panel", lambda: self.open_or_show_view_settings_panel())
         menu_tables.addAction("SharedChannelPanel", lambda: self.open_or_show_shared_channel_panel())
         menu_tables.addAction("SpikeGroupTable", lambda: self.newWindow("SpikeGroupTable"))
         menu_tables.addAction("Events", lambda: self.newWindow("Events"))
@@ -437,6 +513,13 @@ class MdiView(QMainWindow):
         )
 
         channels_menu = self.menubar.addMenu("&Channels")
+        channels_menu.addAction(
+            QAction(
+                "New Channel Group Sub-Window...",
+                self,
+                triggered=lambda: self.newWindow("ChannelGroupContainer"),
+            )
+        )
         channels_menu.addAction(
             QAction(
                 "Shared Channel Controller...",
@@ -724,21 +807,66 @@ class MdiView(QMainWindow):
         target_unit=None,
         channels=None,
         shared_set=None,
+        wrap_in_channel_group=None,
     ):
-        w = self.window_options[k](parent=self, state=self.state)
+        # 1. Singleton OpenEphysLive view: reuse existing instance without re-instantiating
+        if k == "OpenEphysLive" and getattr(self, "_open_ephys_live_dock", None) is not None:
+            dock = self._open_ephys_live_dock
+            if dock.isClosed() or not dock.isVisible():
+                dock.toggleView(True)
+                if pos is not None and pos != QtAds.NoDockWidgetArea:
+                    self.dock_manager.addDockWidget(pos, dock)
+            dock.show()
+            dock.raise_()
+            return dock.widget()
 
-        # Apply target unit, channels, or shared set binding if component supports it
-        if hasattr(w, "channel_bar"):
+        # 2. Channel group container wrapping:
+        # If requested or if component is channel/unit specific, wrap into a ChannelGroupContainer
+        channel_specific_views = (
+            "MultiTrace",
+            "MultiTraceFixedView",
+            "UnitView",
+            "UnitFootprintView",
+            "SingleTraceView",
+            "MultiTrace (PyQtGraph)",
+            "MultiTraceFixed (PyQtGraph)",
+            "SingleTrace (PyQtGraph)",
+            "UnitView (PyQtGraph)",
+        )
+        should_wrap = wrap_in_channel_group or (
+            wrap_in_channel_group is None and (target_unit is not None or channels is not None)
+        )
+
+        if should_wrap and k in channel_specific_views and k in self.window_options:
+            container = ChannelGroupContainerView(parent=self, state=self.state)
+            inner_w = self.window_options[k](parent=container, state=self.state)
+            container.add_view(inner_w, title=k)
             if shared_set is not None:
-                w.channel_bar.bind_to_shared_set(shared_set)
+                container.channel_bar.bind_to_shared_set(shared_set)
             if target_unit is not None:
-                w.channel_bar.bind_to_unit(target_unit)
+                container.channel_bar.bind_to_unit(target_unit)
                 if channels is not None:
-                    w.channel_bar.bind_to_channels(channels)
-                elif shared_set is None and hasattr(w.channel_bar, "set_channel_mode_unit"):
-                    w.channel_bar.set_channel_mode_unit()
+                    container.channel_bar.bind_to_channels(channels)
+                elif shared_set is None and hasattr(container.channel_bar, "set_channel_mode_unit"):
+                    container.channel_bar.set_channel_mode_unit()
             elif channels is not None:
-                w.channel_bar.bind_to_channels(channels)
+                container.channel_bar.bind_to_channels(channels)
+            w = container
+        else:
+            w = self.window_options[k](parent=self, state=self.state)
+
+            # Apply target unit, channels, or shared set binding if component supports it
+            if hasattr(w, "channel_bar") and w.channel_bar is not None:
+                if shared_set is not None:
+                    w.channel_bar.bind_to_shared_set(shared_set)
+                if target_unit is not None:
+                    w.channel_bar.bind_to_unit(target_unit)
+                    if channels is not None:
+                        w.channel_bar.bind_to_channels(channels)
+                    elif shared_set is None and hasattr(w.channel_bar, "set_channel_mode_unit"):
+                        w.channel_bar.set_channel_mode_unit()
+                elif channels is not None:
+                    w.channel_bar.bind_to_channels(channels)
 
         window_no = len(
             [
@@ -749,7 +877,12 @@ class MdiView(QMainWindow):
         )
 
         if name is None:
-            if shared_set is not None:
+            if isinstance(w, ChannelGroupContainerView):
+                prefix = f"Channel Group [{k}]"
+                if target_unit is not None:
+                    prefix += f" (Unit {target_unit})"
+                name = prefix
+            elif shared_set is not None:
                 name = f"{k} [{shared_set}]"
             elif target_unit is not None and self.state and 0 <= target_unit < len(self.state.spike_groups):
                 u_name = getattr(self.state.spike_groups[target_unit].event, "name", f"unit_{target_unit}")
@@ -759,7 +892,11 @@ class MdiView(QMainWindow):
 
         w2 = QtAds.CDockWidget(name)
         w2.setWidget(w)
-        w2.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, True)
+        if k == "OpenEphysLive":
+            w2.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
+            self._open_ephys_live_dock = w2
+        else:
+            w2.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, True)
         w2.setFeature(QtAds.CDockWidget.DockWidgetForceCloseWithArea, True)
         if pos is not None and pos != QtAds.NoDockWidgetArea:
             self.dock_manager.addDockWidget(pos, w2)
