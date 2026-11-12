@@ -418,7 +418,7 @@ class SingleTraceView(QMainWindow):
         loc = matplotlib.ticker.MultipleLocator(0.01)
         self.ax.xaxis.set_minor_locator(loc)
 
-        self.view.draw()
+        self.view.draw_idle()
         self.view.update()
         try:
             self.toolbar.set_history_buttons()

@@ -16,6 +16,7 @@ from neo import Event
 from neo.io import NixIO, NixIOFr
 from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QInputDialog,
     QDialog,
@@ -982,13 +983,14 @@ class ViewerState(QObject):
             import traceback
 
             traceback.print_exc()
-            qmb = QMessageBox(
-                QMessageBox.Critical,
-                "Sorry :(",
-                f'Unable to load "{fname}" using {type}',
-            )
-            qmb.setModal(True)
-            qmb.exec()
+            if QApplication.instance() and QApplication.instance().platformName() != "offscreen":
+                qmb = QMessageBox(
+                    QMessageBox.Critical,
+                    "Sorry :(",
+                    f'Unable to load "{fname}" using {type}',
+                )
+                qmb.setModal(True)
+                qmb.exec()
 
             return
         self.title = fname
@@ -1673,7 +1675,12 @@ class ViewerState(QObject):
         # Emits signals
         self.onNewSweep.emit(new_stim_idx)
         if self.follow_live:
-            self.onStimNoChange.emit(self.stimno)
+            if not hasattr(self, "_onStimNoChange_live_throttled"):
+                from spikespy.helpers import qsignal_throttle
+                self._onStimNoChange_live_throttled = qsignal_throttle(
+                    lambda: self.onStimNoChange.emit(self.stimno), 40
+                )
+            self._onStimNoChange_live_throttled()
         self.onEventsUpdated.emit()
 
         return new_stim_idx

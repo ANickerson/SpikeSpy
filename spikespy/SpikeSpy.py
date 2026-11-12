@@ -19,6 +19,7 @@ from matplotlib.widgets import PolygonSelector
 from neo.io import NixIO, NixIOFr
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QEvent,
     QModelIndex,
     QObject,
     Qt,
@@ -269,6 +270,17 @@ class MdiView(QMainWindow):
             if hasattr(self, "settings_panel") and self.settings_panel is not None:
                 self.settings_panel.setActiveView(w)
 
+    def _on_app_focus_changed(self, old, new):
+        if new is not None and hasattr(self, "settings_panel") and self.settings_panel is not None:
+            self.settings_panel.setActiveView(new)
+
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+            if isinstance(obj, QWidget):
+                if hasattr(self, "settings_panel") and self.settings_panel is not None:
+                    self.settings_panel.setActiveView(obj)
+        return super().eventFilter(obj, event)
+
     def apply_default_layout(self, layout_name: str):
         """
         Applies a predefined multi-panel dock layout.
@@ -368,6 +380,11 @@ class MdiView(QMainWindow):
         self.dock_settings.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
         self.dock_manager.addDockWidget(QtAds.RightDockWidgetArea, self.dock_settings)
         self.dock_manager.focusedDockWidgetChanged.connect(self._on_focused_dock_widget_changed)
+
+        app = QApplication.instance()
+        if app is not None:
+            app.focusChanged.connect(self._on_app_focus_changed)
+            app.installEventFilter(self)
 
         self.mdi = QMdiArea()
         # self.setCentralWidget(self.mdi)

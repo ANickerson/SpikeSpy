@@ -815,6 +815,11 @@ class MultiTraceView(QMainWindow):
                 last_std = float(np.std(erp[-1])) or 1.0
             self.std = 0.95 * float(self.std) + 0.05 * last_std
 
+        toolbar = getattr(self, "toolbar", None)
+        if toolbar is None and hasattr(self, "view") and hasattr(self.view, "canvas"):
+            toolbar = getattr(self.view.canvas, "toolbar", None)
+        is_user_interacting = toolbar is not None and getattr(toolbar, "mode", "") != ""
+
         if self.mode == "heatmap" and self.plotter.ax_track_cmap is not None and abs(self.ax.get_xlim()[1] - self.ax.get_xlim()[0]) > 1.0:
             if has_buf_match:
                 clipped_data = live_buf.clipped_data
@@ -836,25 +841,25 @@ class MultiTraceView(QMainWindow):
                 ),
             )
             self.plotter.ax_track_cmap.set_clim(*clim)
-        else:
+        elif not is_user_interacting:
             self.setup_figure()
 
-        if abs(self.ax.get_xlim()[1] - self.ax.get_xlim()[0]) <= 1.0:
-            self.ax.set_xlim(0, erp.shape[1])
-            self.update_axis()
+        if not is_user_interacting:
+            if abs(self.ax.get_xlim()[1] - self.ax.get_xlim()[0]) <= 1.0:
+                self.ax.set_xlim(0, erp.shape[1])
+                self.update_axis()
 
-        if self.lock_to_stim:
-            self.update_ylim(self.state.stimno)
-        else:
-            current_ylim = self.ax.get_ylim()
-            if (
-                getattr(self.state, "follow_live", True)
-                or abs(current_ylim[0] - erp.shape[0]) <= 5
-                or current_ylim == (0.0, 1.0)
-                or current_ylim[1] == 1.0
-            ):
-                top_lim = current_ylim[1] if (current_ylim[1] != 1.0 and current_ylim != (0.0, 1.0)) else 0
-                self.ax.set_ylim(erp.shape[0], top_lim)
+            if self.lock_to_stim:
+                self.update_ylim(self.state.stimno)
+            else:
+                current_ylim = self.ax.get_ylim()
+                if (
+                    current_ylim == (0.0, 1.0)
+                    or current_ylim[1] == 1.0
+                    or (getattr(self.state, "follow_live", True) and abs(current_ylim[0] - erp.shape[0]) <= 5)
+                ):
+                    top_lim = current_ylim[1] if (current_ylim[1] != 1.0 and current_ylim != (0.0, 1.0)) else 0
+                    self.ax.set_ylim(erp.shape[0], top_lim)
 
         self.plotter.highlight_stim(self.ax, self.state.stimno, partial=False)
         self.plot_spikegroups()
@@ -900,15 +905,19 @@ class MultiTraceView(QMainWindow):
 
         for x in sigs_to_check:
             try:
-                if (
-                    getattr(self.state, "is_streaming", False)
-                    and x.name in getattr(self.state, "_live_aux_erp_buffers", {})
-                ):
-                    buf = self.state._live_aux_erp_buffers[x.name]
-                    if self.toggleMaxMeanButton.isChecked():
-                        vals = buf.row_max
-                    else:
-                        vals = buf.row_mean
+                buf = None
+                if getattr(self.state, "is_streaming", False):
+                    if hasattr(self.state, "_live_aux_erp_buffers") and x.name in self.state._live_aux_erp_buffers:
+                        buf = self.state._live_aux_erp_buffers[x.name]
+                    elif (
+                        getattr(self.state, "_live_erp_buffer", None) is not None
+                        and self.state.analog_signal is not None
+                        and x.name == getattr(self.state.analog_signal, "name", None)
+                    ):
+                        buf = self.state._live_erp_buffer
+
+                if buf is not None:
+                    vals = buf.row_max if self.toggleMaxMeanButton.isChecked() else buf.row_mean
                     self.right_ax_data[x.name] = (
                         vals,
                         np.arange(0, len(vals)),
@@ -924,7 +933,6 @@ class MultiTraceView(QMainWindow):
                             np.mean(self.state.get_erp(x, self.state.event_signal), axis=1),
                             np.arange(0, len(self.state.event_signal.times)),
                         )
-
             except:
                 pass
 
@@ -1077,10 +1085,7 @@ class MultiTraceView(QMainWindow):
             cur_lims = self.ax.get_ylim()
             w = max(abs(cur_lims[1] - cur_lims[0]) // 2, 2)
             self.ax.set_ylim(curStim + w, curStim - w)
-            # self.view.update()
-            # self.view.draw_idle()
-            self.view.draw()
-            # self.view.update()
+            self.view.draw_idle()
 
     def update_axis(self):  # TODO: plot these data using x as the time in millis.
         if self.state is None:
@@ -1090,8 +1095,12 @@ class MultiTraceView(QMainWindow):
         erp = self.state.analog_signal_erp
         if erp is None or len(erp) == 0 or erp.shape[0] == 0:
             return
-        self.ax.set_ylim(len(self.state.event_signal), 0)
-        self.ax.set_xlim(0, len(self.state.analog_signal_erp[0]))
+        cur_xlim = self.ax.get_xlim()
+        if abs(cur_xlim[1] - cur_xlim[0]) <= 1.0 or cur_xlim == (0.0, 1.0):
+            self.ax.set_xlim(0, len(self.state.analog_signal_erp[0]))
+        cur_ylim = self.ax.get_ylim()
+        if abs(cur_ylim[1] - cur_ylim[0]) <= 1.0 or cur_ylim == (0.0, 1.0) or cur_ylim == (1.0, 0.0):
+            self.ax.set_ylim(len(self.state.event_signal), 0)
 
         class CustomFormatter(matplotlib.ticker.Formatter):
             def __init__(self, ax, func):

@@ -110,6 +110,7 @@ class MultiTracePGView(QMainWindow):
         self._dirty: bool = False
         self._user_hidden: bool = False
         self._was_shown: bool = False
+        self._has_initialized_ranges: bool = False
 
         # Build UI layout
         self._init_ui()
@@ -149,6 +150,7 @@ class MultiTracePGView(QMainWindow):
         self.main_plot.setLabel("bottom", "Time", units="ms")
         self.main_plot.setLabel("left", "Stimulus #")
         self.main_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.main_plot.getViewBox().disableAutoRange()
         self.glw.ci.layout.setColumnStretchFactor(0, 3)
 
         # 1. Heatmap ImageItem (axisOrder='row-major': [row, col] -> [y, x])
@@ -497,7 +499,7 @@ class MultiTracePGView(QMainWindow):
             else:
                 clipped = erp_mag
 
-            self.img_item.setImage(clipped, levels=(vmin, max(vmin + 0.001, vmax)))
+            self.img_item.setImage(clipped, autoLevels=False, levels=(vmin, max(vmin + 0.001, vmax)))
             self.img_item.setRect(QRectF(0, 0, n_samples, n_sweeps))
         elif self.mode == "lines":
             self.img_item.setVisible(False)
@@ -522,15 +524,17 @@ class MultiTracePGView(QMainWindow):
             self.active_sweep_curve.setVisible(False)
             self.stim_line.setVisible(False)
 
-        # Adapt xlim and ylim as sweeps arrive
-        current_xrange = self.main_plot.viewRange()[0]
-        if abs(current_xrange[1] - current_xrange[0]) <= 1.0 or current_xrange[1] != n_samples:
+        # Adapt xlim and ylim as sweeps arrive without resetting user zoom
+        if not getattr(self, "_has_initialized_ranges", False):
             self.main_plot.setXRange(0, n_samples, padding=0)
-
-        if self.lock_to_stim:
-            self.update_ylim(self.state.stimno)
-        else:
             self.main_plot.setYRange(0, n_sweeps, padding=0)
+            self._has_initialized_ranges = True
+        elif self.lock_to_stim:
+            self.update_ylim(self.state.stimno)
+        elif getattr(self.state, "follow_live", False):
+            current_yrange = self.main_plot.viewRange()[1]
+            if abs(current_yrange[1] - n_sweeps) <= 3:
+                self.main_plot.setYRange(current_yrange[0], n_sweeps, padding=0)
 
         self.plot_curstim_line(self.state.stimno)
         self.plot_spikegroups()
@@ -557,6 +561,7 @@ class MultiTracePGView(QMainWindow):
 
         self.main_plot.setXRange(0, n_samples, padding=0)
         self.main_plot.setYRange(0, max(n_sweeps, 1), padding=0)
+        self._has_initialized_ranges = True
 
     def update_ylim(self, curStim: int):
         if self.lock_to_stim and self.state and self.state.event_signal is not None:
@@ -601,7 +606,7 @@ class MultiTracePGView(QMainWindow):
             self.img_item.setVisible(True)
             self.stim_line.setVisible(True)
 
-            self.img_item.setImage(erp_mag, levels=(vmin, max(vmin + 0.001, vmax)))
+            self.img_item.setImage(erp_mag, autoLevels=False, levels=(vmin, max(vmin + 0.001, vmax)))
             self.img_item.setRect(QRectF(0, 0, erp_mag.shape[1], erp_mag.shape[0]))
 
         elif self.mode == "lines":
@@ -762,15 +767,19 @@ class MultiTracePGView(QMainWindow):
 
         for x in sigs_to_check:
             try:
-                if (
-                    getattr(self.state, "is_streaming", False)
-                    and x.name in getattr(self.state, "_live_aux_erp_buffers", {})
-                ):
-                    buf = self.state._live_aux_erp_buffers[x.name]
-                    if self.toggleMaxMeanButton.isChecked():
-                        vals = buf.row_max
-                    else:
-                        vals = buf.row_mean
+                buf = None
+                if getattr(self.state, "is_streaming", False):
+                    if hasattr(self.state, "_live_aux_erp_buffers") and x.name in self.state._live_aux_erp_buffers:
+                        buf = self.state._live_aux_erp_buffers[x.name]
+                    elif (
+                        getattr(self.state, "_live_erp_buffer", None) is not None
+                        and self.state.analog_signal is not None
+                        and x.name == getattr(self.state.analog_signal, "name", None)
+                    ):
+                        buf = self.state._live_erp_buffer
+
+                if buf is not None:
+                    vals = buf.row_max if self.toggleMaxMeanButton.isChecked() else buf.row_mean
                     vals_mag = vals.magnitude if hasattr(vals, "magnitude") else vals
                     self.right_ax_data[x.name] = (
                         vals_mag,
@@ -792,13 +801,12 @@ class MultiTracePGView(QMainWindow):
             except Exception:
                 pass
 
-        if not self.rightPlots:
-            self.rightPlots = {k: True for k in self.right_ax_data.keys()}
+        for k in self.right_ax_data.keys():
+            if k not in self.rightPlots:
+                self.rightPlots[k] = True
 
-        if self.settingsDialog is not None:
-            self.settingsDialog.destroy()
-
-        self.settingsDialog = DialogSignalSelect(options=self.rightPlots)
+        if self.settingsDialog is None:
+            self.settingsDialog = DialogSignalSelect(options=self.rightPlots)
 
         def updateView(k, v):
             self.rightPlots[k] = v

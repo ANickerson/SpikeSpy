@@ -65,6 +65,9 @@ class CachedAxesImage(AxesImage):
             and self._cached_magnification == magnification
             # and self._cached_lims == (current_xlim, current_ylim)
             # check ratio of xlim and ylim
+            and self._cached_lims is not None
+            and (current_ylim[1] - current_ylim[0]) != 0
+            and (self._cached_lims[1][1] - self._cached_lims[1][0]) != 0
             and np.isclose(
                 (
                     abs(
@@ -91,10 +94,12 @@ class CachedAxesImage(AxesImage):
         ):
             # return self._cached_image
             # write the transform that gets from self._cached_clip to clip
-            clip2 = Bbox.intersection(transformed_bbox, clip2)
-            x0 = clip2.x0  # self._cached_clip.xmin- transformed_bbox.xmin
-            y0 = clip2.y0  # self._cached_clip.ymin- transformed_bbox.ymin
-            return self._cached_image[0], x0, y0, None  # self._cached_image[3]
+            if clip2 is not None:
+                intersected_clip = Bbox.intersection(transformed_bbox, clip2)
+                if intersected_clip is not None:
+                    x0 = intersected_clip.x0  # self._cached_clip.xmin- transformed_bbox.xmin
+                    y0 = intersected_clip.y0  # self._cached_clip.ymin- transformed_bbox.ymin
+                    return self._cached_image[0], x0, y0, None  # self._cached_image[3]
 
         clip2 = clip.expanded(2, 2)  # 2x the width and height of the window.
         # Cache the new larger cut of the data
@@ -162,9 +167,11 @@ class CachedAxesImage(AxesImage):
             unsampled=unsampled,
         )
 
-        self._cached_clip = Bbox.intersection(transformed_bbox, clip2).transformed(
-            trans.inverted()
-        )
+        intersect_clip = Bbox.intersection(transformed_bbox, clip2)
+        if intersect_clip is not None:
+            self._cached_clip = intersect_clip.transformed(trans.inverted())
+        else:
+            self._cached_clip = None
         self._cached_extent = current_extent
         self._cached_figure_size = tuple(current_figure_size)
         self._cached_magnification = magnification

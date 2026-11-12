@@ -242,12 +242,42 @@ class ViewSettingsPanel(QWidget):
     # ---------------------------------------------------------
     # Active View Tracking & Population
     # ---------------------------------------------------------
+    def _resolve_view(self, w: Optional[QWidget]) -> Optional[QWidget]:
+        if w is None:
+            return None
+        # Check if w is part of ViewSettingsPanel itself
+        curr = w
+        while curr is not None:
+            if curr is self:
+                return self.active_view  # User is interacting with ViewSettingsPanel; do not switch view!
+            curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
+
+        # Now search up for a view widget
+        curr = w
+        found_view = None
+        while curr is not None:
+            c_name = curr.__class__.__name__
+            if any(k in c_name for k in ("MultiTrace", "SingleTrace", "UnitView", "UnitFootprint", "UnitPG", "ChannelGroupContainer")):
+                found_view = curr
+                break
+            curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
+
+        if found_view is not None:
+            # If it's a ChannelGroupContainerView, see if w was inside one of its sub_views
+            if hasattr(found_view, "sub_views") and len(found_view.sub_views) > 0:
+                for sv in found_view.sub_views:
+                    temp = w
+                    while temp is not None and temp is not found_view:
+                        if temp is sv:
+                            return sv
+                        temp = temp.parentWidget() if hasattr(temp, "parentWidget") else None
+                return found_view.sub_views[0]
+            return found_view
+        return w
+
     def setActiveView(self, view: Optional[QWidget]):
         """Sets the active view to display/edit in this settings panel."""
-        # If view is inside a container or wrapper, drill down
-        if view is not None and hasattr(view, "sub_views") and len(view.sub_views) > 0:
-            view = view.sub_views[0]
-
+        view = self._resolve_view(view)
         if self.active_view == view:
             return
 

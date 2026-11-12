@@ -4,8 +4,12 @@ from spikespy.ViewerState import ViewerState
 
 @pytest.fixture()
 def state():
+    import os
+    fname = r"data/test2.h5"
+    if not os.path.exists(fname):
+        pytest.skip(f"Test data file {fname} not found")
     state = ViewerState()
-    state.loadFile(r"data/test2.h5")
+    state.loadFile(fname)
     return state
 
 
