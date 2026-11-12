@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 
 from .ViewerState import ViewerState
 from .QMatplotlib import QMatplotlib
+from .ChannelGroupBar import ChannelGroupBar
 
 mplstyle.use("fast")
 
@@ -80,6 +81,11 @@ class UnitView(QMatplotlib):
             self.matplotlib_toolbar.addSeparator()
             self.matplotlib_toolbar.addWidget(self.chk_show_neighbors)
 
+        self.channel_bar = ChannelGroupBar(parent=self, state=state)
+        self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
+        self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+        self.update_window_title()
+
         def draw_evt(evt):
             self.blit()
             self.update_curstim_line(self.state.stimno)
@@ -88,20 +94,23 @@ class UnitView(QMatplotlib):
         self.canvas.mpl_connect("draw_event", draw_evt)
 
     def is_view_culled(self) -> bool:
-        if getattr(self, "_user_hidden", False):
-            return True
-        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
-            return True
-        curr = self
-        while curr.parentWidget() is not None:
-            curr = curr.parentWidget()
-            if curr.isMinimized():
+        try:
+            if getattr(self, "_user_hidden", False):
                 return True
-        if self.parentWidget() is not None and not self.isVisible():
+            if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+                return True
+            curr = self
+            while curr.parentWidget() is not None:
+                curr = curr.parentWidget()
+                if curr.isMinimized():
+                    return True
+            if self.parentWidget() is not None and not self.isVisible():
+                return True
+            if getattr(self, "_was_shown", False) and not self.isVisible():
+                return True
+            return False
+        except RuntimeError:
             return True
-        if getattr(self, "_was_shown", False) and not self.isVisible():
-            return True
-        return False
 
     def _on_render_timer_tick(self):
         try:
@@ -135,6 +144,18 @@ class UnitView(QMatplotlib):
             self._dirty = False
             self._do_updateAll_core()
 
+    def _on_channel_bar_changed(self):
+        self.update_window_title()
+        self.updateAll()
+
+    def update_window_title(self):
+        if hasattr(self, "channel_bar"):
+            summary = self.channel_bar.get_title_summary()
+            self.setWindowTitle(f"UnitView {summary}")
+            p = self.parentWidget()
+            if p is not None and hasattr(p, "setWindowTitle"):
+                p.setWindowTitle(f"UnitView {summary}")
+
     def blit(self):
         if self.axes is None or "main" not in self.axes:
             return
@@ -142,6 +163,8 @@ class UnitView(QMatplotlib):
 
     def setState(self, state):
         super().setState(state)
+        if hasattr(self, "channel_bar"):
+            self.channel_bar.setState(state)
         self.state.onStimNoChange.connect(self.update_curstim_line)
         self.state.onUnitChange.connect(self.updateAll)
         self.state.onUnitGroupChange.connect(self.updateAll)
@@ -175,10 +198,18 @@ class UnitView(QMatplotlib):
 
     def setup_figure(self):
         self.axes = {"main": self.figure.add_subplot(111)}
-        if self.state is None or self.state.analog_signal is None:
-            return
-        sig_erp = self.state.analog_signal_erp
+        if hasattr(self, "channel_bar"):
+            primary_name = self.channel_bar.get_primary_channel()
+            sig_erp = self.state.get_channel_erp(primary_name)
+            sg = self.channel_bar.get_target_unit()
+        else:
+            primary_name = getattr(self.state.analog_signal, "name", "")
+            sig_erp = self.state.analog_signal_erp
+            sg = self.state.getUnitGroup()
+
         if sig_erp is None or len(sig_erp) == 0:
+            return
+        if getattr(self.state, "sampling_rate", None) is None:
             return
         self.w = int(self.state.sampling_rate * 0.002)
         ax = self.axes["main"]
@@ -189,7 +220,6 @@ class UnitView(QMatplotlib):
 
         ax.axvline(0, ls="--", color="black")
 
-        sg = self.state.getUnitGroup()
         if sg is None:
             return
 
@@ -280,20 +310,25 @@ class UnitView(QMatplotlib):
             ls="--",
             color="black",
             zorder=10,
-            label=getattr(self.state.analog_signal, "name", "Primary"),
+            label=primary_name or "Primary",
         )[0]
         ax.add_artist(lc)
 
         # Plot neighbor channels footprint if enabled
-        if getattr(self, "chk_show_neighbors", None) and self.chk_show_neighbors.isChecked() and sg is not None:
-            neighbors = getattr(sg, "neighbor_channels", []) or []
+        show_neighbors = (getattr(self, "chk_show_neighbors", None) and self.chk_show_neighbors.isChecked()) or (hasattr(self, "channel_bar") and self.channel_bar.is_multichannel())
+        if show_neighbors and sg is not None:
+            if hasattr(self, "channel_bar"):
+                selected_chans = self.channel_bar.get_selected_channels()
+                neighbors = [c for c in selected_chans if c != primary_name]
+            else:
+                neighbors = getattr(sg, "neighbor_channels", []) or []
+
             if not neighbors and hasattr(self.state, "get_available_channels"):
-                avail = [c for c in self.state.get_available_channels() if c != getattr(self.state.analog_signal, "name", "")]
+                avail = [c for c in self.state.get_available_channels() if c != primary_name]
                 neighbors = avail[:3]
 
             colors = ["#e41a1c", "#377eb8", "#4daf4a", "#ff7f00", "#984ea3"]
             has_neighbor_plotted = False
-            primary_name = getattr(self.state.analog_signal, "name", "")
 
             for n_idx, ch_name in enumerate(neighbors):
                 if ch_name == primary_name:

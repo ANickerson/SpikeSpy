@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from .ViewerState import ViewerState
+from .ChannelGroupBar import ChannelGroupDialog
 from PySide6.QtWidgets import QComboBox
 
 
@@ -122,14 +123,45 @@ class SpikeGroupTableView(QWidget):
         if sg is None:
             return
         ch = getattr(sg, "channel", "")
-        if not ch and hasattr(sg, "event") and getattr(sg.event, "annotations", None):
+        if not ch and hasattr(sg.event, "annotations"):
             ch = sg.event.annotations.get("channel", "")
 
         menu = QMenu(self)
         if ch and hasattr(self.state, "set_active_channel"):
-            act_focus = menu.addAction(f"Focus Channel '{ch}'")
+            act_focus = menu.addAction(f"Focus Primary Channel '{ch}'")
             act_focus.triggered.connect(lambda: self.state.set_active_channel(ch))
+
+        menu.addSeparator()
+        act_edit_chans = menu.addAction(f"Configure Channels for Unit {row}...")
+        act_edit_chans.triggered.connect(lambda: self._open_channel_dialog_for_unit(row))
+
+        menu_shift = menu.addMenu("Shift Unit Channel Group")
+        menu_shift.addAction("Shift -1 Channel", lambda: self.state.shift_unit_channels(row, step=-1))
+        menu_shift.addAction("Shift +1 Channel", lambda: self.state.shift_unit_channels(row, step=1))
+        menu_shift.addAction("Shift -4 Channels (Tetrode)", lambda: self.state.shift_unit_channels(row, step=-4))
+        menu_shift.addAction("Shift +4 Channels (Tetrode)", lambda: self.state.shift_unit_channels(row, step=4))
+
+        menu.addSeparator()
+        menu_open = menu.addMenu(f"Open Pinned Window for Unit {row}")
+        menu_open.addAction("MultiTrace View", lambda: self._open_pinned_window("MultiTrace", row))
+        menu_open.addAction("SingleTrace View", lambda: self._open_pinned_window("SingleTraceView", row))
+        menu_open.addAction("UnitView", lambda: self._open_pinned_window("UnitView", row))
+        menu_open.addAction("MultiTraceFixed View", lambda: self._open_pinned_window("MultiTraceFixedView", row))
+
         menu.exec(self.tbl.viewport().mapToGlobal(pos))
+
+    def _open_channel_dialog_for_unit(self, unit_idx: int):
+        dlg = ChannelGroupDialog(parent=self, state=self.state, unit_idx=unit_idx)
+        if dlg.exec() == QDialog.Accepted:
+            selected = dlg.get_selected_channels()
+            if selected:
+                self.state.set_unit_channels(unit_idx, selected)
+                self.update()
+
+    def _open_pinned_window(self, window_key: str, unit_idx: int):
+        top_win = self.window()
+        if hasattr(top_win, "newWindow"):
+            top_win.newWindow(window_key, target_unit=unit_idx)
 
     def on_cell_double_clicked(self, index: QModelIndex):
         if not index.isValid():
@@ -146,20 +178,23 @@ class SpikeGroupTableView(QWidget):
                     self.state.set_active_channel(ch)
 
     def is_view_culled(self) -> bool:
-        if getattr(self, "_user_hidden", False):
-            return True
-        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
-            return True
-        curr = self
-        while curr.parentWidget() is not None:
-            curr = curr.parentWidget()
-            if curr.isMinimized():
+        try:
+            if getattr(self, "_user_hidden", False):
                 return True
-        if self.parentWidget() is not None and not self.isVisible():
+            if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+                return True
+            curr = self
+            while curr.parentWidget() is not None:
+                curr = curr.parentWidget()
+                if curr.isMinimized():
+                    return True
+            if self.parentWidget() is not None and not self.isVisible():
+                return True
+            if getattr(self, "_was_shown", False) and not self.isVisible():
+                return True
+            return False
+        except RuntimeError:
             return True
-        if getattr(self, "_was_shown", False) and not self.isVisible():
-            return True
-        return False
 
     def _on_render_timer_tick(self):
         try:

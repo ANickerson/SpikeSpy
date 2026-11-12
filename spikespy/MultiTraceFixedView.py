@@ -2,11 +2,13 @@ import sys
 import numpy as np
 from PySide6.QtWidgets import QApplication, QToolBar, QSpinBox
 from PySide6.QtGui import QAction
+from PySide6.QtCore import Qt
 from spikespy.QMatplotlib import QMatplotlib
 import matplotlib
 from matplotlib.ticker import Formatter
 from matplotlib.collections import LineCollection
 from spikespy.ViewerState import ViewerState
+from .ChannelGroupBar import ChannelGroupBar
 import matplotlib.style as mplstyle
 
 mplstyle.use("fast")
@@ -20,9 +22,27 @@ class MultiTraceFixedView(QMatplotlib):
             "n_lines_pre": 5,
             "n_lines_post": 5,
         }
+        self.channel_bar = ChannelGroupBar(parent=self, state=state)
+        self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
+        self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+        self.update_window_title()
+
+    def _on_channel_bar_changed(self):
+        self.update_window_title()
+        self.update_figure()
+
+    def update_window_title(self):
+        if hasattr(self, "channel_bar"):
+            summary = self.channel_bar.get_title_summary()
+            self.setWindowTitle(f"MultiTraceFixed {summary}")
+            p = self.parentWidget()
+            if p is not None and hasattr(p, "setWindowTitle"):
+                p.setWindowTitle(f"MultiTraceFixed {summary}")
 
     def setState(self, state: ViewerState):
         super().setState(state)
+        if hasattr(self, "channel_bar"):
+            self.channel_bar.setState(state)
         self.unsetCons()
         con = self.state.onStimNoChange.connect(lambda x: self.update_figure())
         self.connections.append(con)
@@ -45,8 +65,9 @@ class MultiTraceFixedView(QMatplotlib):
             erp = self.state.get_erp()
             if erp is None or len(erp) == 0 or erp.shape[0] == 0:
                 return
-            ylim = (np.std(np.abs(erp)) or 1.0) * 8
-            self.settings["scale"] = np.round(1 / ylim, decimals=4)
+            erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
+            ylim = float(np.std(np.abs(erp_mag)) or 1.0) * 8
+            self.settings["scale"] = float(np.round(1 / ylim, decimals=4))
 
     def onLoadNewFile(self):
         super().onLoadNewFile()
@@ -162,50 +183,91 @@ class MultiTraceFixedView(QMatplotlib):
             return False
         if self.state.event_signal is None or len(self.state.event_signal) == 0:
             return False
-        erp = self.state.get_erp()
+
+        if hasattr(self, "channel_bar"):
+            primary_ch = self.channel_bar.get_primary_channel()
+            target_unit_idx = self.channel_bar.get_target_unit_idx()
+            erp = self.state.get_channel_erp(primary_ch)
+            selected_chans = self.channel_bar.get_selected_channels()
+            is_multi = self.channel_bar.is_multichannel() and len(selected_chans) > 1
+        else:
+            primary_ch = getattr(getattr(self.state, "analog_signal", None), "name", "")
+            target_unit_idx = self.state.cur_spike_group
+            erp = self.state.get_erp()
+            selected_chans = []
+            is_multi = False
+
         if erp is None or len(erp) == 0 or erp.shape[0] == 0:
             return False
         n_lines_pre = self.get_settings().get("n_lines_pre", 10)
         n_lines_post = self.get_settings().get("n_lines_post", 10)
         scale = self.get_settings().get("scale", 1)
+        scale = float(scale.magnitude if hasattr(scale, "magnitude") else scale)
         stimno = self.state.stimno
         start = max(stimno - n_lines_pre, 0)
         stop = min(start + n_lines_pre + n_lines_post + 1, len(erp))
         dpts = erp[start:stop]
+        if hasattr(dpts, "magnitude"):
+            dpts = dpts.magnitude
 
         segments = []
         colors = []
-        for i in range(len(dpts)):
-            x = np.arange(erp.shape[-1]) / self.state.sampling_rate
-            y = (dpts[i] * scale * -1) + i
-            segments.append(np.column_stack([x, y]))
-            if i == stimno - start:
-                colors.append("purple")
-            else:
-                colors.append("grey")
+        ch_palette = ["#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377"]
+
+        if is_multi:
+            # Multi-channel overlay per sweep
+            aux_erps = []
+            for ch in selected_chans:
+                ch_e = self.state.get_channel_erp(ch)
+                if ch_e is not None and len(ch_e) > 0:
+                    aux_erps.append((ch, ch_e[start:stop]))
+
+            for i in range(len(dpts)):
+                for ch_i, (ch_name, ch_matrix) in enumerate(aux_erps):
+                    if i < len(ch_matrix):
+                        ch_d = ch_matrix[i]
+                        if hasattr(ch_d, "magnitude"):
+                            ch_d = ch_d.magnitude
+                        x = np.arange(len(ch_d)) / self.state.sampling_rate
+                        y = (ch_d * scale * -1) + i
+                        segments.append(np.column_stack([x, y]))
+                        c = ch_palette[ch_i % len(ch_palette)]
+                        if i == stimno - start:
+                            colors.append(c)
+                        else:
+                            colors.append("grey" if ch_i == 0 else c)
+        else:
+            for i in range(len(dpts)):
+                x = np.arange(erp.shape[-1]) / self.state.sampling_rate
+                y = (dpts[i] * scale * -1) + i
+                segments.append(np.column_stack([x, y]))
+                if i == stimno - start:
+                    colors.append("purple")
+                else:
+                    colors.append("grey")
+
         x_ys = []
-        for i, l in enumerate(
-            self.state.spike_groups[self.state.cur_spike_group].get_latencies(
+        if 0 <= target_unit_idx < len(self.state.spike_groups):
+            unit_lats = self.state.spike_groups[target_unit_idx].get_latencies(
                 self.state.event_signal[start:stop]
             )
-        ):
-            if np.isnan(l):
-                continue
-            l = l.rescale("s")
-            sample_no = int(l * self.state.sampling_rate)
-            if sample_no >= len(dpts[i]) or sample_no < 0:
-                continue
-            r = 20
-            x = np.arange(sample_no - r, sample_no + r)
-            y = ((dpts[i][x] * scale) * -1) + i
-            segments.append(np.column_stack([x / self.state.sampling_rate, y]))
-            colors.append("red")
-            x_ys.append((float(l.magnitude), (dpts[i][sample_no] * scale * -1) + i))
+            for i, l in enumerate(unit_lats):
+                if np.isnan(l):
+                    continue
+                l = l.rescale("s")
+                sample_no = int(l * self.state.sampling_rate)
+                if sample_no >= len(dpts[i]) or sample_no < 0:
+                    continue
+                r = 20
+                x = np.arange(sample_no - r, sample_no + r)
+                y = ((dpts[i][x] * scale) * -1) + i
+                segments.append(np.column_stack([x / self.state.sampling_rate, y]))
+                colors.append("red")
+                x_ys.append((float(l.magnitude), (dpts[i][sample_no] * scale * -1) + i))
+
         if self.points is not None:
             self.points.remove()
             self.points = None
-
-        # print(x_ys)
 
         self.lines.set_segments(segments)
         self.lines.set_color(colors)

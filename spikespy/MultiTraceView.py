@@ -41,6 +41,7 @@ from PySide6 import QtCore
 from PySide6.QtCore import QTimer
 from .NeoSettingsView import NeoSettingsView
 from .ViewerState import ViewerState, tracked_neuron_unit
+from .ChannelGroupBar import ChannelGroupBar
 
 from .QMatplotlib import QMatplotlib
 from matplotlib.lines import Line2D
@@ -433,6 +434,13 @@ class MultiTraceView(QMainWindow):
 
         self.addToolBarBreak()
         self.addToolBar(Qt.TopToolBarArea, toolbar2)
+
+        # Independent channel group and unit binding toolbar
+        self.channel_bar = ChannelGroupBar(parent=self, state=state)
+        self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
+        self.addToolBarBreak()
+        self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+
         # layout.addLayout(layout2)
         layout.addWidget(self.view)
         w = QWidget(self)
@@ -481,7 +489,7 @@ class MultiTraceView(QMainWindow):
         )
 
     def get_settings(self):
-        return {
+        s = {
             "xlim": self.ax.get_xlim(),
             "yrange": np.diff(self.ax.get_ylim()),
             "mode": self.mode,
@@ -489,8 +497,13 @@ class MultiTraceView(QMainWindow):
             "lock_to_stim": self.lock_to_stim,
             "percentiles": (self.lowerSpinBox.value(), self.upperSpinBox.value()),
         }
+        if hasattr(self, "channel_bar"):
+            s["channel_bar"] = self.channel_bar.get_settings()
+        return s
 
     def set_settings(self, values):
+        if "channel_bar" in values and hasattr(self, "channel_bar"):
+            self.channel_bar.set_settings(values["channel_bar"])
         if "xlim" in values:
             self.ax.set_xlim(values["xlim"])
         if "mode" in values:
@@ -520,7 +533,17 @@ class MultiTraceView(QMainWindow):
         xys = np.array(self.pg_selector._xys[:-1])
         window_size = int(self.state.analog_signal.sampling_rate * window_size / 1000)
 
-        erp = self.state.get_erp()
+        target_unit_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group
+        if hasattr(self, "channel_bar"):
+            chans = self.channel_bar.get_selected_channels()
+            if self.channel_bar.is_multichannel() and len(chans) > 1:
+                erp = self.state.get_multichannel_erp(chans, combine_mode="mean")
+            else:
+                erp = self.state.get_channel_erp(self.channel_bar.get_primary_channel())
+        else:
+            erp = self.state.get_erp()
+        if erp is not None and hasattr(erp, "magnitude"):
+            erp = erp.magnitude
         out = []
 
         for i in range(xys.shape[0] - 1):
@@ -545,7 +568,7 @@ class MultiTraceView(QMainWindow):
             evt = self.state.stimno_offset_to_event(
                 out[:, 1].astype(int), out[:, 0].astype(int)
             )
-            self.state.updateUnit(evt, merge=True)
+            self.state.updateUnit(evt, merge=True, unitid=target_unit_idx)
         self.pg_selector.clear()
 
     def toggle_polySelector(self, mode=None):
@@ -573,12 +596,20 @@ class MultiTraceView(QMainWindow):
         """
         start_event, end_event = self.dialogDeleteRegion.getValues()
 
-        erp = self.state.get_erp()
+        target_unit_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group
+        if hasattr(self, "channel_bar"):
+            chans = self.channel_bar.get_selected_channels()
+            if self.channel_bar.is_multichannel() and len(chans) > 1:
+                erp = self.state.get_multichannel_erp(chans, combine_mode="mean")
+            else:
+                erp = self.state.get_channel_erp(self.channel_bar.get_primary_channel())
+        else:
+            erp = self.state.get_erp()
 
         for stimpos in range(start_event, end_event + 1):
-            if stimpos >= erp.shape[0]:  # if you go off the image
+            if erp is not None and stimpos >= len(erp):  # if you go off the image
                 continue
-            self.state.setUnit(None, stimpos)
+            self.state.setUnit(None, stimpos, unitid=target_unit_idx)
 
     def toggle_deleter(self, mode=None):
         self.deleter = mode or (not self.deleter)
@@ -662,26 +693,46 @@ class MultiTraceView(QMainWindow):
         if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
             self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
             self.references.append(self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval))
+        if hasattr(self, "channel_bar"):
+            self.channel_bar.setState(state)
 
         self.update_axis()
         # self.state.onUnitChange.connect(lambda x:self.reset_right_axes_data())
         self.reset_right_axes_data()
+        self.update_window_title()
+
+    def _on_channel_bar_changed(self):
+        self.update_window_title()
+        if getattr(self, "pg_selector", None) is not None:
+            self.setup_figure()
+            self.render()
+
+    def update_window_title(self):
+        if hasattr(self, "channel_bar"):
+            summary = self.channel_bar.get_title_summary()
+            self.setWindowTitle(f"MultiTrace {summary}")
+            p = self.parentWidget()
+            if p is not None and hasattr(p, "setWindowTitle"):
+                p.setWindowTitle(f"MultiTrace {summary}")
 
     def is_view_culled(self) -> bool:
-        if getattr(self, "_user_hidden", False):
-            return True
-        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
-            return True
-        curr = self
-        while curr.parentWidget() is not None:
-            curr = curr.parentWidget()
-            if curr.isMinimized():
+        try:
+            if getattr(self, "_user_hidden", False):
                 return True
-        if self.parentWidget() is not None and not self.isVisible():
+            if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+                return True
+            curr = self
+            while curr.parentWidget() is not None:
+                curr = curr.parentWidget()
+                if curr.isMinimized():
+                    return True
+            if self.parentWidget() is not None and not self.isVisible():
+                return True
+            if getattr(self, "_was_shown", False) and not self.isVisible():
+                return True
+            return False
+        except RuntimeError:
             return True
-        if getattr(self, "_was_shown", False) and not self.isVisible():
-            return True
-        return False
 
     def _on_render_timer_tick(self):
         try:
@@ -876,7 +927,16 @@ class MultiTraceView(QMainWindow):
             return
 
         # self.ax_right_fig.clear()
-        erp = self.state.get_erp()
+        if hasattr(self, "channel_bar"):
+            chans = self.channel_bar.get_selected_channels()
+            if self.channel_bar.is_multichannel() and len(chans) > 1:
+                erp = self.state.get_multichannel_erp(chans, combine_mode="mean")
+            else:
+                primary = self.channel_bar.get_primary_channel()
+                erp = self.state.get_channel_erp(primary)
+        else:
+            erp = self.state.get_erp()
+
         if erp is not None and hasattr(erp, "magnitude"):
             erp = erp.magnitude
         if erp is None or erp.shape[0] == 0:
@@ -1072,11 +1132,12 @@ class MultiTraceView(QMainWindow):
                 else float(self.state.analog_signal.sampling_rate)
             )
 
+        target_unit_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group
         active_unit_indices = set()
         if self.includeAllUnitsCheckBox.isChecked():
             active_unit_indices.update(range(len(self.state.spike_groups)))
-        if self.includeUnitCheckbox.isChecked() and self.state.cur_spike_group is not None:
-            active_unit_indices.add(self.state.cur_spike_group)
+        if self.includeUnitCheckbox.isChecked() and target_unit_idx is not None:
+            active_unit_indices.add(target_unit_idx)
 
         # Hide any unused unit artists
         for u_idx, line in list(self.Patches.items()):
@@ -1097,7 +1158,7 @@ class MultiTraceView(QMainWindow):
             lat_vals = [(float(lats[s].rescale(pq.s).magnitude) if hasattr(lats[s], "rescale") else float(lats[s])) for s in sweeps]
             samples = np.array([int(round(lv * sr)) for lv in lat_vals], dtype=float)
 
-            is_cur = (i == self.state.cur_spike_group)
+            is_cur = (i == target_unit_idx)
             c = "red" if is_cur else colors[i % len(colors)]
             alpha = (0.6 if self.mode == "heatmap" else 1.0) if is_cur else 0.8
             zorder = 12 if is_cur else 11
@@ -1151,7 +1212,7 @@ class MultiTraceView(QMainWindow):
 
         o2 = self.plot_spikegroups()
 
-        if self.pg_selector.active:
+        if getattr(self, "pg_selector", None) and self.pg_selector.active:
             self.pg_selector.set_visible(True)
 
             # self.pg_selector._draw_polygon()

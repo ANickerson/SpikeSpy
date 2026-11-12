@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from .ViewerState import ViewerState, tracked_neuron_unit
+from .ChannelGroupBar import ChannelGroupBar
 
 mplstyle.use("fast")
 
@@ -103,6 +104,12 @@ class UnitFootprintView(QMainWindow):
         self.control_toolbar.addWidget(self.btn_auto_assign_channels)
         self.addToolBar(self.control_toolbar)
 
+        # Independent channel group and unit binding toolbar
+        self.channel_bar = ChannelGroupBar(parent=self, state=state)
+        self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
+        self.addToolBarBreak()
+        self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+
         # Matplotlib navigation toolbar
         self.matplotlib_toolbar = NavigationToolbar2QT(self.canvas, self)
         self.addToolBar(self.matplotlib_toolbar)
@@ -144,22 +151,38 @@ class UnitFootprintView(QMainWindow):
 
         if state is not None:
             self.setState(state)
+        self.update_window_title()
+
+    def _on_channel_bar_changed(self):
+        self.update_window_title()
+        self.update_plot()
+
+    def update_window_title(self):
+        if hasattr(self, "channel_bar"):
+            summary = self.channel_bar.get_title_summary()
+            self.setWindowTitle(f"UnitFootprint {summary}")
+            p = self.parentWidget()
+            if p is not None and hasattr(p, "setWindowTitle"):
+                p.setWindowTitle(f"UnitFootprint {summary}")
 
     def is_view_culled(self) -> bool:
-        if getattr(self, "_user_hidden", False):
-            return True
-        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
-            return True
-        curr = self
-        while curr.parentWidget() is not None:
-            curr = curr.parentWidget()
-            if curr.isMinimized():
+        try:
+            if getattr(self, "_user_hidden", False):
                 return True
-        if self.parentWidget() is not None and not self.isVisible():
+            if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+                return True
+            curr = self
+            while curr.parentWidget() is not None:
+                curr = curr.parentWidget()
+                if curr.isMinimized():
+                    return True
+            if self.parentWidget() is not None and not self.isVisible():
+                return True
+            if getattr(self, "_was_shown", False) and not self.isVisible():
+                return True
+            return False
+        except RuntimeError:
             return True
-        if getattr(self, "_was_shown", False) and not self.isVisible():
-            return True
-        return False
 
     def _on_render_timer_tick(self):
         try:
@@ -195,6 +218,8 @@ class UnitFootprintView(QMainWindow):
 
     def setState(self, state: ViewerState):
         self.state = state
+        if hasattr(self, "channel_bar"):
+            self.channel_bar.setState(state)
         if self.state is not None:
             if hasattr(self.state, "onUnitChange"):
                 self.state.onUnitChange.connect(lambda *args: self.schedule_update())
@@ -211,6 +236,7 @@ class UnitFootprintView(QMainWindow):
             if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
                 self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
                 self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
+        self.update_window_title()
         self.update_plot()
 
     def schedule_update(self):
@@ -437,9 +463,10 @@ class UnitFootprintView(QMainWindow):
         spatiotemporal footprint amplitude and SNR, updating unit annotations.
         """
         if sg is None:
-            if self.state is None:
-                return
-            sg = self.state.getUnitGroup()
+            if hasattr(self, "channel_bar"):
+                sg = self.channel_bar.get_target_unit()
+            elif self.state is not None:
+                sg = self.state.getUnitGroup()
         if sg is None:
             return
 
@@ -508,7 +535,10 @@ class UnitFootprintView(QMainWindow):
         self.canvas.draw_idle()
 
     def _plot_single_unit_composite(self):
-        sg = self.state.getUnitGroup() if self.state is not None else None
+        if hasattr(self, "channel_bar"):
+            sg = self.channel_bar.get_target_unit()
+        else:
+            sg = self.state.getUnitGroup() if self.state is not None else None
         if sg is None:
             ax = self.figure.add_subplot(111)
             ax.text(

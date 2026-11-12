@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
 from scipy.signal import fftconvolve, find_peaks
 from .processing import create_erp_signals
 from .ViewerState import ViewerState
+from .ChannelGroupBar import ChannelGroupBar
 import quantities as pq
 from matplotlib.ticker import Formatter
 
@@ -142,6 +143,12 @@ class SingleTraceView(QMainWindow):
         self.toolbar.addWidget(self.chk_unit_neighbors_only)
         self.toolbar.addWidget(self.spin_chan_spacing)
 
+        # Independent channel group and unit binding toolbar
+        self.channel_bar = ChannelGroupBar(parent=self, state=self.state)
+        self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
+        self.addToolBarBreak()
+        self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+
         self.aux_trace_lines = []
         self.aux_trace_labels = []
 
@@ -232,10 +239,38 @@ class SingleTraceView(QMainWindow):
         self._templates = {}
         self.step = None
         self.setupFigure()
+        self.update_window_title()
+
+    def _on_channel_bar_changed(self):
+        if hasattr(self, "channel_bar"):
+            self.chk_multichannel.blockSignals(True)
+            self.chk_multichannel.setChecked(self.channel_bar.is_multichannel())
+            self.chk_multichannel.blockSignals(False)
+            self.update_window_title()
+            self._histogram_dirty = True
+            self.setupFigure()
+            self.updateFigure_core()
+
+    def update_window_title(self):
+        if hasattr(self, "channel_bar"):
+            summary = self.channel_bar.get_title_summary()
+            self.setWindowTitle(f"SingleTrace {summary}")
+            p = self.parentWidget()
+            if p is not None and hasattr(p, "setWindowTitle"):
+                p.setWindowTitle(f"SingleTrace {summary}")
 
     def get_overlay_channels(self) -> List[str]:
         if not self.chk_multichannel.isChecked() or self.state is None:
             return []
+
+        if hasattr(self, "channel_bar"):
+            all_chans = self.channel_bar.get_selected_channels()
+            primary_name = self.channel_bar.get_primary_channel()
+            # If explicit group or unit channels selected in bar, return them directly
+            mode, _ = self.channel_bar.get_channel_mode()
+            if mode in (self.channel_bar.MODE_FOLLOW_UNIT, self.channel_bar.MODE_GROUP) or (len(all_chans) > 1 and mode != self.channel_bar.MODE_FOLLOW_GLOBAL):
+                return [c for c in all_chans if c != primary_name]
+
         if hasattr(self.state, "get_available_channels"):
             chans = list(self.state.get_available_channels())
         elif getattr(self.state, "segment", None) is not None:
@@ -243,7 +278,11 @@ class SingleTraceView(QMainWindow):
         else:
             chans = []
 
-        sg = self.state.getUnitGroup() if hasattr(self.state, "getUnitGroup") else None
+        sg = (
+            self.channel_bar.get_target_unit()
+            if hasattr(self, "channel_bar")
+            else (self.state.getUnitGroup() if hasattr(self.state, "getUnitGroup") else None)
+        )
         unit_chans = []
         if sg is not None:
             if getattr(sg, "channel", ""):
@@ -264,7 +303,11 @@ class SingleTraceView(QMainWindow):
                 chans = [c for c in chans if c in unit_chans]
 
         # Exclude the primary active channel
-        primary_name = getattr(getattr(self.state, "analog_signal", None), "name", "")
+        primary_name = (
+            self.channel_bar.get_primary_channel()
+            if hasattr(self, "channel_bar")
+            else getattr(getattr(self.state, "analog_signal", None), "name", "")
+        )
         chans = [c for c in chans if c != primary_name]
         return chans
 
@@ -372,7 +415,10 @@ class SingleTraceView(QMainWindow):
 
         self.view.draw()
         self.view.update()
-        self.toolbar.set_history_buttons()
+        try:
+            self.toolbar.set_history_buttons()
+        except Exception:
+            pass
         self.step = None
         self._histogram_dirty = True
         self.updateHistogram()
@@ -603,7 +649,11 @@ class SingleTraceView(QMainWindow):
         if not getattr(self, "_histogram_dirty", True) and self.step is not None:
             return
 
-        sg = self.state.getUnitGroup()
+        sg = (
+            self.channel_bar.get_target_unit()
+            if hasattr(self, "channel_bar")
+            else (self.state.getUnitGroup() if hasattr(self.state, "getUnitGroup") else None)
+        )
         if self.step is not None:
             try:
                 self.step[0].remove()
@@ -640,20 +690,23 @@ class SingleTraceView(QMainWindow):
         self._dirty = True
 
     def is_view_culled(self) -> bool:
-        if getattr(self, "_user_hidden", False):
-            return True
-        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
-            return True
-        curr = self
-        while curr.parentWidget() is not None:
-            curr = curr.parentWidget()
-            if curr.isMinimized():
+        try:
+            if getattr(self, "_user_hidden", False):
                 return True
-        if self.parentWidget() is not None and not self.isVisible():
+            if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
+                return True
+            curr = self
+            while curr.parentWidget() is not None:
+                curr = curr.parentWidget()
+                if curr.isMinimized():
+                    return True
+            if self.parentWidget() is not None and not self.isVisible():
+                return True
+            if getattr(self, "_was_shown", False) and not self.isVisible():
+                return True
+            return False
+        except RuntimeError:
             return True
-        if getattr(self, "_was_shown", False) and not self.isVisible():
-            return True
-        return False
 
     def _on_render_timer_tick(self):
         try:
@@ -698,12 +751,19 @@ class SingleTraceView(QMainWindow):
             return
         if self.state.analog_signal is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
             return
-        erp = self.state.get_erp()
+
+        if hasattr(self, "channel_bar"):
+            primary_ch = self.channel_bar.get_primary_channel()
+            erp = self.state.get_channel_erp(primary_ch)
+            sg = self.channel_bar.get_target_unit()
+        else:
+            erp = self.state.get_erp()
+            sg = self.state.getUnitGroup()
+
         if erp is None or erp.shape[0] == 0:
             return
         if self.state.stimno >= erp.shape[0] or self.state.stimno >= len(self.state.event_signal):
             return
-        sg = self.state.getUnitGroup()
         dpts = erp[self.state.stimno]  # this should only happen once.
         if hasattr(dpts, "magnitude"):
             dpts = dpts.magnitude
@@ -888,8 +948,8 @@ class SingleTraceView(QMainWindow):
             if x < 0 + w or x > self.state.analog_signal_erp.shape[1] - w:
                 return
 
-            x += np.argmax(np.abs(dpts[x - w : x + w])) - w
-        self.state.setUnit(x)
+        target_unit_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group
+        self.state.setUnit(x, unitid=target_unit_idx)
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Z:  # Although the zoom works, it can't be undone...
@@ -955,10 +1015,8 @@ class SingleTraceView(QMainWindow):
                 closest_idx += 1
             if e.key() == Qt.Key_Left:
                 closest_idx -= 1
-            if closest_idx < 0 or closest_idx >= len(idx):
-                return
-
-            self.state.setUnit(idx[closest_idx])
+            target_unit_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group
+            self.state.setUnit(idx[closest_idx], unitid=target_unit_idx)
         elif e.key() == Qt.Key_BracketLeft:  # Zoom out
             # get current xlim & ylim
             x_limits = [self.ax.get_xlim()[0], self.ax.get_xlim()[1]]

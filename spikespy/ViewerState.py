@@ -344,6 +344,8 @@ class ViewerState(QObject):
     onUnitAnnotated = Signal(dict)
     onChannelChange = Signal(str)
     onUIRefreshRateChange = Signal(int)
+    onChannelGroupsChanged = Signal()
+    onSharedChannelSetChanged = Signal(str)
 
     def __init__(self, parent=None, segment=None, spike_groups=None):
         super().__init__(parent)
@@ -361,6 +363,15 @@ class ViewerState(QObject):
         self.MAX_UNDO = 10
         self.title = ""
         self.ui_refresh_rate_ms: int = 33  # ~30 FPS
+
+        # Channel groups storage: name -> list of channel names
+        self.channel_groups: dict = {}
+
+        # Shared channel sets for coordinated multi-panel viewing
+        self.shared_channel_sets: dict = {
+            "Shared Group A": {"channels": [], "group_name": "", "unit_idx": None, "multichannel": True},
+            "Shared Group B": {"channels": [], "group_name": "", "unit_idx": None, "multichannel": True},
+        }
 
         # Live streaming state attributes
         self.is_streaming: bool = False
@@ -386,6 +397,245 @@ class ViewerState(QObject):
 
     def get_ui_refresh_rate_ms(self) -> int:
         return getattr(self, "ui_refresh_rate_ms", 33)
+    def add_channel_group(self, name: str, channels: List[str]):
+        """Add or update a named channel group."""
+        if not name or not channels:
+            return
+        cleaned = [str(c).strip() for c in channels if str(c).strip()]
+        self.channel_groups[str(name).strip()] = cleaned
+        self.onChannelGroupsChanged.emit()
+
+    def remove_channel_group(self, name: str):
+        """Remove a named channel group."""
+        if name in self.channel_groups:
+            del self.channel_groups[name]
+            self.onChannelGroupsChanged.emit()
+
+    def get_channel_group(self, name: str) -> List[str]:
+        """Return the channels in a named group."""
+        return list(self.channel_groups.get(name, []))
+
+    def get_all_channel_groups(self) -> dict:
+        """Return all user-defined and unit-derived channel groups."""
+        groups = dict(self.channel_groups)
+        for i, sg in enumerate(self.spike_groups):
+            u_chans = self.get_unit_channels(i)
+            if u_chans:
+                u_name = getattr(sg.event, "name", f"unit_{i}") or f"unit_{i}"
+                groups[f"Unit {i} ({u_name})"] = u_chans
+        return groups
+
+    def get_unit_channels(self, unit_idx: int) -> List[str]:
+        """Return the primary and neighbor channels associated with the specified unit."""
+        if unit_idx < 0 or unit_idx >= len(self.spike_groups):
+            return []
+        sg = self.spike_groups[unit_idx]
+        primary = getattr(sg, "channel", "")
+        if not primary and hasattr(sg, "event") and getattr(sg.event, "annotations", None):
+            primary = sg.event.annotations.get("channel", "")
+        neighbors = getattr(sg, "neighbor_channels", []) or []
+        if not neighbors and hasattr(sg, "event") and getattr(sg.event, "annotations", None):
+            neighbors = sg.event.annotations.get("neighbor_channels", []) or []
+
+        chans = []
+        if primary:
+            chans.append(str(primary))
+        for c in neighbors:
+            c_str = str(c).strip()
+            if c_str and c_str not in chans:
+                chans.append(c_str)
+        if not chans and self.analog_signal is not None and getattr(self.analog_signal, "name", ""):
+            chans.append(self.analog_signal.name)
+        return chans
+
+    def set_unit_channels(self, unit_idx: int, channels: List[str]):
+        """Set the primary and neighbor channels for a unit."""
+        if unit_idx < 0 or unit_idx >= len(self.spike_groups) or not channels:
+            return
+        sg = self.spike_groups[unit_idx]
+        cleaned = [str(c).strip() for c in channels if str(c).strip()]
+        if not cleaned:
+            return
+        primary = cleaned[0]
+        neighbors = [c for c in cleaned[1:] if c != primary]
+        sg.channel = primary
+        sg.neighbor_channels = neighbors
+        if hasattr(sg, "event") and sg.event is not None:
+            if not hasattr(sg.event, "annotations"):
+                sg.event.annotations = {}
+            sg.event.annotations["channel"] = primary
+            sg.event.annotations["neighbor_channels"] = neighbors
+        self.onUnitGroupChange.emit()
+        self.onChannelGroupsChanged.emit()
+
+    def shift_channels(self, channels: List[str], step: int = 1) -> List[str]:
+        """
+        Shifts a list of channels forward or backward along available channels in the recording.
+        Preserves relative offsets and channel group size.
+        """
+        avail = self.get_available_channels()
+        if not avail or not channels:
+            return list(channels)
+
+        chan_to_idx = {name: i for i, name in enumerate(avail)}
+        valid_indices = [chan_to_idx[c] for c in channels if c in chan_to_idx]
+        if not valid_indices:
+            return list(channels)
+
+        min_idx = min(valid_indices)
+        max_idx = max(valid_indices)
+        span = max_idx - min_idx
+
+        new_min = min_idx + step
+        if new_min < 0:
+            new_min = 0
+        if new_min + span >= len(avail):
+            new_min = max(0, len(avail) - 1 - span)
+
+        shift_delta = new_min - min_idx
+        new_channels = []
+        for c in channels:
+            if c in chan_to_idx:
+                old_i = chan_to_idx[c]
+                new_i = max(0, min(len(avail) - 1, old_i + shift_delta))
+                new_channels.append(avail[new_i])
+            else:
+                new_channels.append(c)
+
+        return new_channels
+
+    def shift_unit_channels(self, unit_idx: int, step: int = 1) -> List[str]:
+        """Shifts the entire channel group of a unit along available recording channels by step."""
+        if unit_idx < 0 or unit_idx >= len(self.spike_groups):
+            return []
+        current = self.get_unit_channels(unit_idx)
+        shifted = self.shift_channels(current, step=step)
+        if shifted:
+            self.set_unit_channels(unit_idx, shifted)
+        return shifted
+
+    def get_shared_channel_set(self, set_name: str = "Shared Group A") -> dict:
+        """Returns the dictionary configuration for a shared channel set."""
+        if not set_name:
+            set_name = "Shared Group A"
+        if set_name not in self.shared_channel_sets:
+            self.shared_channel_sets[set_name] = {
+                "channels": [],
+                "group_name": "",
+                "unit_idx": None,
+                "multichannel": True,
+            }
+        s = dict(self.shared_channel_sets[set_name])
+        if not s.get("channels"):
+            avail = self.get_available_channels()
+            s["channels"] = avail[:4] if len(avail) >= 4 else avail
+        return s
+
+    def set_shared_channels(
+        self,
+        set_name: str,
+        channels: List[str],
+        group_name: str = "",
+        unit_idx: Optional[int] = None,
+        multichannel: bool = True,
+    ):
+        """Updates the channel configuration for a shared viewer set and notifies all listening viewers."""
+        if not set_name:
+            set_name = "Shared Group A"
+        cleaned = [str(c).strip() for c in channels if str(c).strip()]
+        self.shared_channel_sets[set_name] = {
+            "channels": cleaned,
+            "group_name": group_name,
+            "unit_idx": unit_idx,
+            "multichannel": multichannel,
+        }
+        self.onSharedChannelSetChanged.emit(set_name)
+
+    def shift_shared_channels(self, set_name: str, step: int = 1) -> List[str]:
+        """Shifts the active channels of a shared channel set forward or backward along recording channels."""
+        current_set = self.get_shared_channel_set(set_name)
+        current_channels = current_set.get("channels", [])
+        if not current_channels:
+            return []
+        shifted = self.shift_channels(current_channels, step=step)
+        if shifted:
+            self.set_shared_channels(
+                set_name=set_name,
+                channels=shifted,
+                group_name=f"Shifted ({len(shifted)} ch)",
+                unit_idx=current_set.get("unit_idx"),
+                multichannel=current_set.get("multichannel", True),
+            )
+        return shifted
+
+    def cycle_shared_group(self, set_name: str, direction: int = 1) -> str:
+        """Cycles the shared channel set to the next or previous saved channel group."""
+        all_groups = self.get_all_channel_groups()
+        if not all_groups:
+            return ""
+        group_names = list(all_groups.keys())
+        current_set = self.get_shared_channel_set(set_name)
+        current_group = current_set.get("group_name", "")
+
+        curr_i = group_names.index(current_group) if current_group in group_names else -1
+        next_i = (curr_i + direction) % len(group_names)
+        target_name = group_names[next_i]
+        target_chans = all_groups[target_name]
+        self.set_shared_channels(
+            set_name=set_name,
+            channels=target_chans,
+            group_name=target_name,
+            unit_idx=current_set.get("unit_idx"),
+            multichannel=current_set.get("multichannel", True),
+        )
+        return target_name
+
+    def auto_create_channel_groups(self, group_size: int = 4, prefix: str = "Group") -> dict:
+        """Splits all available channels into consecutive groups of group_size."""
+        avail = self.get_available_channels()
+        if not avail or group_size <= 0:
+            return {}
+        created = {}
+        for idx, start_i in enumerate(range(0, len(avail), group_size)):
+            chunk = avail[start_i : start_i + group_size]
+            g_name = f"{prefix} {idx + 1} ({len(chunk)} ch: {chunk[0]}..{chunk[-1]})"
+            self.add_channel_group(g_name, chunk)
+            created[g_name] = chunk
+        return created
+
+    def get_multichannel_erp(
+        self, channel_names: List[str] = None, combine_mode: str = "mean"
+    ) -> Optional[np.ndarray]:
+        """
+        Retrieves and integrates ERP across multiple channels.
+        combine_mode can be 'mean', 'sum', or 'stack'.
+        """
+        if not channel_names:
+            erp = self.get_erp()
+            return erp.magnitude if hasattr(erp, "magnitude") else erp
+
+        erps = []
+        for ch in channel_names:
+            e = self.get_channel_erp(ch)
+            if e is not None and len(e) > 0:
+                e_mag = e.magnitude if hasattr(e, "magnitude") else np.asarray(e)
+                erps.append(e_mag)
+
+        if not erps:
+            erp = self.get_erp()
+            return erp.magnitude if hasattr(erp, "magnitude") else erp
+
+        min_sweeps = min(e.shape[0] for e in erps)
+        min_samples = min(e.shape[1] for e in erps)
+        aligned = [e[:min_sweeps, :min_samples] for e in erps]
+
+        if combine_mode == "mean":
+            return np.mean(aligned, axis=0)
+        elif combine_mode == "sum":
+            return np.sum(aligned, axis=0)
+        elif combine_mode == "stack":
+            return np.stack(aligned, axis=0)
+        return aligned[0]
 
     def get_available_channels(self) -> List[str]:
         if self.is_streaming and self._live_aux_erp_buffers:
@@ -458,13 +708,15 @@ class ViewerState(QObject):
     @Slot(int, int)
     @Slot(int)
     @Slot()
-    def setUnit(self, latency, stimno=None, unit_idx: Optional[int] = None):
-        if stimno is None:
-            stimno = self.stimno
+    def setUnit(self, latency, stimno=None, unit_idx: Optional[int] = None, unitid: Optional[int] = None):
+        if unitid is not None:
+            unit_idx = unitid
         if unit_idx is None:
             unit_idx = self.cur_spike_group
         if unit_idx < 0 or unit_idx >= len(self.spike_groups):
             return
+        if stimno is None:
+            stimno = self.stimno
 
         sg = self.spike_groups[unit_idx]
         evt = sg.event
@@ -500,7 +752,6 @@ class ViewerState(QObject):
 
         if latency is None:
             sg.idx_arr[stimno] = None
-
         else:
             if (
                 latency == -1
@@ -586,19 +837,24 @@ class ViewerState(QObject):
         self.onNewSpikeEvents.emit(unit_idx)
 
     @Slot(Event)
-    def updateUnit(self, event, merge=False):
+    def updateUnit(self, event, merge=False, unitid=None):
+        if unitid is None:
+            unitid = self.cur_spike_group
+        if unitid < 0 or unitid >= len(self.spike_groups):
+            return
+
         def undo(
-            x=self.cur_spike_group,
-            evt=self.spike_groups[self.cur_spike_group].event,
+            x=unitid,
+            evt=self.spike_groups[unitid].event,
             stimno=self.stimno,
         ):
-            self.spike_groups[self.cur_spike_group].event = evt
+            self.spike_groups[x].event = evt
             self.update_idx_arrs()
             self.onUnitChange.emit(stimno)
 
         self.save_undo(undo)
 
-        old_evt = self.spike_groups[self.cur_spike_group].event.rescale(pq.s)
+        old_evt = self.spike_groups[unitid].event.rescale(pq.s)
         new_event = event.rescale(pq.s)
         if merge:
             # update the existing events with the new ones, removing ones within 0.5s of the other
@@ -619,8 +875,8 @@ class ViewerState(QObject):
                 np.array(newEvents) * pq.s, **old_evt.annotations, name=old_evt.name
             )
             # TODO: this does not maintain array_annotations.
-        self.spike_groups[self.cur_spike_group].event = event
-        del self.spike_groups[self.cur_spike_group].idx_arr
+        self.spike_groups[unitid].event = event
+        del self.spike_groups[unitid].idx_arr
         self.update_idx_arrs()
         self.onUnitGroupChange.emit()
 
