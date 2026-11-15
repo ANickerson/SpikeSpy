@@ -2,14 +2,14 @@ import itertools
 import sys
 import logging
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import numpy as np
 import quantities as pq
 from neo import Event
 
 import PySide6
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import Qt, Signal, Slot, QTimer, QRectF, QPointF
+from PySide6.QtCore import Qt, Signal, Slot, QTimer, QRectF, QPointF, QSignalBlocker
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -95,7 +95,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         self.std: float = 1.0
         self.rightPlots: Dict[str, bool] = {}
         self.right_plots: Dict[str, pg.PlotItem] = {}
-        self.references: List = []
+        self.connections: List[Tuple] = []
+        self.references = self.connections
         self.legend_items: List[pg.TextItem] = []
         self.message_items: List[pg.TextItem] = []
         self.other_unit_scatters: List[pg.ScatterPlotItem] = []
@@ -488,8 +489,48 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             self._dirty = False
             self.on_new_sweep(self.state.stimno if self.state else 0)
 
+    def _connect_state(self, sig, slot):
+        sig.connect(slot)
+        self.connections.append((sig, slot))
+
+    def unset_connections(self):
+        self._unregister_live_frames()
+        for sig, slot in self.connections:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self.connections.clear()
+
+    def remove_references(self):
+        self.unset_connections()
+
+    @Slot()
+    def _on_data_reload(self):
+        self.reset_right_axes_data()
+        self.setup_figure()
+        self.update_axis()
+
+    @Slot()
+    def _on_unit_updated(self, *args):
+        self.render()
+        self._schedule_right_axis_update(force=True)
+
+    @Slot()
+    @Slot(int)
+    def _on_stim_no_changed(self, stimno: int = -1):
+        target = self.state.stimno if stimno < 0 and self.state is not None else stimno
+        if target is not None:
+            self.update_ylim(target)
+            self.plot_curstim_line(target)
+
+    @Slot()
+    @Slot(int)
+    def _on_new_spike_events(self, *args):
+        self._schedule_spike_group_update()
+
     def set_state(self, state: ViewerState):
-        self.remove_references()
+        self.unset_connections()
         self.state = state
         if hasattr(self, "channel_bar") and self.channel_bar is not None:
             self.channel_bar.setState(state)
@@ -511,26 +552,17 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         # pipeline as live sweeps (single point of view processing).
         self._register_data_reload(
             state,
-            lambda: (
-                self.reset_right_axes_data(),
-                self.setup_figure(),
-                self.update_axis(),
-            ),
+            self._on_data_reload,
             name="reload_setup",
         )
 
-        def _on_unit_updated(*args):
-            self.render()
-            self._schedule_right_axis_update(force=True)
+        self._connect_state(self.state.onUnitGroupChange, self._on_unit_updated)
+        self._connect_state(self.state.onUnitChange, self._on_unit_updated)
 
-        self.references.append(self.state.onUnitGroupChange.connect(_on_unit_updated))
-        self.references.append(self.state.onUnitChange.connect(_on_unit_updated))
-
-        self.references.append(self.state.onStimNoChange.connect(self.update_ylim))
-        self.references.append(self.state.onStimNoChange.connect(lambda *args: self.plot_curstim_line(self.state.stimno)))
+        self._connect_state(self.state.onStimNoChange, self._on_stim_no_changed)
 
         if hasattr(self.state, "onChannelChange"):
-            self.references.append(self.state.onChannelChange.connect(self._on_channel_change))
+            self._connect_state(self.state.onChannelChange, self._on_channel_change)
 
         if hasattr(self.state, "onNewSweep"):
             self.on_new_sweep_throttled = qsignal_throttle(lambda: self.on_new_sweep(self.state.stimno if self.state else 0), 40)
@@ -538,7 +570,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         # the GUI-side throttle keeps render scheduling rate-limited.
         self._register_live_frames(state, lambda _stimno: self.on_new_sweep_throttled())
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.references.append(self.state.onNewSpikeEvents.connect(lambda *args: self._schedule_spike_group_update()))
+            self._connect_state(self.state.onNewSpikeEvents, self._on_new_spike_events)
 
         self.update_axis()
         self._schedule_right_axis_update(force=True)
@@ -897,15 +929,6 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         else:
             self.tracked_unit_scatter.clear()
 
-    def remove_references(self):
-        self._unregister_live_frames()
-        if self.state is not None:
-            for ref in self.references:
-                try:
-                    self.state.disconnect(ref)
-                except Exception:
-                    pass
-            self.references.clear()
 
     @quiet_fail
     def update_axis(self):

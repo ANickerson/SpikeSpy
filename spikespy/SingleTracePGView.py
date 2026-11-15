@@ -1,10 +1,10 @@
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import numpy as np
 import quantities as pq
 from scipy.signal import fftconvolve, find_peaks
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Slot, QSignalBlocker
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -78,7 +78,7 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
         self.setFocusPolicy(Qt.ClickFocus)
 
         self.state: Optional[ViewerState] = state
-        self.connections: List = []
+        self.connections: List[Tuple] = []
         self.select_local_maxima_width: int = 1
         self.closest_pos: int = 0
         self.conv: Optional[_SweepConvProxy] = None
@@ -337,6 +337,25 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
                     return erp
         return self.state.get_erp()
 
+    def _connect_state(self, sig, slot):
+        sig.connect(slot)
+        self.connections.append((sig, slot))
+
+    @Slot()
+    def _on_data_reloaded(self):
+        self.setup_figure()
+
+    @Slot()
+    @Slot(int)
+    def _on_unit_change(self, *args):
+        self.update_figure()
+        self.update_histogram()
+
+    @Slot()
+    @Slot(int)
+    def _on_new_spike_events(self, *args):
+        self.update_histogram()
+
     def set_state(self, state: ViewerState):
         self.unset_connections()
         self.state = state
@@ -356,13 +375,12 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
             }
         )
 
-        self._register_data_reload(state, self.setup_figure)
-        self.connections.append(self.state.onStimNoChange.connect(self._on_stim_no_change))
-        self.connections.append(self.state.onUnitChange.connect(self.update_figure))
-        self.connections.append(self.state.onUnitGroupChange.connect(self._on_unit_group_changed))
-        self.connections.append(self.state.onUnitChange.connect(self.update_histogram))
+        self._register_data_reload(state, self._on_data_reloaded)
+        self._connect_state(self.state.onStimNoChange, self._on_stim_no_change)
+        self._connect_state(self.state.onUnitChange, self._on_unit_change)
+        self._connect_state(self.state.onUnitGroupChange, self._on_unit_group_changed)
         if hasattr(self.state, "onChannelChange"):
-            self.connections.append(self.state.onChannelChange.connect(self._on_channel_change_event))
+            self._connect_state(self.state.onChannelChange, self._on_channel_change_event)
         def _on_live_frame_cb(stimno):
             target = self.state.stimno if stimno is None else int(stimno)
             self._last_live_rendered_stim = target
@@ -373,7 +391,7 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
             _on_live_frame_cb,
         )
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.connections.append(self.state.onNewSpikeEvents.connect(self.update_histogram))
+            self._connect_state(self.state.onNewSpikeEvents, self._on_new_spike_events)
 
         self._setup_done = False
         self.setup_figure()
@@ -911,12 +929,11 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
 
     def unset_connections(self):
         self._unregister_live_frames()
-        if self.state is not None:
-            for con in self.connections:
-                try:
-                    self.state.disconnect(con)
-                except Exception:
-                    pass
+        for sig, slot in self.connections:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
         self.connections.clear()
 
     @quiet_fail
@@ -1301,9 +1318,8 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
         if "separate_axes" in values:
             self._separate_axes = bool(values["separate_axes"])
             if hasattr(self, "separate_axes_check"):
-                self.separate_axes_check.blockSignals(True)
-                self.separate_axes_check.setChecked(self._separate_axes)
-                self.separate_axes_check.blockSignals(False)
+                with QSignalBlocker(self.separate_axes_check):
+                    self.separate_axes_check.setChecked(self._separate_axes)
         if "xlim" in values:
             self.main_plot.setXRange(values["xlim"][0], values["xlim"][1], padding=0)
         if "channel_bar" in values and hasattr(self, "channel_bar") and self.channel_bar is not None:

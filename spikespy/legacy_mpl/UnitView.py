@@ -34,10 +34,10 @@ from PySide6.QtWidgets import (
 )
 
 
-from .ViewerState import ViewerState
+from ..ViewerState import ViewerState
 from .QMatplotlib import QMatplotlib
-from .live_orchestrator import LiveFrameConsumerMixin
-from .ChannelGroupBar import ChannelGroupBar
+from ..live_orchestrator import LiveFrameConsumerMixin
+from ..ChannelGroupBar import ChannelGroupBar
 
 mplstyle.use("fast")
 

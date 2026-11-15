@@ -23,7 +23,7 @@ from PySide6.QtCore import (
     QRunnable,
     QTimer,
 )
-from .helpers import qsignal_throttle
+from ..helpers import qsignal_throttle
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -47,10 +47,10 @@ from PySide6.QtWidgets import (
 )
 
 from scipy.signal import fftconvolve, find_peaks
-from .processing import create_erp_signals
-from .ViewerState import ViewerState
-from .live_orchestrator import LiveFrameConsumerMixin
-from .ChannelGroupBar import ChannelGroupBar
+from ..processing import create_erp_signals
+from ..ViewerState import ViewerState
+from ..live_orchestrator import LiveFrameConsumerMixin
+from ..ChannelGroupBar import ChannelGroupBar
 import quantities as pq
 from matplotlib.ticker import Formatter
 

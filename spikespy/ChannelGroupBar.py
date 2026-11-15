@@ -2,7 +2,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import PySide6
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import QSignalBlocker, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -243,6 +243,7 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
         super().__init__("Channels & Unit", parent)
         self.state: Optional[ViewerState] = state
         self._block_updates = False
+        self._state_connections: list[tuple] = []
 
         # Target Unit Selector
         self.lbl_unit = QLabel(" Unit: ", self)
@@ -318,20 +319,50 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
                 return i
         return -1
 
+    def unset_connections(self):
+        """Disconnect all tracked state signal connections cleanly."""
+        for sig, slot in self._state_connections:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._state_connections.clear()
+        self._unregister_live_frames()
+
+    def closeEvent(self, event):
+        self.unset_connections()
+        super().closeEvent(event)
+
+    def _on_state_unit_changed(self, *args):
+        self.refresh_units()
+
     def setState(self, state: ViewerState):
+        self.unset_connections()
         self.state = state
         if self.state is not None:
+            self._state_connections.append((self.state.onUnitGroupChange, self.refresh_units))
             self.state.onUnitGroupChange.connect(self.refresh_units)
+
+            if hasattr(self.state, "onActiveUnitChanged"):
+                self._state_connections.append((self.state.onActiveUnitChanged, self._on_state_unit_changed))
+                self.state.onActiveUnitChanged.connect(self._on_state_unit_changed)
+            if hasattr(self.state, "onUnitListChanged"):
+                self._state_connections.append((self.state.onUnitListChanged, self._on_state_unit_changed))
+                self.state.onUnitListChanged.connect(self._on_state_unit_changed)
+
             if hasattr(self.state, "onLoadNewFile"):
                 self._register_data_reload(
                     self.state,
                     lambda: self.refresh_all(),
                 )
             if hasattr(self.state, "onChannelGroupsChanged"):
+                self._state_connections.append((self.state.onChannelGroupsChanged, self.refresh_channels))
                 self.state.onChannelGroupsChanged.connect(self.refresh_channels)
             if hasattr(self.state, "onChannelChange"):
+                self._state_connections.append((self.state.onChannelChange, self._on_global_channel_changed))
                 self.state.onChannelChange.connect(self._on_global_channel_changed)
             if hasattr(self.state, "onSharedChannelSetChanged"):
+                self._state_connections.append((self.state.onSharedChannelSetChanged, self._on_shared_set_changed))
                 self.state.onSharedChannelSetChanged.connect(self._on_shared_set_changed)
             if hasattr(self.state, "onNewSweep"):
                 self._register_live_frames(
@@ -382,68 +413,66 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
 
     def refresh_units(self):
         curr_data = self.combo_unit.currentData()
-        self.combo_unit.blockSignals(True)
-        self.combo_unit.clear()
+        with QSignalBlocker(self.combo_unit):
+            self.combo_unit.clear()
 
-        # Follow active unit option
-        self.combo_unit.addItem("(Follow Active Unit)", userData=None)
+            # Follow active unit option
+            self.combo_unit.addItem("(Follow Active Unit)", userData=None)
 
-        if self.state and self.state.spike_groups:
-            for i, sg in enumerate(self.state.spike_groups):
-                u_name = getattr(sg.event, "name", f"unit_{i}") or f"unit_{i}"
-                ch = getattr(sg, "channel", "")
-                ch_info = f" [{ch}]" if ch else ""
-                self.combo_unit.addItem(f"Unit {i}: {u_name}{ch_info}", userData=i)
+            if self.state and self.state.spike_groups:
+                for i, sg in enumerate(self.state.spike_groups):
+                    u_name = getattr(sg.event, "name", f"unit_{i}") or f"unit_{i}"
+                    ch = getattr(sg, "channel", "")
+                    ch_info = f" [{ch}]" if ch else ""
+                    self.combo_unit.addItem(f"Unit {i}: {u_name}{ch_info}", userData=i)
 
-        # Restore previous selection if possible
-        restored = False
-        if curr_data is not None:
-            idx = self.find_unit_data_index(curr_data)
-            if idx >= 0:
-                self.combo_unit.setCurrentIndex(idx)
-                restored = True
-        if not restored:
-            self.combo_unit.setCurrentIndex(0)
-        self.combo_unit.blockSignals(False)
+            # Restore previous selection if possible
+            restored = False
+            if curr_data is not None:
+                idx = self.find_unit_data_index(curr_data)
+                if idx >= 0:
+                    self.combo_unit.setCurrentIndex(idx)
+                    restored = True
+            if not restored:
+                self.combo_unit.setCurrentIndex(0)
 
     def refresh_channels(self):
         curr_data = self.combo_channel.currentData()
-        self.combo_channel.blockSignals(True)
-        self.combo_channel.clear()
+        with QSignalBlocker(self.combo_channel):
+            self.combo_channel.clear()
 
-        # Dynamic options
-        self.combo_channel.addItem("(Follow Global Channel)", userData=(self.MODE_FOLLOW_GLOBAL, None))
-        self.combo_channel.addItem("(📡 Follow Live Input)", userData=(self.MODE_FOLLOW_LIVE, None))
-        self.combo_channel.addItem("(Bound Unit Channels)", userData=(self.MODE_FOLLOW_UNIT, None))
-        self.combo_channel.addItem("(🔗 Shared Group A)", userData=(self.MODE_SHARED_SET, "Shared Group A"))
-        self.combo_channel.addItem("(🔗 Shared Group B)", userData=(self.MODE_SHARED_SET, "Shared Group B"))
+            # Dynamic options
+            self.combo_channel.addItem("(Follow Global Channel)", userData=(self.MODE_FOLLOW_GLOBAL, None))
+            self.combo_channel.addItem("(📡 Follow Live Input)", userData=(self.MODE_FOLLOW_LIVE, None))
+            self.combo_channel.addItem("(Bound Unit Channels)", userData=(self.MODE_FOLLOW_UNIT, None))
+            self.combo_channel.addItem("(🔗 Shared Group A)", userData=(self.MODE_SHARED_SET, "Shared Group A"))
+            self.combo_channel.addItem("(🔗 Shared Group B)", userData=(self.MODE_SHARED_SET, "Shared Group B"))
 
-        # Available individual channels and groups
-        if self.state:
-            avail = self.state.get_available_channels()
-            all_groups = self.state.get_all_channel_groups() if hasattr(self.state, "get_all_channel_groups") else {}
+            # Available individual channels and groups
+            if self.state:
+                avail = self.state.get_available_channels()
+                all_groups = self.state.get_all_channel_groups() if hasattr(self.state, "get_all_channel_groups") else {}
 
-            if all_groups:
-                self.combo_channel.insertSeparator(self.combo_channel.count())
-                for g_name, g_chans in all_groups.items():
-                    preview = f" ({len(g_chans)} ch: {', '.join(g_chans[:3])}{'...' if len(g_chans)>3 else ''})"
-                    self.combo_channel.addItem(f"[Group] {g_name}{preview}", userData=(self.MODE_GROUP, g_name))
+                if all_groups:
+                    self.combo_channel.insertSeparator(self.combo_channel.count())
+                    for g_name, g_chans in all_groups.items():
+                        preview = f" ({len(g_chans)} ch: {', '.join(g_chans[:3])}{'...' if len(g_chans)>3 else ''})"
+                        self.combo_channel.addItem(f"[Group] {g_name}{preview}", userData=(self.MODE_GROUP, g_name))
 
-            if avail:
-                self.combo_channel.insertSeparator(self.combo_channel.count())
-                for ch in avail:
-                    self.combo_channel.addItem(ch, userData=(self.MODE_SINGLE, ch))
+                if avail:
+                    self.combo_channel.insertSeparator(self.combo_channel.count())
+                    for ch in avail:
+                        self.combo_channel.addItem(ch, userData=(self.MODE_SINGLE, ch))
 
-        # Restore previous selection if possible
-        restored = False
-        if curr_data is not None and isinstance(curr_data, (tuple, list)) and len(curr_data) == 2:
-            idx = self.find_channel_data_index(curr_data[0], curr_data[1])
-            if idx >= 0:
-                self.combo_channel.setCurrentIndex(idx)
-                restored = True
-        if not restored:
-            self.combo_channel.setCurrentIndex(0)
-        self.combo_channel.blockSignals(False)
+            # Restore previous selection if possible
+            restored = False
+            if curr_data is not None and isinstance(curr_data, (tuple, list)) and len(curr_data) == 2:
+                idx = self.find_channel_data_index(curr_data[0], curr_data[1])
+                if idx >= 0:
+                    self.combo_channel.setCurrentIndex(idx)
+                    restored = True
+            if not restored:
+                self.combo_channel.setCurrentIndex(0)
 
     def _on_unit_selection_changed(self, index: int):
         if not self._block_updates:
@@ -453,9 +482,8 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
         if not self._block_updates:
             mode, val = self.get_channel_mode()
             if mode in (self.MODE_FOLLOW_UNIT, self.MODE_GROUP, self.MODE_SHARED_SET):
-                self.chk_multichannel.blockSignals(True)
-                self.chk_multichannel.setChecked(True)
-                self.chk_multichannel.blockSignals(False)
+                with QSignalBlocker(self.chk_multichannel):
+                    self.chk_multichannel.setChecked(True)
             self.bindingChanged.emit()
 
     def _on_shared_set_changed(self, set_name: str):

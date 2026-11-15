@@ -1,11 +1,11 @@
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import quantities as pq
 
 import PySide6
 from PySide6 import QtCore
-from PySide6.QtCore import Qt, Signal, Slot, QTimer
+from PySide6.QtCore import Qt, Signal, Slot, QTimer, QSignalBlocker
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -48,7 +48,7 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
         self.setFocusPolicy(Qt.ClickFocus)
 
         self.state: Optional[ViewerState] = None
-        self.connections: List = []
+        self.connections: List[Tuple] = []
         self.settings: Dict = {
             "n_lines_pre": 5,
             "n_lines_post": 5,
@@ -184,6 +184,38 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
         toolbar.addWidget(scale_widget)
         self.addToolBar(toolbar)
 
+    def _connect_state(self, sig, slot):
+        sig.connect(slot)
+        self.connections.append((sig, slot))
+
+    def unset_connections(self):
+        self._unregister_live_frames()
+        for sig, slot in self.connections:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self.connections.clear()
+
+    @Slot()
+    @Slot(int)
+    def _on_unit_change(self, *args):
+        self.update_figure()
+
+    @Slot()
+    def _on_unit_group_change(self, *args):
+        self.update_figure()
+
+    @Slot()
+    @Slot(str)
+    def _on_channel_change(self, *args):
+        self.update_figure(force=True)
+
+    @Slot()
+    @Slot(int)
+    def _on_new_spike_events(self, *args):
+        self.update_figure()
+
     def set_state(self, state: ViewerState):
         self.unset_connections()
         self.state = state
@@ -192,19 +224,19 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
         if self.state is None:
             return
 
-        self.connections.append(self.state.onStimNoChange.connect(self._on_stim_no_change))
-        self.connections.append(self.state.onUnitChange.connect(lambda x: self.update_figure()))
-        self.connections.append(self.state.onUnitGroupChange.connect(lambda: self.update_figure()))
+        self._connect_state(self.state.onStimNoChange, self._on_stim_no_change)
+        self._connect_state(self.state.onUnitChange, self._on_unit_change)
+        self._connect_state(self.state.onUnitGroupChange, self._on_unit_group_change)
         self._register_data_reload(state, self._on_load_new_file)
         if hasattr(self.state, "onChannelChange"):
-            self.connections.append(self.state.onChannelChange.connect(lambda *args: self.update_figure(force=True)))
+            self._connect_state(self.state.onChannelChange, self._on_channel_change)
         if hasattr(self.state, "onNewSweep"):
             self._register_live_frames(
                 self.state,
                 lambda stimno: self.on_new_sweep(stimno),
             )
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.connections.append(self.state.onNewSpikeEvents.connect(lambda *args: self.update_figure()))
+            self._connect_state(self.state.onNewSpikeEvents, self._on_new_spike_events)
 
         self._has_initialized_xrange = False
         self._auto_scale_needed = True
@@ -281,15 +313,6 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
         else:
             self._on_new_sweep_core(*args)
 
-    def unset_connections(self):
-        self._unregister_live_frames()
-        if self.state is not None:
-            for con in self.connections:
-                try:
-                    self.state.disconnect(con)
-                except Exception:
-                    pass
-        self.connections.clear()
 
     @quiet_fail
     def _auto_scale(self):

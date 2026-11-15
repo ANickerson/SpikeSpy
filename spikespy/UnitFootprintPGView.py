@@ -9,7 +9,7 @@ from neo import Event
 
 import PySide6
 from PySide6 import QtCore, QtGui, QtWidgets
-from PySide6.QtCore import Qt, QTimer, Slot, QRectF, QPointF
+from PySide6.QtCore import Qt, QTimer, Slot, QRectF, QPointF, QSignalBlocker
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -168,6 +168,8 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
         if self.state and hasattr(self.state, "onUIRefreshRateChange"):
             self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
 
+        self.connections: List[Tuple] = []
+
         # Signal connections for UI controls
         self.combo_mode.currentIndexChanged.connect(self.update_plot)
         self.spin_last_n.valueChanged.connect(self.update_plot)
@@ -242,24 +244,73 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
             self._dirty = False
             self._do_update_plot()
 
+    def _connect_state(self, sig, slot):
+        sig.connect(slot)
+        self.connections.append((sig, slot))
+
+    def unset_connections(self):
+        self._unregister_live_frames()
+        for sig, slot in self.connections:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self.connections.clear()
+
+    def closeEvent(self, event):
+        self.unset_connections()
+        super().closeEvent(event)
+
+    @Slot()
+    def _on_state_reset(self, *args):
+        self.schedule_update()
+
+    @Slot()
+    @Slot(int)
+    def _on_unit_params_changed(self, unit_idx: int = -1):
+        if unit_idx < 0 or unit_idx == self.get_target_unit_idx():
+            self.schedule_update()
+
+    @Slot()
+    @Slot(int)
+    def _on_new_spike_events(self, unit_idx: int = -1):
+        if unit_idx < 0 or unit_idx == self.get_target_unit_idx():
+            self.schedule_update()
+
+    @Slot()
+    @Slot(int)
+    def _on_unit_change(self, *args):
+        if self.get_target_unit_idx() == getattr(self.state, "cur_spike_group", 0):
+            self.schedule_update()
+
+    @Slot()
+    @Slot(str)
+    def _on_channel_change(self, *args):
+        self.schedule_update()
+
     def set_state(self, state: ViewerState):
+        self.unset_connections()
         self.state = state
         if hasattr(self, "channel_bar"):
             self.channel_bar.setState(state)
         if self.state is not None:
             if hasattr(self.state, "onUnitChange"):
-                self.state.onUnitChange.connect(lambda *args: self.schedule_update())
+                self._connect_state(self.state.onUnitChange, self._on_unit_change)
             if hasattr(self.state, "onUnitGroupChange"):
-                self.state.onUnitGroupChange.connect(lambda *args: self.schedule_update())
+                self._connect_state(self.state.onUnitGroupChange, self._on_state_reset)
             if hasattr(self.state, "onLoadNewFile"):
                 self._register_data_reload(
                     self.state,
-                    lambda: self.schedule_update(),
+                    self._on_state_reset,
                 )
             if hasattr(self.state, "onNewSpikeEvents"):
-                self.state.onNewSpikeEvents.connect(lambda *args: self.schedule_update())
+                self._connect_state(self.state.onNewSpikeEvents, self._on_new_spike_events)
+            if hasattr(self.state, "onUnitParamsChanged"):
+                self._connect_state(self.state.onUnitParamsChanged, self._on_unit_params_changed)
+            if hasattr(self.state, "onChannelGroupsChanged"):
+                self._connect_state(self.state.onChannelGroupsChanged, self._on_state_reset)
             if hasattr(self.state, "onChannelChange"):
-                self.state.onChannelChange.connect(lambda *args: self.schedule_update())
+                self._connect_state(self.state.onChannelChange, self._on_channel_change)
             if hasattr(self.state, "onNewSweep"):
                 self._register_live_frames(
                     self.state,
@@ -267,7 +318,7 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
                 )
             if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
                 self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
-                self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
+                self._connect_state(self.state.onUIRefreshRateChange, self.render_timer.setInterval)
         self.update_window_title()
         self.update_plot()
 

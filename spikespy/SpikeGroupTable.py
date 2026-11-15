@@ -3,7 +3,16 @@ from typing import Any, List, Optional, Union
 import PySide6
 
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, Signal, Slot, QTimer
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QObject,
+    QSignalBlocker,
+    Qt,
+    Signal,
+    Slot,
+    QTimer,
+)
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -44,6 +53,8 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
         self.render_count: int = 0
         self._dirty: bool = False
         self._user_hidden: bool = False
+        self._state_connections: list[tuple] = []
+        self._last_unit_change_sync_token: Optional[tuple] = None
 
         self.update_timer = QTimer(self)
         interval = (
@@ -56,6 +67,7 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
         self.update_timer.start()
 
         if state and hasattr(state, "onUIRefreshRateChange"):
+            self._state_connections.append((state.onUIRefreshRateChange, self.update_timer.setInterval))
             state.onUIRefreshRateChange.connect(self.update_timer.setInterval)
 
         self.spike_tablemodel = SpikeGroupTableModel(lambda: state.spike_groups)
@@ -64,12 +76,18 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
         self.tbl.setModel(self.spike_tablemodel)
         self.state = state
         if state is not None:
-            state.onUnitChange.connect(self.update)
+            self._state_connections.append((state.onUnitChange, self._on_unit_change))
+            state.onUnitChange.connect(self._on_unit_change)
+            self._state_connections.append((state.onUnitGroupChange, self.update))
             state.onUnitGroupChange.connect(self.update)
+            if hasattr(state, "onUnitParamsChanged"):
+                self._state_connections.append((state.onUnitParamsChanged, self._on_unit_params_changed))
+                state.onUnitParamsChanged.connect(self._on_unit_params_changed)
             if hasattr(state, "onLoadNewFile"):
                 self._register_data_reload(state, self.update)
             if hasattr(state, "onNewSpikeEvents"):
-                state.onNewSpikeEvents.connect(self.update)
+                self._state_connections.append((state.onNewSpikeEvents, self._on_new_spike_events))
+                state.onNewSpikeEvents.connect(self._on_new_spike_events)
             if hasattr(state, "onNewSweep"):
                 self._register_live_frames(
                     state,
@@ -236,6 +254,57 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
             self._dirty = False
             self._do_update_core()
 
+    def unset_connections(self):
+        """Disconnect all tracked ViewerState signal connections cleanly."""
+        for sig, slot in self._state_connections:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._state_connections.clear()
+        self._unregister_live_frames()
+
+    def closeEvent(self, event):
+        self.unset_connections()
+        super().closeEvent(event)
+
+    @Slot()
+    def _on_unit_params_changed(self, *args):
+        self.update()
+
+    def _get_sync_token(self) -> Optional[tuple]:
+        if not self.state or not self.state.spike_groups:
+            return None
+        u_idx = getattr(self.state, "cur_spike_group", 0)
+        stim = getattr(self.state, "stimno", 0)
+        sg_len = len(self.state.spike_groups)
+        u_spikes_count = (
+            len(self.state.spike_groups[u_idx].event)
+            if 0 <= u_idx < sg_len and self.state.spike_groups[u_idx].event is not None
+            else 0
+        )
+        return (sg_len, stim, u_idx, u_spikes_count)
+
+    def _on_unit_change(self, *args):
+        self.update()
+        self._last_unit_change_sync_token = self._get_sync_token()
+
+    def _on_new_spike_events(self, unit_idx: int = -1):
+        if getattr(self.state, "is_streaming", False):
+            self.schedule_update()
+            return
+        curr_token = self._get_sync_token()
+        if (
+            self._last_unit_change_sync_token is not None
+            and curr_token == self._last_unit_change_sync_token
+        ):
+            # Already updated synchronously by onUnitChange right before this
+            return
+        self.update()
+
+    def schedule_update(self):
+        self._dirty = True
+
     def update(self):
         if self.is_view_culled():
             self._dirty = True
@@ -263,9 +332,9 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
                     self.tbl.model().index(row, 0), role="SPIKEGROUP_ROLE"
                 )
                 if sg is not None and current_group.event is not None and sg.event.name == current_group.event.name:
-                    self.tbl.selectionModel().blockSignals(True)
-                    self.tbl.selectRow(row)
-                    self.tbl.selectionModel().blockSignals(False)
+                    if self.tbl.currentIndex().row() != row:
+                        with QSignalBlocker(self.tbl.selectionModel()):
+                            self.tbl.selectRow(row)
                     break
         # self.tbl.selectionModel().disconnect(self.set_selection)
         # self.tbl.selectionModel().setCurrentIndex(

@@ -2,7 +2,7 @@ import logging
 from typing import Any, Dict, Optional, Union
 
 import PySide6
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import QSignalBlocker, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -271,6 +271,26 @@ class ViewSettingsPanel(QWidget):
             return True
         return hasattr(w, "populate_settings_panel") and callable(getattr(w, "populate_settings_panel"))
 
+    def _disconnect_current_view(self):
+        """Cleanly disconnect any signals from the previously active view."""
+        self.active_view = None
+
+    def _on_focus_changed(self, old: Optional[QWidget], new: Optional[QWidget]):
+        if new is not None:
+            self.setActiveView(new)
+
+    def closeEvent(self, event):
+        if getattr(self, "_focus_connected", False):
+            app = QApplication.instance()
+            if app is not None:
+                try:
+                    app.focusChanged.disconnect(self._on_focus_changed)
+                except (TypeError, RuntimeError):
+                    pass
+            self._focus_connected = False
+        self._disconnect_current_view()
+        super().closeEvent(event)
+
     def _resolve_view(self, w: Optional[QWidget]) -> Optional[QWidget]:
         if w is None:
             return None
@@ -289,6 +309,24 @@ class ViewSettingsPanel(QWidget):
             if any(k in c_name for k in ("MultiTrace", "SingleTrace", "UnitView", "UnitFootprint", "UnitPG", "ChannelGroupContainer")) or hasattr(curr, "populate_settings_panel"):
                 found_view = curr
                 break
+            # Check CDockWidget or CDockWidgetTab unwrapping
+            if c_name == "CDockWidget" and hasattr(curr, "widget") and callable(getattr(curr, "widget")):
+                try:
+                    inner = curr.widget()
+                    if inner is not None and (self._is_configurable_view(inner) or inner.__class__.__name__ == "ChannelGroupContainerView"):
+                        found_view = inner
+                        break
+                except TypeError:
+                    pass
+            elif c_name == "CDockWidgetTab" and hasattr(curr, "dockWidget") and callable(getattr(curr, "dockWidget")):
+                try:
+                    dw = curr.dockWidget()
+                    inner = dw.widget() if dw is not None else None
+                    if inner is not None and (self._is_configurable_view(inner) or inner.__class__.__name__ == "ChannelGroupContainerView"):
+                        found_view = inner
+                        break
+                except TypeError:
+                    pass
             curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
 
         if found_view is not None:
@@ -301,17 +339,50 @@ class ViewSettingsPanel(QWidget):
                             return sv
                         temp = temp.parentWidget() if hasattr(temp, "parentWidget") else None
                 return found_view.sub_views[0]
-            return found_view
-        return w
+            if self._is_configurable_view(found_view):
+                return found_view
+            return None
+        return None
 
     def setActiveView(self, view: Optional[QWidget]):
         """Sets the active view to display/edit in this settings panel.
         Retains the latest valid configurable visualizer when non-configurable panels are clicked.
         """
+        if view is None:
+            self._disconnect_current_view()
+            self.lbl_view_title.setText("<b>No View Selected</b>")
+            self.lbl_view_sub.setText("Click any view window to edit its settings.")
+            self.grp_multitrace.setVisible(False)
+            self.grp_singletrace.setVisible(False)
+            self.grp_fixed.setVisible(False)
+            self.grp_unit.setVisible(False)
+            if hasattr(self, "_custom_plugin_grp") and self._custom_plugin_grp is not None:
+                self._custom_plugin_grp.setVisible(False)
+                self._custom_plugin_grp.deleteLater()
+                self._custom_plugin_grp = None
+            self.placeholder.setVisible(True)
+            self._block_updates = False
+            return
+
         resolved = self._resolve_view(view)
-        if view is not None and not self._is_configurable_view(resolved):
+        if not self._is_configurable_view(resolved):
             if self._is_configurable_view(self.active_view):
                 return
+            # Look through parent's dock_manager if available
+            parent_widget = self.parent()
+            found_fallback = None
+            if parent_widget is not None and hasattr(parent_widget, "dock_manager") and parent_widget.dock_manager is not None:
+                for dw in parent_widget.dock_manager.dockWidgets():
+                    if hasattr(dw, "widget") and callable(getattr(dw, "widget")):
+                        candidate = self._resolve_view(dw.widget())
+                        if self._is_configurable_view(candidate):
+                            found_fallback = candidate
+                            break
+            if found_fallback is not None:
+                resolved = found_fallback
+            else:
+                return
+
         if self.active_view == resolved and self._is_view_alive(self.active_view):
             return
 

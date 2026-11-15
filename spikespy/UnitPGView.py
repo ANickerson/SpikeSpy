@@ -1,11 +1,11 @@
 import sys
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 import numpy as np
 import quantities as pq
 
 import PySide6
 from PySide6 import QtCore
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import Qt, Signal, Slot, QSignalBlocker
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -37,7 +37,7 @@ class UnitPGView(LiveFrameConsumerMixin, QMainWindow):
         self.setFocusPolicy(Qt.ClickFocus)
 
         self.state: Optional[ViewerState] = None
-        self.connections: List = []
+        self.connections: List[Tuple] = []
         self.lines: Dict[int, np.ndarray] = {}
         self.w: int = 0
         self._dirty: bool = False
@@ -65,6 +65,73 @@ class UnitPGView(LiveFrameConsumerMixin, QMainWindow):
 
         if state is not None:
             self.set_state(state)
+
+    def _connect_state(self, sig, slot):
+        sig.connect(slot)
+        self.connections.append((sig, slot))
+
+    def unset_connections(self):
+        self._unregister_live_frames()
+        for sig, slot in self.connections:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self.connections.clear()
+
+    def get_target_unit_idx(self) -> int:
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            return self.channel_bar.get_target_unit_idx()
+        return getattr(self.state, "cur_spike_group", 0) if self.state is not None else 0
+
+    @Slot()
+    @Slot(int)
+    def _on_stim_no_change(self, stimno: int = -1):
+        if stimno >= 0:
+            self.update_curstim_line(stimno)
+        elif self.state is not None:
+            self.update_curstim_line(self.state.stimno)
+
+    @Slot()
+    @Slot(int)
+    def _on_unit_change(self, *args):
+        if getattr(self, "compare_mode", False):
+            self._dirty = True
+            self._handled_in_unit_change = True
+            self.update_all()
+            return
+        if self.get_target_unit_idx() != getattr(self.state, "cur_spike_group", 0):
+            return
+        self._dirty = True
+        self._handled_in_unit_change = True
+        self.update_all()
+
+    @Slot()
+    def _on_unit_group_change(self, *args):
+        self.update_all()
+
+    @Slot()
+    @Slot(str)
+    def _on_channel_change(self, *args):
+        self.update_all()
+
+    @Slot()
+    def _on_load_new_file(self, *args):
+        self.update_all()
+
+    @Slot()
+    @Slot(int)
+    def _on_new_spike_events(self, unit_idx: int = -1):
+        if getattr(self, "_handled_in_unit_change", False):
+            self._handled_in_unit_change = False
+            return
+        if not getattr(self, "compare_mode", False) and unit_idx >= 0 and unit_idx != self.get_target_unit_idx():
+            return
+        self._dirty = True
+        if not getattr(self.state, "is_streaming", False):
+            self.update_all()
+        else:
+            self.on_new_sweep_throttled()
 
     def _on_channel_bar_changed(self):
         if hasattr(self, "channel_bar"):
@@ -115,17 +182,17 @@ class UnitPGView(LiveFrameConsumerMixin, QMainWindow):
             }
         )
 
-        self.connections.append(self.state.onStimNoChange.connect(self.update_curstim_line))
-        self.connections.append(self.state.onUnitChange.connect(lambda *args: self.update_all()))
-        self.connections.append(self.state.onUnitGroupChange.connect(lambda *args: self.update_all()))
-        self._register_data_reload(state, self.update_all)
+        self._connect_state(self.state.onStimNoChange, self._on_stim_no_change)
+        self._connect_state(self.state.onUnitChange, self._on_unit_change)
+        self._connect_state(self.state.onUnitGroupChange, self._on_unit_group_change)
+        self._register_data_reload(state, self._on_load_new_file)
         if hasattr(self.state, "onChannelChange"):
-            self.connections.append(self.state.onChannelChange.connect(lambda *args: self.update_all()))
+            self._connect_state(self.state.onChannelChange, self._on_channel_change)
         # Live sweeps arrive through the state's LiveOrchestrator (LIFO);
         # the GUI-side throttle keeps update scheduling rate-limited.
         self._register_live_frames(state, lambda _stimno: self.on_new_sweep_throttled())
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.connections.append(self.state.onNewSpikeEvents.connect(self.on_new_sweep_throttled))
+            self._connect_state(self.state.onNewSpikeEvents, self._on_new_spike_events)
 
         self.update_all()
 
@@ -182,15 +249,6 @@ class UnitPGView(LiveFrameConsumerMixin, QMainWindow):
         else:
             self._on_new_sweep_core(*args)
 
-    def unset_connections(self):
-        self._unregister_live_frames()
-        if self.state is not None:
-            for con in self.connections:
-                try:
-                    self.state.disconnect(con)
-                except Exception:
-                    pass
-        self.connections.clear()
 
     def _schedule_update_all(self):
         """Schedule update_all to background thread."""

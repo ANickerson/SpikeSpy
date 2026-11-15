@@ -22,9 +22,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .ViewerState import ViewerState, tracked_neuron_unit
-from .live_orchestrator import LiveFrameConsumerMixin
-from .ChannelGroupBar import ChannelGroupBar
+from ..ViewerState import ViewerState, tracked_neuron_unit
+from ..live_orchestrator import LiveFrameConsumerMixin
+from ..ChannelGroupBar import ChannelGroupBar
 
 mplstyle.use("fast")
 

@@ -11,13 +11,13 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt
-from spikespy.QMatplotlib import QMatplotlib
+from .QMatplotlib import QMatplotlib
 import matplotlib
 from matplotlib.ticker import Formatter
 from matplotlib.collections import LineCollection
-from spikespy.ViewerState import ViewerState
-from .ChannelGroupBar import ChannelGroupBar
-from .live_orchestrator import LiveFrameConsumerMixin
+from ..ViewerState import ViewerState
+from ..ChannelGroupBar import ChannelGroupBar
+from ..live_orchestrator import LiveFrameConsumerMixin
 import matplotlib.style as mplstyle
 
 mplstyle.use("fast")
@@ -109,7 +109,7 @@ class MultiTraceFixedView(QMatplotlib):
             con_ch = self.state.onChannelChange.connect(lambda *args: self.update_figure())
             self.connections.append(con_ch)
         if hasattr(self.state, "onNewSweep"):
-            from spikespy.helpers import qsignal_throttle
+            from ..helpers import qsignal_throttle
             self._throttled_update = qsignal_throttle(self.update_figure, 40)
         # Live sweeps arrive through the state's LiveOrchestrator (LIFO);
         # the GUI-side throttle keeps redraws rate-limited.

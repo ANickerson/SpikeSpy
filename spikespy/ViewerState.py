@@ -425,6 +425,10 @@ class ViewerState(QObject):
     onLoadNewFile = Signal()
     onUnitChange = Signal(int)
     onUnitGroupChange = Signal()
+    onActiveUnitChanged = Signal(int)
+    onUnitListChanged = Signal()
+    onUnitParamsChanged = Signal(int)
+    onUnitSpikeChanged = Signal(int, int)
     onStimNoChange = Signal(int)
     onNewSweep = Signal(int)
     # Live UI refresh period; sweeps arriving within one period trigger a single redraw.
@@ -480,6 +484,7 @@ class ViewerState(QObject):
         self.live_disk_cache: bool = True
         self._live_frame_timer = None
         self._live_frame_pending_idx = None
+        self._last_live_emitted_stimno = None
         self._live_raw_stores: dict = {}
         self._live_aux_erp_buffers: dict = {}
         self._live_channel_signals: dict = {}
@@ -568,6 +573,10 @@ class ViewerState(QObject):
             chans.append(self.analog_signal.name)
         return chans
 
+    def emit_unit_params_changed(self, unit_idx: int = -1):
+        """Emit onUnitParamsChanged for a specific unit or -1 for all units."""
+        self.onUnitParamsChanged.emit(unit_idx)
+
     def set_unit_channels(self, unit_idx: int, channels: List[str]):
         """Set the primary and neighbor channels for a unit."""
         if unit_idx < 0 or unit_idx >= len(self.spike_groups) or not channels:
@@ -586,6 +595,7 @@ class ViewerState(QObject):
             sg.event.annotations["channel"] = primary
             sg.event.annotations["neighbor_channels"] = neighbors
         self.onUnitGroupChange.emit()
+        self.onUnitParamsChanged.emit(unit_idx)
         self.onChannelGroupsChanged.emit()
 
     def shift_channels(self, channels: List[str], step: int = 1) -> List[str]:
@@ -823,6 +833,7 @@ class ViewerState(QObject):
             ):
                 self.set_active_channel(sg.channel)
         self.onUnitGroupChange.emit()
+        self.onActiveUnitChanged.emit(self.cur_spike_group)
 
     @Slot(int, int, int)
     @Slot(int, int)
@@ -965,6 +976,7 @@ class ViewerState(QObject):
 
         self.onUnitChange.emit(stimno)
         self.onNewSpikeEvents.emit(unit_idx)
+        self.onUnitSpikeChanged.emit(unit_idx, stimno)
 
     @Slot(Event)
     def updateUnit(self, event, merge=False, unitid=None):
@@ -1009,6 +1021,7 @@ class ViewerState(QObject):
         del self.spike_groups[unitid].idx_arr
         self.update_idx_arrs()
         self.onUnitGroupChange.emit()
+        self.onUnitListChanged.emit()
 
     def track_stimulus_all_units(self, stimno: int) -> List[dict]:
         """Track all auto_track enabled units on their respective channels for stimulus index stimno."""
@@ -1210,6 +1223,7 @@ class ViewerState(QObject):
             )
         )
         self.onUnitGroupChange.emit()
+        self.onUnitListChanged.emit()
 
     @Slot()
     def addUnitGroup(self):
@@ -1226,6 +1240,7 @@ class ViewerState(QObject):
         self.spike_groups.append(tracked_neuron_unit(event=evt))
         self.update_idx_arrs()
         self.onUnitGroupChange.emit()
+        self.onUnitListChanged.emit()
 
     def update_idx_arrs(self):
         if self.event_signal is None or len(self.event_signal) == 0:
@@ -1424,6 +1439,7 @@ class ViewerState(QObject):
         self.update_idx_arrs()
         self._notify_dataset_loaded("load")
         self.onLoadNewFile.emit()
+        self.onUnitListChanged.emit()
         self.undo_queue = []
 
     def getUnitGroup(self, unit=None):
@@ -1571,6 +1587,7 @@ class ViewerState(QObject):
 
         self.cur_spike_group = 0
         self.stimno = 0
+        self._last_live_emitted_stimno = None
         self.is_streaming = True
         self.sampling_rate = int(sampling_rate)
         self.window_size = (window_size_ms / 1000.0) * pq.s
@@ -1668,7 +1685,9 @@ class ViewerState(QObject):
         self._live_frame_pending_idx = None
         self.onNewSweep.emit(idx)
         if self.follow_live:
-            self.onStimNoChange.emit(self.stimno)
+            if getattr(self, "_last_live_emitted_stimno", None) != self.stimno:
+                self._last_live_emitted_stimno = self.stimno
+                self.onStimNoChange.emit(self.stimno)
         self.onEventsUpdated.emit()
         if (
             self.live_frame_interval_ms <= 0

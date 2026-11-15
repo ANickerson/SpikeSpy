@@ -4,8 +4,8 @@ from PySide6.QtWidgets import QApplication, QDialogButtonBox
 from PySide6.QtCore import QAbstractListModel, Qt, QAbstractTableModel
 
 from neo import Event
-from .ui.EventView import Ui_EventView
-from .ViewerState import ViewerState
+from ..ui.EventView import Ui_EventView
+from ..ViewerState import ViewerState
 from typing import List
 import sys
 import numpy as np

@@ -5,8 +5,8 @@ from PySide6.QtCore import Signal, Slot
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvas, NavigationToolbar2QT
 
-from spikespy.ViewerState import ViewerState
-from spikespy.live_orchestrator import LiveFrameConsumerMixin
+from ..ViewerState import ViewerState
+from ..live_orchestrator import LiveFrameConsumerMixin
 
 
 class QMatplotlib(LiveFrameConsumerMixin, QMainWindow):

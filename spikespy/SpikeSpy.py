@@ -60,13 +60,17 @@ from spikespy.processing import MultiAnalogSignal
 
 # import PySide6QtAds as QtAds
 from .mng_file_selector import QNeoSelector
-from .MultiTraceView import MultiTraceView
+from .legacy_mpl import (
+    MultiTraceView,
+    SingleTraceView,
+    UnitView,
+    UnitFootprintView,
+    EventView,
+    MultiTraceFixedView,
+)
 from .NeoSettingsView import NeoSettingsView
-from .SingleTraceView import SingleTraceView
 from .SpikeGroupTable import SpikeGroupTableView
 from .TrackingView import TrackingView
-from .UnitView import UnitView
-from .UnitFootprintView import UnitFootprintView
 from .ViewerState import ViewerState, prompt_for_neo_file, tracked_neuron_unit
 from .io_manager import (
     export_units_csv,
@@ -74,8 +78,6 @@ from .io_manager import (
     import_units_csv,
     save_state_to_nix,
 )
-from .EventView import EventView
-from .MultiTraceFixedView import MultiTraceFixedView
 from .UnitSuggestor import UnitSuggestor
 from .open_ephys_addin import OpenEphysLiveView
 from .ChannelGroupBar import ChannelGroupBar, ChannelGroupDialog
@@ -262,11 +264,16 @@ class MdiView(QMainWindow):
         return self.newWindow("SharedChannelPanel", pos=QtAds.BottomDockWidgetArea)
 
     def open_or_show_view_settings_panel(self):
-        """Opens or brings to front the View Settings side panel."""
+        """Opens or brings to front the View Settings side panel on the left side."""
         if hasattr(self, "dock_settings") and self.dock_settings is not None:
-            if self.dock_settings.isClosed() or not self.dock_settings.isVisible():
+            if self.dock_settings not in self.dock_manager.dockWidgets():
+                self.dock_settings = QtAds.CDockWidget("View Settings")
+                self.dock_settings.setWidget(self.settings_panel)
+                self.dock_settings.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
+                self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
+            elif self.dock_settings.isClosed() or not self.dock_settings.isVisible():
                 self.dock_settings.toggleView(True)
-                self.dock_manager.addDockWidget(QtAds.RightDockWidgetArea, self.dock_settings)
+                self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
             self.dock_settings.show()
             self.dock_settings.raise_()
             return self.dock_settings.widget()
@@ -386,7 +393,7 @@ class MdiView(QMainWindow):
         self.dock_settings = QtAds.CDockWidget("View Settings")
         self.dock_settings.setWidget(self.settings_panel)
         self.dock_settings.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
-        self.dock_manager.addDockWidget(QtAds.RightDockWidgetArea, self.dock_settings)
+        self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
         self.dock_manager.focusedDockWidgetChanged.connect(self._on_focused_dock_widget_changed)
 
         app = QApplication.instance()
@@ -944,6 +951,8 @@ class MdiView(QMainWindow):
             self.dock_manager.addDockWidget(QtAds.NoDockWidgetArea, w2)
         self.cur_windows.append(w2)
         w2.show()
+        if hasattr(self, "settings_panel") and self.settings_panel is not None:
+            self.settings_panel.setActiveView(w)
         return w
 
     def open_dual_unit_view(self):

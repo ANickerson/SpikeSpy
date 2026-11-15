@@ -327,3 +327,121 @@ def test_unit_footprint_pg_view_live_sweep_overlay_and_dsp_helpers(qtbot):
     )
     assert list(stims) == [0, 1]
     assert list(samples) == [250, 250]
+
+
+def test_scoped_unit_signals_and_pinned_view_filtering(qtbot):
+    """Verify scoped ViewerState signals, TrackingView parameter signals, and pinned view event filtering."""
+    state = _make_synthetic_state(n_sweeps=4)
+    # Add a second unit so we have Unit 0 and Unit 1
+    state.addUnitGroup()
+
+    active_unit_events = []
+    unit_list_events = []
+    unit_params_events = []
+    unit_spike_events = []
+
+    state.onActiveUnitChanged.connect(lambda idx: active_unit_events.append(idx))
+    state.onUnitListChanged.connect(lambda: unit_list_events.append(True))
+    state.onUnitParamsChanged.connect(lambda idx: unit_params_events.append(idx))
+    state.onUnitSpikeChanged.connect(lambda u_idx, stim: unit_spike_events.append((u_idx, stim)))
+
+    state.setUnitGroup(1)
+    assert active_unit_events == [1]
+
+    state.setStimNo(2)
+    state.setUnit(250, unit_idx=1)
+    assert (1, 2) in unit_spike_events
+
+    # TrackingView spinbox change should emit onUnitParamsChanged without triggering ChannelGroupBar.refresh_units
+    tv = TrackingView(state=state)
+    qtbot.addWidget(tv)
+    fp_view = UnitFootprintPGView(state=state)
+    qtbot.addWidget(fp_view)
+    fp_view.channel_bar.bind_to_unit(1)
+
+    refresh_units_calls = 0
+    orig_refresh_units = fp_view.channel_bar.refresh_units
+
+    def tracked_refresh_units(*args, **kwargs):
+        nonlocal refresh_units_calls
+        refresh_units_calls += 1
+        return orig_refresh_units(*args, **kwargs)
+
+    fp_view.channel_bar.refresh_units = tracked_refresh_units
+
+    # Change tracking window on TrackingView
+    tv.qsb_window_size.setValue(tv.qsb_window_size.value() + 1.0)
+    assert len(unit_params_events) >= 1
+    assert refresh_units_calls == 0
+
+    # Pinned UnitFootprintPGView (pinned to Unit 1) should ignore spike events for Unit 0
+    fp_view._dirty = False
+    state.onNewSpikeEvents.emit(0)
+    assert fp_view._dirty is False
+    state.onNewSpikeEvents.emit(1)
+    assert fp_view._dirty is True
+    fp_view._dirty = False
+
+
+def test_signal_disconnection_on_view_close(qtbot):
+    """Verify closing views cleanly disconnects their slots from ViewerState."""
+    from spikespy.SpikeGroupTable import SpikeGroupTableView
+
+    state = _make_synthetic_state(n_sweeps=3)
+    fp_view = UnitFootprintPGView(state=state)
+    st_view = SingleTracePGView(state=state)
+    tv = TrackingView(state=state)
+    tbl = SpikeGroupTableView(state=state)
+    for w in (fp_view, st_view, tv, tbl):
+        qtbot.addWidget(w)
+        w.close()
+
+    assert len(fp_view.connections) == 0
+    assert len(st_view.connections) == 0
+    assert len(tv._state_connections) == 0
+    assert len(tbl._state_connections) == 0
+
+    # Emitting state signals after views are closed should not trigger timers or updates on closed views
+    fp_view._dirty = False
+    state.onNewSpikeEvents.emit(0)
+    state.onUnitGroupChange.emit()
+    assert fp_view._dirty is False
+
+
+def test_legacy_mpl_package_and_left_docked_property_pane(qtbot):
+    """Verify legacy Matplotlib views live in spikespy.legacy_mpl and MdiView docks ViewSettings on the left."""
+    import PySide6QtAds as QtAds
+    from spikespy.SpikeSpy import MdiView
+    from spikespy.legacy_mpl import (
+        MultiTraceView,
+        SingleTraceView,
+        MultiTraceFixedView,
+        UnitView,
+        UnitFootprintView,
+        EventView,
+    )
+    import spikespy.MultiTraceView as legacy_alias
+
+    assert legacy_alias.MultiTraceView is MultiTraceView
+    assert MultiTraceView.__module__.startswith("spikespy.legacy_mpl")
+    assert SingleTraceView.__module__.startswith("spikespy.legacy_mpl")
+    assert MultiTraceFixedView.__module__.startswith("spikespy.legacy_mpl")
+    assert UnitView.__module__.startswith("spikespy.legacy_mpl")
+    assert UnitFootprintView.__module__.startswith("spikespy.legacy_mpl")
+    assert EventView.__module__.startswith("spikespy.legacy_mpl")
+
+    state = _make_synthetic_state(n_sweeps=3)
+    mdi = MdiView(state=state, check_updates=False)
+    qtbot.addWidget(mdi)
+
+    # ViewSettings dock widget is present and persists across layout switches
+    assert mdi.dock_settings in mdi.dock_manager.dockWidgets()
+    w_st = mdi.newWindow("SingleTrace (PyQtGraph)")
+    assert mdi.settings_panel.active_view is w_st
+
+    # Clicking or opening a non-configurable panel (SpikeGroupTable) retains SingleTracePGView in property pane
+    w_tbl = mdi.newWindow("SpikeGroupTable")
+    assert mdi.settings_panel.active_view is w_st
+    mdi.settings_panel.setActiveView(mdi.btn_add_panel)
+    assert mdi.settings_panel.active_view is w_st
+

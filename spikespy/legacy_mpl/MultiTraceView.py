@@ -42,22 +42,22 @@ from PySide6.QtWidgets import (
 )
 from PySide6 import QtCore
 from PySide6.QtCore import QTimer
-from .NeoSettingsView import NeoSettingsView
-from .ViewerState import ViewerState, tracked_neuron_unit
-from .ChannelGroupBar import ChannelGroupBar
+from ..NeoSettingsView import NeoSettingsView
+from ..ViewerState import ViewerState, tracked_neuron_unit
+from ..ChannelGroupBar import ChannelGroupBar
 
 from .QMatplotlib import QMatplotlib
-from .live_orchestrator import LiveFrameConsumerMixin
+from ..live_orchestrator import LiveFrameConsumerMixin
 from matplotlib.lines import Line2D
 import time
 
 # mplstyle.use("fast")
 
 from matplotlib.axes import Axes
-from .helpers import qsignal_throttle_wrapper, qsignal_throttle
+from ..helpers import qsignal_throttle_wrapper, qsignal_throttle
 from matplotlib.image import AxesImage
 from .CachedAxesImage import CachedAxesImage
-from .viewer_worker import get_task_manager, TaskType, TaskPriority
+from ..viewer_worker import get_task_manager, TaskType, TaskPriority
 
 
 class falling_leaf_plotter:
