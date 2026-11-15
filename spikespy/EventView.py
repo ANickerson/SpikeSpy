@@ -6,6 +6,7 @@ from PySide6.QtCore import QAbstractListModel, Qt, QAbstractTableModel
 from neo import Event
 from .ui.EventView import Ui_EventView
 from .ViewerState import ViewerState
+from .helpers import qsignal_throttle
 from typing import List
 import sys
 import numpy as np
@@ -113,6 +114,9 @@ class EventView(QtWidgets.QWidget):
         self.ui.deleteButton.clicked.connect(self.del_clicked)
         self.ui.addButton.clicked.connect(self.add_clicked)
 
+        self._throttled_update_model = qsignal_throttle(self.updateModel, 250, parent=self, weight="heavy")
+        self._throttled_stim_change = qsignal_throttle(self.onStimNoChange, 150, parent=self, weight="heavy")
+
         self.state: ViewerState = None
         self.setState(state)
 
@@ -126,11 +130,21 @@ class EventView(QtWidgets.QWidget):
         self.updateModel()
 
         self.evtChangeConnection = self.state.onStimNoChange.connect(
-            self.onStimNoChange
+            lambda *args: (
+                self._throttled_stim_change()
+                if getattr(self.state, "is_streaming", False)
+                else self.onStimNoChange()
+            )
         )
         self.state.onLoadNewFile.connect(self.updateModel)
         if hasattr(self.state, "onEventsUpdated"):
-            self.state.onEventsUpdated.connect(self.updateModel)
+            self.state.onEventsUpdated.connect(
+                lambda *args: (
+                    self._throttled_update_model()
+                    if getattr(self.state, "is_streaming", False)
+                    else self.updateModel()
+                )
+            )
         # self.state.onUnitChange.connect(lambda x: self.model.resetInternalData())
 
     def updateModel(self):
@@ -149,10 +163,14 @@ class EventView(QtWidgets.QWidget):
         if self.state.stimno >= len(self.state.event_signal):
             return
         t = self.state.event_signal[self.state.stimno]
-        diffs = t - self.model.event
-        diffs[diffs < 0] = np.inf * pq.s
-        i = np.argmin(diffs)
-        # i = self.model.event.searchsorted(t, side="right")-1
+        try:
+            evt_s = self.model.event.rescale(pq.s).magnitude
+            t_s = float(t.rescale(pq.s).magnitude)
+            i = max(0, int(np.searchsorted(evt_s, t_s, side="right")) - 1)
+        except Exception:
+            diffs = t - self.model.event
+            diffs[diffs < 0] = np.inf * pq.s
+            i = int(np.argmin(diffs))
         self.ui.eventTableView.setCurrentIndex(self.model.index(i, 0))
 
     def onEventChange(self, index):

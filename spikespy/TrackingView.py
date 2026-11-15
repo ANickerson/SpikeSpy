@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from .basic_tracking import track_basic
 from .ViewerState import ViewerState
+from .helpers import qsignal_throttle
 from neo import Event
 
 
@@ -127,13 +128,21 @@ class TrackingView(QMainWindow):
         self.qsb_max_skip.valueChanged.connect(self._on_params_changed)
         self.qcb_auto_track.toggled.connect(self._on_params_changed)
 
+        self._sync_throttled = qsignal_throttle(self.sync_from_active_unit, 200, parent=self, weight="heavy")
+
         if self.state is not None:
             if hasattr(self.state, "onUnitGroupChange"):
-                self.state.onUnitGroupChange.connect(self.sync_from_active_unit)
+                self.state.onUnitGroupChange.connect(self._on_unit_updated)
             if hasattr(self.state, "onUnitChange"):
-                self.state.onUnitChange.connect(self.sync_from_active_unit)
+                self.state.onUnitChange.connect(self._on_unit_updated)
             if hasattr(self.state, "onNewSweep"):
                 self.state.onNewSweep.connect(self.on_new_sweep)
+            self.sync_from_active_unit()
+
+    def _on_unit_updated(self, *args):
+        if self.state is not None and getattr(self.state, "is_streaming", False):
+            self._sync_throttled()
+        else:
             self.sync_from_active_unit()
 
     def sync_from_active_unit(self):
@@ -254,6 +263,11 @@ class TrackingView(QMainWindow):
 
     def on_new_sweep(self, stimno: int):
         if self.state is None:
+            return
+        # ViewerState.append_sweep already dispatches background tracking on QThreadPool.
+        # Under UI strain, skip duplicate synchronous main-thread tracking.
+        sched = getattr(self.state, "frame_scheduler", None)
+        if sched is not None and sched.should_skip_nonessential_work():
             return
         self.state.track_stimulus_all_units(stimno)
 

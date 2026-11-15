@@ -21,7 +21,7 @@ import pyqtgraph as pg
 
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
-from .helpers import qsignal_throttle
+from .helpers import qsignal_throttle, run_adaptive_render
 
 
 class FixedTimeAxisItem(pg.AxisItem):
@@ -191,8 +191,24 @@ class MultiTraceFixedPGView(QMainWindow):
         if self.state is None:
             return
 
-        self.connections.append(self.state.onStimNoChange.connect(lambda x: self.update_figure()))
-        self.connections.append(self.state.onUnitChange.connect(lambda x: self.update_figure()))
+        self.connections.append(
+            self.state.onStimNoChange.connect(
+                lambda x: (
+                    self.on_new_sweep_throttled()
+                    if getattr(self.state, "is_streaming", False)
+                    else self.update_figure()
+                )
+            )
+        )
+        self.connections.append(
+            self.state.onUnitChange.connect(
+                lambda x: (
+                    self.on_new_sweep_throttled()
+                    if getattr(self.state, "is_streaming", False)
+                    else self.update_figure()
+                )
+            )
+        )
         self.connections.append(self.state.onUnitGroupChange.connect(lambda: self.update_figure()))
         self.connections.append(self.state.onLoadNewFile.connect(self._on_load_new_file))
         if hasattr(self.state, "onChannelChange"):
@@ -200,7 +216,15 @@ class MultiTraceFixedPGView(QMainWindow):
         if hasattr(self.state, "onNewSweep"):
             self.connections.append(self.state.onNewSweep.connect(self.on_new_sweep))
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.connections.append(self.state.onNewSpikeEvents.connect(lambda *args: self.update_figure()))
+            self.connections.append(
+                self.state.onNewSpikeEvents.connect(
+                    lambda *args: (
+                        self.on_new_sweep_throttled()
+                        if getattr(self.state, "is_streaming", False)
+                        else self.update_figure()
+                    )
+                )
+            )
 
         self._has_initialized_xrange = False
         self._auto_scale_needed = True
@@ -259,7 +283,7 @@ class MultiTraceFixedPGView(QMainWindow):
             if erp is not None and len(erp) > 0:
                 self._auto_scale()
                 self._auto_scale_needed = False
-        self.update_figure()
+        run_adaptive_render(self, self.update_figure, weight="normal", base_interval_ms=40.0)
 
     def on_new_sweep(self, *args):
         if getattr(self, "_auto_scale_needed", True):
@@ -384,26 +408,44 @@ class MultiTraceFixedPGView(QMainWindow):
 
         ug = self.get_target_unit()
         if ug is not None:
-            latencies = ug.get_latencies(self.state.event_signal[start:stop])
+            idx_arr = getattr(ug, "idx_arr", None)
             r = 20
+            if idx_arr is not None and len(idx_arr) >= stop:
+                for i, s_idx in enumerate(range(start, stop)):
+                    entry = idx_arr[s_idx]
+                    if entry is None:
+                        continue
+                    sample_no = int(entry[0])
+                    if sample_no < 0 or sample_no >= len(dpts_mag[i]):
+                        continue
+                    l_sec = sample_no / sr
+                    r_start = max(0, sample_no - r)
+                    r_end = min(len(dpts_mag[i]), sample_no + r)
+                    seg_x = np.arange(r_start, r_end) / sr
+                    seg_y = (dpts_mag[i][r_start:r_end] * scale * -1.0) + i
 
-            for i, l in enumerate(latencies):
-                if np.isnan(l):
-                    continue
-                l_sec = float(l.rescale("s").magnitude)
-                sample_no = int(l_sec * sr)
-                if sample_no < 0 or sample_no >= len(dpts_mag[i]):
-                    continue
+                    hl_x.append(np.append(seg_x, np.nan))
+                    hl_y.append(np.append(seg_y, np.nan))
+                    scat_pts.append((l_sec, (dpts_mag[i][sample_no] * scale * -1.0) + i))
+            else:
+                latencies = ug.get_latencies(self.state.event_signal[start:stop])
+                for i, l in enumerate(latencies):
+                    if np.isnan(l):
+                        continue
+                    l_sec = float(l.rescale("s").magnitude)
+                    sample_no = int(l_sec * sr)
+                    if sample_no < 0 or sample_no >= len(dpts_mag[i]):
+                        continue
 
-                r_start = max(0, sample_no - r)
-                r_end = min(len(dpts_mag[i]), sample_no + r)
-                seg_x = np.arange(r_start, r_end) / sr
-                seg_y = (dpts_mag[i][r_start:r_end] * scale * -1.0) + i
+                    r_start = max(0, sample_no - r)
+                    r_end = min(len(dpts_mag[i]), sample_no + r)
+                    seg_x = np.arange(r_start, r_end) / sr
+                    seg_y = (dpts_mag[i][r_start:r_end] * scale * -1.0) + i
 
-                hl_x.append(np.append(seg_x, np.nan))
-                hl_y.append(np.append(seg_y, np.nan))
+                    hl_x.append(np.append(seg_x, np.nan))
+                    hl_y.append(np.append(seg_y, np.nan))
 
-                scat_pts.append((l_sec, (dpts_mag[i][sample_no] * scale * -1.0) + i))
+                    scat_pts.append((l_sec, (dpts_mag[i][sample_no] * scale * -1.0) + i))
 
         if hl_x:
             self.highlight_segments.setData(np.concatenate(hl_x), np.concatenate(hl_y))

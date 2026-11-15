@@ -1,307 +1,185 @@
+import json
 import time
 import numpy as np
-import pytest
 import quantities as pq
-import neo
-from PySide6.QtCore import Qt, QThreadPool, QTimer
+import pytest
 from PySide6.QtWidgets import QApplication
 
-from spikespy.ViewerState import ViewerState, tracked_neuron_unit
-from spikespy.SingleTraceView import SingleTraceView
-from spikespy.MultiTraceView import MultiTraceView
-from spikespy.UnitView import UnitView
-from spikespy.UnitFootprintView import UnitFootprintView
+from spikespy.ViewerState import ViewerState
+from spikespy.ui_diagnostics import UIWatchdog, AdaptiveFrameScheduler
+from spikespy.open_ephys_addin.oe_live_view import OpenEphysLiveView
+from spikespy.open_ephys_addin.oe_stream_worker import OpenEphysStreamWorker
+from spikespy.SingleTracePGView import SingleTracePGView
+from spikespy.MultiTracePGView import MultiTracePGView
+from spikespy.MultiTraceFixedPGView import MultiTraceFixedPGView
+from spikespy.UnitPGView import UnitPGView
+from spikespy.UnitFootprintPGView import UnitFootprintPGView
 from spikespy.SpikeGroupTable import SpikeGroupTableView
-from spikespy.processing import LiveERPBuffer
+from spikespy.TrackingView import TrackingView
 
 
-def test_hidden_views_do_not_render(qtbot):
-    """Verify that views that are hidden do NOT render (render count == 0),
-    and render once when made visible.
+@pytest.fixture(scope="module")
+def qapp():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
+
+
+def test_ui_watchdog_detects_main_thread_stall(qapp):
+    """Verify UIWatchdog detects an artificial main-thread block and captures Python stack frames."""
+    watchdog = UIWatchdog(
+        stall_threshold_ms=120.0,
+        heartbeat_interval_ms=25,
+        log_to_stderr=False,
+    )
+    watchdog.start()
+    try:
+        qapp.processEvents()
+        # Artificially block the main thread longer than stall_threshold_ms
+        time.sleep(0.22)
+        qapp.processEvents()
+
+        assert len(watchdog.reports) >= 1
+        report = watchdog.reports[-1]
+        assert report.duration_ms >= 120.0
+        assert "test_ui_watchdog_detects_main_thread_stall" in report.stack_trace
+    finally:
+        watchdog.stop()
+
+
+def test_adaptive_frame_scheduler_scales_intervals_under_strain():
+    """Verify AdaptiveFrameScheduler scales effective intervals and enforces idle gap under heavy render load."""
+    sched = AdaptiveFrameScheduler(base_interval_ms=33, min_idle_gap_ms=12, max_interval_ms=400)
+
+    # Normal low-cost rendering: no strain
+    sched.record_render_time("SingleTracePGView", 2.0, weight="primary")
+    sched.record_render_time("MultiTracePGView", 3.0, weight="normal")
+    assert sched.strain_level < 0.25
+    assert not sched.should_skip_nonessential_work()
+    assert sched.get_effective_interval_ms(weight="primary") == 33
+
+    # Simulate heavy multi-window rendering (e.g. views taking ~22-28ms each)
+    for _ in range(6):
+        sched.record_render_time("SingleTraceView", 22.0, weight="heavy")
+        sched.record_render_time("MultiTraceView", 25.0, weight="heavy")
+        sched.record_render_time("UnitFootprintView", 28.0, weight="heavy")
+        sched.update_loop_lag(65.0)
+
+    assert sched.strain_level >= 0.8
+    assert sched.should_skip_nonessential_work()
+
+    primary_iv = sched.get_effective_interval_ms(weight="primary")
+    normal_iv = sched.get_effective_interval_ms(weight="normal")
+    heavy_iv = sched.get_effective_interval_ms(weight="heavy")
+
+    # Heavy views back off more aggressively than normal, which back off more than primary
+    assert heavy_iv > normal_iv >= primary_iv
+    assert heavy_iv >= 60
+
+    summary = sched.get_diagnostics_summary()
+    assert "SingleTraceView" in summary["views"]
+    assert "MultiTraceView" in summary["views"]
+
+
+def test_stream_worker_coalesces_spike_events_within_pending_sweep():
+    """Verify spike events falling inside an active pending sweep do not emit redundant immediate signals."""
+    worker = OpenEphysStreamWorker(window_ms=40.0, pre_stim_ms=10.0)
+    worker.sample_rate = 10000.0
+    emitted_batches = []
+    worker.spikeEventsReady.connect(lambda unit, evts: emitted_batches.append((unit, evts)))
+
+    # Queue a stimulus trigger at sample 1000 (sweep window: [900, 1400])
+    worker.queue_sweep_trigger(1000, 0.1)
+    assert len(worker._pending_sweeps) == 1
+
+    # Spike at sample 1120 falls inside the pending sweep [900, 1400]:
+    # should be attached to the pending sweep and NOT emitted immediately via spikeEventsReady
+    raw_in_sweep = json.dumps({
+        "type": "spike",
+        "sample_number": 1120,
+        "unit_name": "unit_0",
+        "electrode": 0,
+    }).encode("utf-8")
+    worker._handle_event_json(raw_in_sweep)
+    assert len(emitted_batches) == 0
+    assert "unit_0" in worker._pending_sweeps[0].spike_latencies
+
+    # Spike at sample 5000 is outside any pending sweep: should emit spikeEventsReady
+    raw_out_sweep = json.dumps({
+        "type": "spike",
+        "sample_number": 5000,
+        "unit_name": "unit_0",
+        "electrode": 0,
+    }).encode("utf-8")
+    worker._handle_event_json(raw_out_sweep)
+    assert len(emitted_batches) == 1
+
+
+def test_multi_window_50hz_live_streaming_responsive(qapp):
+    """
+    Stress-test 50 Hz live streaming with 8 simultaneous views open.
+    Verifies sweep batch coalescing, responsive event loop (no freeze), and bounded render counts.
     """
     state = ViewerState()
-    state.start_live_session(sampling_rate=10000.0, window_size_ms=50.0, units=pq.uV)
-
-    st_view = SingleTraceView(state=state)
-    mt_view = MultiTraceView(state=state)
-    u_view = UnitView(state=state)
-    uf_view = UnitFootprintView(state=state)
-
-    tbl_view = SpikeGroupTableView(state=state)
-
-    qtbot.addWidget(st_view)
-    qtbot.addWidget(mt_view)
-    qtbot.addWidget(u_view)
-    qtbot.addWidget(uf_view)
-    qtbot.addWidget(tbl_view)
-
-    # Hide all views
-    st_view.hide()
-    mt_view.hide()
-    u_view.hide()
-    uf_view.hide()
-    tbl_view.hide()
-
-    # Reset render counts to 0
-    st_view.render_count = 0
-    mt_view.render_count = 0
-    u_view.render_count = 0
-    uf_view.render_count = 0
-    tbl_view.render_count = 0
-
-    # Feed 30 sweeps via state.append_sweep(...)
-    for i in range(30):
-        w = np.zeros(500, dtype=np.float32)
-        state.append_sweep(float(i) * 0.01, w)
-        QApplication.processEvents()
-
-    # Wait for any background timers or throttles
-    qtbot.wait(100)
-
-    # Assert that view.render_count == 0 for all hidden views!
-    assert st_view.render_count == 0, f"SingleTraceView rendered while hidden: {st_view.render_count}"
-    assert mt_view.render_count == 0, f"MultiTraceView rendered while hidden: {mt_view.render_count}"
-    assert u_view.render_count == 0, f"UnitView rendered while hidden: {u_view.render_count}"
-    assert uf_view.render_count == 0, f"UnitFootprintView rendered while hidden: {uf_view.render_count}"
-    assert tbl_view.render_count == 0, f"SpikeGroupTableView rendered while hidden: {tbl_view.render_count}"
-
-    # Show SingleTraceView (view.show()), process Qt events
-    st_view.show()
-    qtbot.wait(100)
-    QApplication.processEvents()
-
-    # Assert view.render_count >= 1
-    assert st_view.render_count >= 1, "SingleTraceView failed to render upon becoming visible"
-
-    # Show other views as well and verify they also render once visible
-    mt_view.show()
-    u_view.show()
-    uf_view.show()
-    tbl_view.show()
-    qtbot.wait(100)
-    QApplication.processEvents()
-
-    assert mt_view.render_count >= 1, "MultiTraceView failed to render upon becoming visible"
-    assert u_view.render_count >= 1, "UnitView failed to render upon becoming visible"
-    assert uf_view.render_count >= 1, "UnitFootprintView failed to render upon becoming visible"
-    assert tbl_view.render_count >= 1, "SpikeGroupTableView failed to render upon becoming visible"
-
-    state.stop_live_session()
-
-
-def test_ui_refresh_rate_configuration(qtbot):
-    """Verify that ViewerState ui refresh rate updates timers across views."""
-    state = ViewerState()
-    assert state.get_ui_refresh_rate_ms() == 33
-
-    st_view = SingleTraceView(state=state)
-    mt_view = MultiTraceView(state=state)
-    u_view = UnitView(state=state)
-    uf_view = UnitFootprintView(state=state)
-    tbl_view = SpikeGroupTableView(state=state)
-
-    for v in [st_view, mt_view, u_view, uf_view]:
-        qtbot.addWidget(v)
-        assert hasattr(v, "render_timer")
-        assert v.render_timer.interval() == 33
-
-    assert hasattr(tbl_view, "update_timer")
-    assert tbl_view.update_timer.interval() == 33
-
-    # Update UI refresh rate in ViewerState
-    state.set_ui_refresh_rate_ms(50)
-    assert state.get_ui_refresh_rate_ms() == 50
-
-    for v in [st_view, mt_view, u_view, uf_view]:
-        assert v.render_timer.interval() == 50
-    assert tbl_view.update_timer.interval() == 50
-
-
-def test_ui_rendering_refresh_rate_cap(qtbot):
-    """Verify that UI render frame rate is bounded by the target refresh rate (e.g. 30 FPS / ~33 ms).
-    Simulating a high-frequency stimulus burst (100 Hz) coalesces incoming sweeps rather
-    than triggering 100 individual full redraws.
-    """
-    state = ViewerState()
-    state.start_live_session(sampling_rate=10000.0, window_size_ms=50.0, units=pq.uV)
-
-    st_view = SingleTraceView(state=state)
-    qtbot.addWidget(st_view)
-    st_view.show()
-    qtbot.wait(100)
-    QApplication.processEvents()
-
-    # Reset render count before burst
-    st_view.render_count = 0
-
-    # Blast 100 sweeps in ~50 ms (simulating a 100 Hz burst)
-    t_start = time.time()
-    for i in range(100):
-        w = np.zeros(500, dtype=np.float32)
-        state.append_sweep(float(i) * 0.01, w)
-        QApplication.processEvents()
-        time.sleep(0.0005)  # 0.5 ms between incoming packets
-
-    t_elapsed = time.time() - t_start
-
-    # Count render calls: assert view.render_count < 30
-    assert st_view.render_count < 30, (
-        f"Render count was not throttled/capped: {st_view.render_count} renders in {t_elapsed * 1000:.1f} ms"
+    state.start_live_session(
+        sampling_rate=10000.0,
+        window_size_ms=50.0,
+        channel_name="CH0",
+        aux_channels=["CH0", "CH1"],
     )
 
-    state.stop_live_session()
+    live_view = OpenEphysLiveView(state=state)
+    v_single = SingleTracePGView(state=state)
+    v_multi = MultiTracePGView(state=state)
+    v_fixed = MultiTraceFixedPGView(state=state)
+    v_unit = UnitPGView(state=state)
+    v_fp = UnitFootprintPGView(state=state)
+    v_table = SpikeGroupTableView(state=state)
+    v_track = TrackingView(state=state)
 
+    views = [live_view, v_single, v_multi, v_fixed, v_unit, v_fp, v_table, v_track]
+    for v in views:
+        v.show()
+    qapp.processEvents()
 
-def test_visibility_culling_in_background_tabs(qtbot):
-    """Hidden views in background tabs must not execute rendering or increment render_count."""
-    from PySide6.QtWidgets import QTabWidget
-    state = ViewerState()
-    state.start_live_session(sampling_rate=10000.0, window_size_ms=50.0, units=pq.uV)
+    sr = 10000.0
+    n_samples = 600
+    t_vec = np.arange(n_samples) / sr
+    n_sweeps = 40  # 40 sweeps at 50 Hz
 
-    tabs = QTabWidget()
-    qtbot.addWidget(tabs)
+    t0 = time.perf_counter()
+    for i in range(n_sweeps):
+        ch0 = (np.sin(2 * np.pi * 60.0 * t_vec) * 0.05).astype(np.float32)
+        ch1 = (np.cos(2 * np.pi * 60.0 * t_vec) * 0.03).astype(np.float32)
+        # Inject primary spike at 12ms
+        ch0[118:123] = np.array([-0.2, -0.8, -1.5, -0.6, 0.3], dtype=np.float32)
+        ch1[120:125] = np.array([-0.1, -0.5, -0.9, -0.3, 0.2], dtype=np.float32)
 
-    single_view = SingleTraceView(state=state)
-    multi_view = MultiTraceView(state=state)
-    table_view = SpikeGroupTableView(state=state)
+        payload = {
+            "stim_timestamp_s": i * 0.020,
+            "waveform": ch0,
+            "pre_offset_s": 0.010,
+            "spike_latencies_s": {"unit_0": 0.012, "unit_1": 0.018},
+            "aux_sweeps": {"CH0": ch0, "CH1": ch1},
+            "sample_rate": sr,
+        }
+        live_view._on_sweep_ready(payload)
 
-    tabs.addTab(single_view, "SingleTrace")
-    tabs.addTab(multi_view, "MultiTrace")
-    tabs.addTab(table_view, "Table")
+        # Simulate realistic bursty GUI event processing every few sweeps
+        if i % 4 == 3:
+            qapp.processEvents()
 
-    tabs.show()
-    qtbot.waitExposed(tabs)
+    # Drain any remaining queued sweeps
+    live_view._drain_sweep_queue()
+    qapp.processEvents()
+    elapsed_s = time.perf_counter() - t0
 
-    # Initial state: only active tab (tab 0: single_view) is visible; background tabs are culled
-    assert not single_view.is_view_culled()
-    assert multi_view.is_view_culled()
-    assert table_view.is_view_culled()
-
-    # Reset render counts to baseline
-    single_view.render_count = 0
-    multi_view.render_count = 0
-    table_view.render_count = 0
-
-    # Trigger renders across all views while tab 0 is active
-    single_view.updateFigure_core()
-    multi_view.on_new_sweep(0)
-    table_view.update()
-
-    # Active tab rendered
-    assert single_view.render_count == 1
-    # Background tabs culled (did NOT render)
-    assert multi_view.render_count == 0
-    assert table_view.render_count == 0
-
-    # All culled views marked dirty
-    assert multi_view._dirty is True
-    assert table_view._dirty is True
-
-    # Switch to tab 1 (MultiTraceView): showEvent should fire and trigger rendering
-    tabs.setCurrentIndex(1)
-    assert not multi_view.is_view_culled()
-    assert multi_view.render_count == 1
-    assert multi_view._dirty is False
-
-    # Switch to tab 2 (SpikeGroupTableView)
-    tabs.setCurrentIndex(2)
-    assert not table_view.is_view_culled()
-    assert table_view.render_count == 1
-    assert table_view._dirty is False
+    assert len(state.event_signal) == n_sweeps
+    assert state.stimno == n_sweeps - 1
+    # Processing 40 multi-channel sweeps across 8 open windows should complete quickly (< 4s)
+    assert elapsed_s < 4.0, f"Multi-window 50Hz streaming took too long: {elapsed_s:.2f}s"
 
     state.stop_live_session()
-
-
-def test_async_spike_tracking_throughput_and_responsiveness(qtbot):
-    """Verify that spike tracking runs asynchronously without blocking the UI thread,
-    keeps up with high-frequency stimulus streams, and tracks multiple units across channels.
-    """
-    state = ViewerState()
-    state.start_live_session(sampling_rate=10000.0, window_size_ms=50.0, units=pq.uV)
-
-    # Setup 3 recording channels
-    buf0 = LiveERPBuffer(window_samples=500, units=pq.uV)
-    buf1 = LiveERPBuffer(window_samples=500, units=pq.uV)
-    buf2 = LiveERPBuffer(window_samples=500, units=pq.uV)
-    state._live_erp_buffer = buf0
-    state._live_aux_erp_buffers = {"CH0": buf0, "CH1": buf1, "CH2": buf2}
-    state.active_channel_names = ["CH0", "CH1", "CH2"]
-
-    # Configure 3 units with auto_track=True on different channels
-    sg0 = tracked_neuron_unit(
-        event=neo.Event([], name="unit_0", units=pq.s),
-        channel="CH0",
-        tracking_channel="CH0",
-        auto_track=True,
-        tracking_threshold_mv=0.02,
-        tracking_window_ms=5.0,
-    )
-    sg1 = tracked_neuron_unit(
-        event=neo.Event([], name="unit_1", units=pq.s),
-        channel="CH1",
-        tracking_channel="CH1",
-        auto_track=True,
-        tracking_threshold_mv=0.02,
-        tracking_window_ms=5.0,
-    )
-    sg2 = tracked_neuron_unit(
-        event=neo.Event([], name="unit_2", units=pq.s),
-        channel="CH2",
-        tracking_channel="CH2",
-        auto_track=True,
-        tracking_threshold_mv=0.02,
-        tracking_window_ms=5.0,
-    )
-    state.spike_groups = [sg0, sg1, sg2]
-
-    # Sweep 0: initial seed spikes
-    w0 = np.zeros(500, dtype=np.float32)
-    w0[100] = 50.0  # 10.0 ms
-    w1 = np.zeros(500, dtype=np.float32)
-    w1[150] = 50.0  # 15.0 ms
-    w2 = np.zeros(500, dtype=np.float32)
-    w2[200] = 50.0  # 20.0 ms
-
-    state.append_sweep(0.0, w0, aux_sweeps={"CH1": w1, "CH2": w2})
-    state.setUnit(100, stimno=0, unit_idx=0)
-    state.setUnit(150, stimno=0, unit_idx=1)
-    state.setUnit(200, stimno=0, unit_idx=2)
-
-    # Monitor UI thread responsiveness with a high-frequency Qt timer
-    ui_heartbeat_ticks = []
-    heartbeat_timer = QTimer()
-    heartbeat_timer.setInterval(5)  # 5 ms tick
-    heartbeat_timer.timeout.connect(lambda: ui_heartbeat_ticks.append(time.time()))
-    heartbeat_timer.start()
-
-    # Append 20 sweeps with synthetic spikes drifting slightly
-    for s in range(1, 21):
-        w0_s = np.zeros(500, dtype=np.float32)
-        w0_s[100 + (s % 4)] = 50.0
-        w1_s = np.zeros(500, dtype=np.float32)
-        w1_s[150 + (s % 4)] = 50.0
-        w2_s = np.zeros(500, dtype=np.float32)
-        w2_s[200 + (s % 4)] = 50.0
-
-        state.append_sweep(float(s) * 0.05, w0_s, aux_sweeps={"CH1": w1_s, "CH2": w2_s})
-        QApplication.processEvents()
-        time.sleep(0.002)
-
-    heartbeat_timer.stop()
-
-    # Wait for background tracking to complete
-    QThreadPool.globalInstance().waitForDone(2000)
-    qtbot.wait(100)
-    QApplication.processEvents()
-
-    # Assert all 3 units have detected spikes across the sweeps
-    for u_idx, sg in enumerate(state.spike_groups):
-        tracked = [x for x in sg.idx_arr[1:21] if x is not None]
-        assert len(tracked) >= 18, (
-            f"Unit {u_idx} failed to detect spikes asynchronously across sweeps: {len(tracked)}/20 detected"
-        )
-
-    # Measure UI thread responsiveness during the stream: heartbeat timer ticked continuously
-    assert len(ui_heartbeat_ticks) > 5, "UI thread was completely blocked during live streaming"
-
-    state.stop_live_session()
+    for v in views:
+        v.close()

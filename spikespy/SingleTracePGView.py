@@ -2,7 +2,7 @@ import sys
 from typing import Dict, List, Optional
 import numpy as np
 import quantities as pq
-from scipy.signal import find_peaks
+from scipy.signal import fftconvolve, find_peaks
 
 import PySide6
 from PySide6 import QtCore
@@ -18,7 +18,7 @@ import pyqtgraph as pg
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .processing import create_erp_signals
 from .ChannelGroupBar import ChannelGroupBar
-from .helpers import qsignal_throttle
+from .helpers import qsignal_throttle, run_adaptive_render
 
 
 class SingleTraceTimeAxisItem(pg.AxisItem):
@@ -28,61 +28,26 @@ class SingleTraceTimeAxisItem(pg.AxisItem):
         return [f"{1000 * v:g}" for v in values]
 
 
-class WorkerSignals(QObject):
-    result = Signal(np.ndarray)
-    cancel = Signal()
+class SweepConvProxy:
+    """Lazy per-sweep FFT template correlation proxy (O(W log W) for the active sweep instead of all sweeps)."""
 
+    def __init__(self, view):
+        self.view = view
+        self._cache = {}
+        self._kernel_key = None
+        self._kernel = None
 
-class PGUpdateConv(QRunnable):
-    """Background worker for template cross-correlation."""
+    def clear(self):
+        self._cache.clear()
+        self._kernel_key = None
+        self._kernel = None
 
-    def __init__(self, analog_signal, sg, erp):
-        super().__init__()
-        self.signals = WorkerSignals()
-        self.erp = erp
-        self.sg = sg
-        self.analog_signal = analog_signal
-        self.cancelled = False
-        self.signals.cancel.connect(self.cancel)
+    def __len__(self):
+        erp = self.view.get_erp_signal()
+        return len(erp) if erp is not None else 0
 
-    def cancel(self):
-        self.cancelled = True
-
-    def create_erp_signals(self, signal_chan, idxs, offset=-1000 * pq.ms, length=30000 * pq.ms):
-        arr = np.zeros(
-            (
-                len(idxs),
-                int(np.ceil(length.rescale(pq.second).magnitude * signal_chan.sampling_rate.magnitude)),
-            )
-        )
-        for i, x in enumerate(idxs):
-            try:
-                arr[i].flat[:] = signal_chan.time_slice(x + offset, x + offset + length).as_array()
-                if self.cancelled:
-                    return None
-            except Exception:
-                pass
-        return arr * signal_chan.units
-
-    def run(self):
-        erp_sig = self.create_erp_signals(self.analog_signal, self.sg.event, -0.01 * pq.s, +0.02 * pq.s)
-        if self.cancelled or erp_sig is None:
-            return
-        mean_erp = np.mean(erp_sig, axis=0)
-        std_mean = np.std(mean_erp)
-        if std_mean == 0 or self.cancelled:
-            return
-
-        conv = np.convolve(
-            mean_erp / std_mean,
-            (self.erp / std_mean).flat[:],
-            mode="same",
-        ).reshape(self.erp.shape)
-        conv[:, 0 : len(mean_erp)] = 0
-        conv[:, -len(mean_erp) :] = 0
-
-        if not self.cancelled:
-            self.signals.result.emit(conv)
+    def __getitem__(self, stimno: int):
+        return self.view._compute_sweep_conv(stimno)
 
 
 class SingleTracePGView(QMainWindow):
@@ -105,14 +70,18 @@ class SingleTracePGView(QMainWindow):
         self.connections: List = []
         self.select_local_maxima_width: int = 1
         self.closest_pos: int = 0
-        self.conv: Optional[np.ndarray] = None
-        self.task: Optional[PGUpdateConv] = None
+        self.conv: Optional[SweepConvProxy] = SweepConvProxy(self)
+        self.task = None
         self._dirty: bool = False
         self._was_shown: bool = False
         self._user_hidden: bool = False
         self._last_render_key = None
-        self.on_new_sweep_throttled = qsignal_throttle(self._on_new_sweep_core, 40)
-        self.update_histogram_throttled = qsignal_throttle(self._update_histogram_core, 500)
+        self.on_new_sweep_throttled = qsignal_throttle(
+            self._on_new_sweep_core, 40, parent=self, weight="primary"
+        )
+        self.update_histogram_throttled = qsignal_throttle(
+            self._update_histogram_core, 400, parent=self, weight="heavy"
+        )
 
         # Graphics items
         self.top_lines: List[pg.InfiniteLine] = []
@@ -230,8 +199,8 @@ class SingleTracePGView(QMainWindow):
             return
 
         self.connections.append(self.state.onLoadNewFile.connect(self.setup_figure))
-        self.connections.append(self.state.onStimNoChange.connect(self.update_figure))
-        self.connections.append(self.state.onUnitChange.connect(self.update_figure))
+        self.connections.append(self.state.onStimNoChange.connect(self._on_stimno_change))
+        self.connections.append(self.state.onUnitChange.connect(self._on_unit_change))
         self.connections.append(self.state.onUnitGroupChange.connect(self.update_figure))
         self.connections.append(self.state.onUnitChange.connect(self.update_histogram))
         self.connections.append(self.state.onUnitGroupChange.connect(self.update_histogram))
@@ -240,10 +209,29 @@ class SingleTracePGView(QMainWindow):
         if hasattr(self.state, "onNewSweep"):
             self.connections.append(self.state.onNewSweep.connect(self.on_new_sweep))
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.connections.append(self.state.onNewSpikeEvents.connect(lambda *args: (self.update_histogram(), self.update_figure())))
+            self.connections.append(self.state.onNewSpikeEvents.connect(self._on_new_spike_events))
 
         self._setup_done = False
         self.setup_figure()
+
+    def _on_stimno_change(self, *args):
+        if self.state is not None and getattr(self.state, "is_streaming", False):
+            self.on_new_sweep()
+        else:
+            self.update_figure()
+
+    def _on_unit_change(self, *args):
+        if self.state is not None and getattr(self.state, "is_streaming", False):
+            self.on_new_sweep()
+        else:
+            self.update_figure()
+
+    def _on_new_spike_events(self, *args):
+        self.update_histogram()
+        if self.state is not None and getattr(self.state, "is_streaming", False):
+            self.on_new_sweep()
+        else:
+            self.update_figure()
 
     def is_view_culled(self) -> bool:
         try:
@@ -331,6 +319,81 @@ class SingleTracePGView(QMainWindow):
         self._update_histogram_core()
         self.update_figure()
 
+    def _compute_sweep_conv(self, stimno: int) -> np.ndarray:
+        """Compute template correlation for a single sweep lazily via FFT convolution."""
+        erp = self.get_erp_signal()
+        if erp is None or stimno < 0 or stimno >= len(erp) or self.state is None:
+            return np.zeros(0, dtype=np.float64)
+
+        sg = self.get_target_unit()
+        n_samples = erp.shape[-1]
+        if sg is None or sg.event is None or len(sg.event) == 0:
+            return np.zeros(n_samples, dtype=np.float64)
+
+        sr = (
+            float(self.state.sampling_rate.rescale("Hz").magnitude)
+            if hasattr(self.state.sampling_rate, "rescale")
+            else float(self.state.sampling_rate or 30000.0)
+        )
+        erp_mag = erp.magnitude if hasattr(erp, "magnitude") else np.asarray(erp)
+        ug_idx = self.get_target_unit_idx()
+        primary_ch = self.channel_bar.get_primary_channel() if hasattr(self, "channel_bar") else ""
+        kernel_key = (ug_idx, len(sg.event), primary_ch, int(sr))
+
+        proxy = self.conv if isinstance(self.conv, SweepConvProxy) else None
+        if proxy is not None and proxy._kernel_key == kernel_key and proxy._kernel is not None:
+            if stimno in proxy._cache:
+                return proxy._cache[stimno]
+            kernel = proxy._kernel
+        else:
+            pre_s = int(round(0.01 * sr))
+            post_s = int(round(0.02 * sr))
+            win_len = pre_s + post_s
+            if win_len <= 0:
+                return np.zeros(n_samples, dtype=np.float64)
+
+            snippets = []
+            if getattr(sg, "idx_arr", None) is not None:
+                valid_pairs = [
+                    (sw, x[0] if isinstance(x, (tuple, list)) else int(x))
+                    for sw, x in enumerate(sg.idx_arr)
+                    if x is not None and sw < len(erp_mag)
+                ]
+                for sw, samp in valid_pairs[-32:]:
+                    s0 = samp - pre_s
+                    s1 = samp + post_s
+                    if 0 <= s0 and s1 <= erp_mag.shape[-1]:
+                        snippets.append(np.asarray(erp_mag[sw, s0:s1], dtype=np.float64))
+
+            if not snippets:
+                return np.zeros(n_samples, dtype=np.float64)
+
+            mean_erp = np.mean(snippets, axis=0)
+            std_mean = float(np.std(mean_erp))
+            if std_mean == 0.0:
+                return np.zeros(n_samples, dtype=np.float64)
+
+            kernel = (mean_erp / (std_mean * std_mean)).astype(np.float64)
+            if proxy is not None:
+                proxy.clear()
+                proxy._kernel_key = kernel_key
+                proxy._kernel = kernel
+
+        row = np.asarray(erp_mag[stimno], dtype=np.float64).flatten()
+        if len(row) == 0 or len(kernel) == 0:
+            return np.zeros(n_samples, dtype=np.float64)
+
+        conv_row = fftconvolve(row, kernel, mode="same")
+        klen = len(kernel)
+        if klen < len(conv_row):
+            conv_row[:klen] = 0.0
+            conv_row[-klen:] = 0.0
+        if proxy is not None:
+            if len(proxy._cache) > 64:
+                proxy._cache.clear()
+            proxy._cache[stimno] = conv_row
+        return conv_row
+
     def update_histogram(self):
         if hasattr(self, "update_histogram_throttled"):
             self.update_histogram_throttled()
@@ -346,23 +409,32 @@ class SingleTracePGView(QMainWindow):
             self.histogram_curve.clear()
             return
 
-        if self.task is not None:
-            self.task.signals.cancel.emit()
+        if isinstance(self.conv, SweepConvProxy):
+            self.conv.clear()
+        else:
+            self.conv = SweepConvProxy(self)
 
-        erp = self.get_erp_signal()
-        if erp is not None and len(erp) > 0 and self.state.analog_signal is not None:
-            self.task = PGUpdateConv(self.state.analog_signal, sg, erp)
-            self.task.signals.result.connect(self._on_conv_done)
-            QThreadPool.globalInstance().start(self.task)
+        # Draw latency histogram using fast idx_arr when available
+        sr = (
+            float(self.state.sampling_rate.rescale("Hz").magnitude)
+            if hasattr(self.state.sampling_rate, "rescale")
+            else float(self.state.sampling_rate or 30000.0)
+        )
+        if getattr(sg, "idx_arr", None) is not None and len(sg.idx_arr) > 0:
+            sec_vals = [
+                (x[0] if isinstance(x, (tuple, list)) else float(x)) / sr
+                for x in sg.idx_arr
+                if x is not None
+            ]
+        else:
+            latencies = sg.get_latencies(self.state.event_signal)
+            valid = latencies[~np.isnan(latencies)]
+            sec_vals = [float(v.rescale("s").magnitude) for v in valid]
 
-        # Draw latency histogram
-        latencies = sg.get_latencies(self.state.event_signal)
-        valid = latencies[~np.isnan(latencies)]
-        if len(valid) == 0:
+        if len(sec_vals) == 0:
             self.histogram_curve.clear()
             return
 
-        sec_vals = [float(v.rescale("s").magnitude) for v in valid]
         step = 0.002  # 2 ms bins
         min_v = min(sec_vals)
         max_v = max(sec_vals)
@@ -385,7 +457,9 @@ class SingleTracePGView(QMainWindow):
             self._dirty = True
             return
         self._dirty = False
+        run_adaptive_render(self, lambda: self._do_update_figure_core(force=force), weight="primary")
 
+    def _do_update_figure_core(self, force: bool = False):
         if self.state is None or self.state.event_signal is None:
             return
 
@@ -453,48 +527,57 @@ class SingleTracePGView(QMainWindow):
             self.top_plot.removeItem(line)
         self.top_lines.clear()
 
+        idxs = []
+        values = []
         sg = self.get_target_unit()
         if sg is not None and getattr(sg, "idx_arr", None) is not None:
             idxs = [i for i, x in enumerate(sg.idx_arr) if x is not None]
             values = [x[0] / sr for x in sg.idx_arr if x is not None]
 
-            if len(self.state.event_signal.times) > stimno:
+            lat_sec = None
+            if stimno < len(sg.idx_arr) and sg.idx_arr[stimno] is not None:
+                item = sg.idx_arr[stimno]
+                samp = item[0] if isinstance(item, (tuple, list)) else int(item)
+                lat_sec = samp / sr
+            elif len(self.state.event_signal.times) > stimno:
                 cur_ev = self.state.event_signal.times[stimno]
                 lat = sg.get_latencies(np.array([cur_ev]) * cur_ev.units)[0].rescale("s")
-
                 if not np.isnan(lat) and lat < self.state.window_size:
                     lat_sec = float(lat.magnitude)
-                    self.identified_spike_line.setValue(lat_sec)
-                    self.identified_spike_line.setVisible(True)
 
-                    line_cur = pg.InfiniteLine(pos=lat_sec, angle=90, pen=pg.mkPen("blue", width=1.5), movable=False)
-                    self.top_plot.addItem(line_cur)
-                    self.top_lines.append(line_cur)
-                else:
-                    self.identified_spike_line.setVisible(False)
+            if lat_sec is not None:
+                self.identified_spike_line.setValue(lat_sec)
+                self.identified_spike_line.setVisible(True)
+
+                line_cur = pg.InfiniteLine(pos=lat_sec, angle=90, pen=pg.mkPen("blue", width=1.5), movable=False)
+                self.top_plot.addItem(line_cur)
+                self.top_lines.append(line_cur)
             else:
                 self.identified_spike_line.setVisible(False)
 
         # Plot previous and next identified spikes in this group
-        cur_idx = int(np.searchsorted(idxs, stimno))
-        if cur_idx > 0 and (stimno - idxs[cur_idx - 1]) < 10:
-            l_prev = values[cur_idx - 1]
-            line_prev = pg.InfiniteLine(
-                pos=l_prev, angle=90, pen=pg.mkPen(0, 180, 0, 150, width=1.5), movable=False
-            )
-            self.top_plot.addItem(line_prev)
-            self.top_lines.append(line_prev)
+        if idxs:
+            cur_idx = int(np.searchsorted(idxs, stimno))
+            if cur_idx > 0 and (stimno - idxs[cur_idx - 1]) < 10:
+                l_prev = values[cur_idx - 1]
+                line_prev = pg.InfiniteLine(
+                    pos=l_prev, angle=90, pen=pg.mkPen(0, 180, 0, 150, width=1.5), movable=False
+                )
+                self.top_plot.addItem(line_prev)
+                self.top_lines.append(line_prev)
 
-        if (cur_idx + 1) < len(idxs) and (idxs[cur_idx + 1] - stimno) < 10 and cur_idx >= 0:
-            l_next = values[cur_idx + 1]
-            line_next = pg.InfiniteLine(
-                pos=l_next, angle=90, pen=pg.mkPen(220, 0, 0, 150, width=1.5), movable=False
-            )
-            self.top_plot.addItem(line_next)
-            self.top_lines.append(line_next)
+            if (cur_idx + 1) < len(idxs) and (idxs[cur_idx + 1] - stimno) < 10 and cur_idx >= 0:
+                l_next = values[cur_idx + 1]
+                line_next = pg.InfiniteLine(
+                    pos=l_next, angle=90, pen=pg.mkPen(220, 0, 0, 150, width=1.5), movable=False
+                )
+                self.top_plot.addItem(line_next)
+                self.top_lines.append(line_next)
 
-        # Correlation peaks
-        if self.conv is not None and stimno < len(self.conv):
+        # Correlation peaks (skip during high UI strain to keep frame times fast)
+        scheduler = getattr(self.state, "frame_scheduler", None)
+        skip_conv = scheduler is not None and scheduler.should_skip_nonessential_work()
+        if not skip_conv and self.conv is not None and stimno < len(self.conv):
             conv_row = self.conv[stimno]
             if len(conv_row) > 2000:
                 p99 = float(np.percentile(conv_row[1000:-1000], 99))

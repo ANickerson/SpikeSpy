@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from .ViewerState import ViewerState
 from .QMatplotlib import QMatplotlib
 from .ChannelGroupBar import ChannelGroupBar
+from .helpers import run_adaptive_render
 
 mplstyle.use("fast")
 
@@ -113,7 +114,7 @@ class UnitView(QMatplotlib):
             if self.is_view_culled() or not getattr(self, "_dirty", False):
                 return
             self._dirty = False
-            self._do_updateAll_core()
+            run_adaptive_render(self, self._do_updateAll_core, weight="heavy")
         except RuntimeError:
             pass
 
@@ -161,12 +162,30 @@ class UnitView(QMatplotlib):
         super().setState(state)
         if hasattr(self, "channel_bar"):
             self.channel_bar.setState(state)
-        self.state.onStimNoChange.connect(self.update_curstim_line)
-        self.state.onUnitChange.connect(self.updateAll)
+        self.state.onStimNoChange.connect(
+            lambda x: (
+                self.schedule_update()
+                if getattr(self.state, "is_streaming", False)
+                else self.update_curstim_line(x)
+            )
+        )
+        self.state.onUnitChange.connect(
+            lambda *args: (
+                self.schedule_update()
+                if getattr(self.state, "is_streaming", False)
+                else self.updateAll()
+            )
+        )
         self.state.onUnitGroupChange.connect(self.updateAll)
         self.state.onLoadNewFile.connect(self.updateAll)
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.state.onNewSpikeEvents.connect(lambda *args: self.updateAll())
+            self.state.onNewSpikeEvents.connect(
+                lambda *args: (
+                    self.schedule_update()
+                    if getattr(self.state, "is_streaming", False)
+                    else self.updateAll()
+                )
+            )
         if hasattr(self.state, "onChannelChange"):
             self.state.onChannelChange.connect(self.updateAll)
         if hasattr(self.state, "onNewSweep"):
@@ -240,7 +259,9 @@ class UnitView(QMatplotlib):
                 else float(self.state.analog_signal.sampling_rate)
             )
 
-        if self.state.event_signal is not None and hasattr(sg, "get_latencies"):
+        if getattr(sg, "idx_arr", None) is not None and len(sg.idx_arr) == len(sig_erp):
+            sample_arr = sg.idx_arr
+        elif self.state.event_signal is not None and hasattr(sg, "get_latencies"):
             lats = sg.get_latencies(self.state.event_signal)
             sample_arr = []
             for lat in lats:
@@ -262,9 +283,19 @@ class UnitView(QMatplotlib):
         should_align = getattr(self, "chk_show_neighbors", None) and self.chk_show_neighbors.isChecked()
         search_r = max(int(0.00075 * sr), 3)
 
-        for i, idx, d in zip(range(len(sig_erp)), idx_arr, sig_erp):
+        n_erp = min(len(sig_erp), len(idx_arr))
+        if getattr(self.state, "is_streaming", False) and n_erp > 100:
+            sweep_indices = list(range(n_erp - 100, n_erp))
+            if 0 <= self.state.stimno < n_erp and self.state.stimno not in sweep_indices:
+                sweep_indices.append(self.state.stimno)
+        else:
+            sweep_indices = range(n_erp)
+
+        for i in sweep_indices:
+            idx = idx_arr[i]
             if idx is None:
                 continue
+            d = sig_erp[i]
             c_idx = idx[0]
             if should_align:
                 search_start = max(0, c_idx - search_r)

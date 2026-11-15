@@ -23,7 +23,7 @@ from PySide6.QtCore import (
     QRunnable,
     QTimer,
 )
-from .helpers import qsignal_throttle
+from .helpers import qsignal_throttle, run_adaptive_render
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -721,7 +721,7 @@ class SingleTraceView(QMainWindow):
             if not getattr(self, "_dirty", False):
                 return
             self._dirty = False
-            self.updateFigure_core()
+            run_adaptive_render(self, self.updateFigure_core, weight="heavy")
         except RuntimeError:
             pass
 
@@ -845,15 +845,27 @@ class SingleTraceView(QMainWindow):
             self.aux_trace_lines[idx_c].set_visible(False)
             self.aux_trace_labels[idx_c].set_visible(False)
 
-        lats_all = sg.get_latencies(self.state.event_signal) if sg is not None else np.array([])
-        valid_mask = ~np.isnan(lats_all) if len(lats_all) > 0 else np.array([], dtype=bool)
-        idxs = np.where(valid_mask)[0] if len(valid_mask) > 0 else np.array([], dtype=int)
-        values = [(float(lats_all[i].rescale(pq.s).magnitude) if hasattr(lats_all[i], "rescale") else float(lats_all[i])) for i in idxs]
-
-        lat = (
-            sg.get_latencies(np.array([cur_event_time]) * cur_event_time.units)[0].rescale("s")
-            if sg is not None else np.nan * pq.s
-        )
+        sr_val = float(self.state.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(self.state.sampling_rate, "rescale") else float(self.state.sampling_rate)
+        if sg is not None and getattr(sg, "idx_arr", None) is not None and len(sg.idx_arr) == len(self.state.event_signal):
+            idx_list = []
+            val_list = []
+            for s_i, entry in enumerate(sg.idx_arr):
+                if entry is not None:
+                    idx_list.append(s_i)
+                    val_list.append(entry[0] / sr_val)
+            idxs = np.array(idx_list, dtype=int)
+            values = val_list
+            cur_entry = sg.idx_arr[self.state.stimno] if self.state.stimno < len(sg.idx_arr) else None
+            lat = (cur_entry[0] / sr_val) * pq.s if cur_entry is not None else np.nan * pq.s
+        else:
+            lats_all = sg.get_latencies(self.state.event_signal) if sg is not None else np.array([])
+            valid_mask = ~np.isnan(lats_all) if len(lats_all) > 0 else np.array([], dtype=bool)
+            idxs = np.where(valid_mask)[0] if len(valid_mask) > 0 else np.array([], dtype=int)
+            values = [(float(lats_all[i].rescale(pq.s).magnitude) if hasattr(lats_all[i], "rescale") else float(lats_all[i])) for i in idxs]
+            lat = (
+                sg.get_latencies(np.array([cur_event_time]) * cur_event_time.units)[0].rescale("s")
+                if sg is not None else np.nan * pq.s
+            )
 
         if not np.isnan(lat) and lat < self.state.window_size:
             cur_point = int(lat * self.state.sampling_rate)

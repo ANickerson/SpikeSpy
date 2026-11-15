@@ -489,24 +489,50 @@ class MultiTracePGView(QMainWindow):
         self.references.append(self.state.onLoadNewFile.connect(self.setup_figure))
         self.references.append(self.state.onLoadNewFile.connect(self.update_axis))
 
+        self.on_new_sweep_throttled = qsignal_throttle(
+            lambda: self.on_new_sweep(self.state.stimno if self.state else 0),
+            40,
+            parent=self,
+            weight="primary",
+        )
+        self.reset_right_axes_throttled = qsignal_throttle(
+            self.reset_right_axes_data,
+            200,
+            parent=self,
+            weight="heavy",
+        )
+
         def _on_unit_updated(*args):
-            self.render()
-            self.reset_right_axes_data()
+            if getattr(self.state, "is_streaming", False):
+                self.on_new_sweep_throttled()
+            else:
+                self.render()
+                self.reset_right_axes_data()
 
         self.references.append(self.state.onUnitGroupChange.connect(_on_unit_updated))
         self.references.append(self.state.onUnitChange.connect(_on_unit_updated))
 
-        self.references.append(self.state.onStimNoChange.connect(self.update_ylim))
-        self.references.append(self.state.onStimNoChange.connect(lambda *args: self.plot_curstim_line(self.state.stimno)))
+        def _on_stimno_changed(*args):
+            if getattr(self.state, "is_streaming", False):
+                self.on_new_sweep_throttled()
+            else:
+                self.update_ylim(self.state.stimno)
+                self.plot_curstim_line(self.state.stimno)
+
+        self.references.append(self.state.onStimNoChange.connect(_on_stimno_changed))
 
         if hasattr(self.state, "onChannelChange"):
             self.references.append(self.state.onChannelChange.connect(self._on_channel_change))
 
         if hasattr(self.state, "onNewSweep"):
-            self.on_new_sweep_throttled = qsignal_throttle(lambda: self.on_new_sweep(self.state.stimno if self.state else 0), 40)
             self.references.append(self.state.onNewSweep.connect(self.on_new_sweep_throttled))
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.references.append(self.state.onNewSpikeEvents.connect(lambda *args: self.render()))
+            def _on_spike_events(*args):
+                if getattr(self.state, "is_streaming", False):
+                    self.on_new_sweep_throttled()
+                else:
+                    self.render()
+            self.references.append(self.state.onNewSpikeEvents.connect(_on_spike_events))
 
         self.update_axis()
         self.reset_right_axes_data()
@@ -518,7 +544,10 @@ class MultiTracePGView(QMainWindow):
             return
         if self.state is None:
             return
+        from .helpers import run_adaptive_render
+        run_adaptive_render(self, lambda: self._on_new_sweep_core(stimno), weight="primary")
 
+    def _on_new_sweep_core(self, stimno: Optional[int] = None):
         live_buf = self.get_live_buffer()
         if live_buf is not None and len(live_buf) > 0:
             erp = live_buf.data
@@ -599,7 +628,10 @@ class MultiTracePGView(QMainWindow):
 
         self.plot_curstim_line(self.state.stimno)
         self.plot_spikegroups()
-        self.reset_right_axes_data()
+        if getattr(self.state, "is_streaming", False) and hasattr(self, "reset_right_axes_throttled"):
+            self.reset_right_axes_throttled()
+        else:
+            self.reset_right_axes_data()
 
     def remove_references(self):
         if self.state is not None:
@@ -728,14 +760,9 @@ class MultiTracePGView(QMainWindow):
                 pass
         self.legend_items.clear()
 
-        for scat in self.other_unit_scatters:
-            try:
-                self.main_plot.removeItem(scat)
-            except Exception:
-                pass
-        self.other_unit_scatters.clear()
-
         target_unit_idx = self.get_target_unit_idx()
+        show_legend = hasattr(self, "showLegend") and self.showLegend.isChecked()
+        other_idx = 0
 
         # 1. Other Units (only if "Others" checkbox is checked)
         if self.includeAllUnitsCheckBox.isChecked():
@@ -748,23 +775,40 @@ class MultiTracePGView(QMainWindow):
                 pts_arr = np.array(points)
                 c = SET2_COLORS[i % len(SET2_COLORS)]
 
-                scat = pg.ScatterPlotItem(
-                    x=pts_arr[:, 0],
-                    y=pts_arr[:, 1],
-                    size=8,
-                    symbol="s",
-                    pen=None,
-                    brush=pg.mkBrush(*c, 200),
-                )
-                self.main_plot.addItem(scat)
-                self.other_unit_scatters.append(scat)
+                if other_idx < len(self.other_unit_scatters):
+                    scat = self.other_unit_scatters[other_idx]
+                    scat.setData(
+                        x=pts_arr[:, 0],
+                        y=pts_arr[:, 1],
+                        size=8,
+                        symbol="s",
+                        pen=None,
+                        brush=pg.mkBrush(*c, 200),
+                    )
+                    scat.setVisible(True)
+                else:
+                    scat = pg.ScatterPlotItem(
+                        x=pts_arr[:, 0],
+                        y=pts_arr[:, 1],
+                        size=8,
+                        symbol="s",
+                        pen=None,
+                        brush=pg.mkBrush(*c, 200),
+                    )
+                    self.main_plot.addItem(scat)
+                    self.other_unit_scatters.append(scat)
+                other_idx += 1
 
-                if hasattr(self, "showLegend") and self.showLegend.isChecked():
+                if show_legend:
                     unit_name = unit.event.name or str(i)
                     lbl = pg.TextItem(text=unit_name, color=c, fill=pg.mkBrush(255, 255, 255, 220))
                     lbl.setPos(pts_arr[0, 0], pts_arr[0, 1])
                     self.main_plot.addItem(lbl)
                     self.legend_items.append(lbl)
+
+        for idx_unused in range(other_idx, len(self.other_unit_scatters)):
+            self.other_unit_scatters[idx_unused].clear()
+            self.other_unit_scatters[idx_unused].setVisible(False)
 
         # 2. Tracked Unit (Red) - strictly target_unit_idx only
         if self.includeUnitCheckbox.isChecked() and 0 <= target_unit_idx < len(self.state.spike_groups):
@@ -786,7 +830,7 @@ class MultiTracePGView(QMainWindow):
                 )
                 self.tracked_unit_scatter.setVisible(True)
 
-                if hasattr(self, "showLegend") and self.showLegend.isChecked():
+                if show_legend:
                     unit_name = sg.event.name or str(target_unit_idx)
                     lbl = pg.TextItem(text=unit_name, color=(255, 0, 0), fill=pg.mkBrush(255, 255, 255, 220))
                     lbl.setPos(pts_arr[0, 0], pts_arr[0, 1])
@@ -804,28 +848,49 @@ class MultiTracePGView(QMainWindow):
         if self.state is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
             return
 
-        if len(self.state.event_signal.times) > 1:
-            stimFreq_data = (
-                (1 / np.diff(self.state.event_signal.times).rescale(pq.second)).magnitude,
-                np.arange(1, len(self.state.event_signal.times)),
-            )
+        ev_mag = (
+            self.state.event_signal.rescale(pq.second).magnitude
+            if hasattr(self.state.event_signal, "rescale")
+            else np.asarray(self.state.event_signal)
+        )
+        n_ev = len(ev_mag)
+        if n_ev > 1:
+            dt = np.diff(ev_mag)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                freq_arr = np.where(dt > 0, 1.0 / dt, np.nan)
+            stimFreq_data = (freq_arr, np.arange(1, n_ev))
         else:
             stimFreq_data = (np.array([]), np.array([]))
 
         ug = self.get_target_unit()
         if ug is not None:
-            latencies = ug.get_latencies(self.state.event_signal)
-            idx_na = np.isnan(latencies)
-
-            current_spike_diffs = np.diff(latencies[~idx_na])
-            out = np.ones(latencies.shape) * np.nan
-            if len(np.where(~idx_na)[0]) > 1:
-                diffs_mag = current_spike_diffs.rescale(pq.ms).magnitude if hasattr(current_spike_diffs, "magnitude") else current_spike_diffs
-                out[np.where(~idx_na)[0][1:]] = diffs_mag
+            sr = (
+                float(self.state.sampling_rate.rescale(pq.Hz).magnitude)
+                if hasattr(self.state.sampling_rate, "rescale")
+                else float(self.state.sampling_rate or 30000.0)
+            )
+            if getattr(ug, "idx_arr", None) is not None and len(ug.idx_arr) == n_ev:
+                lat_ms = np.full(n_ev, np.nan, dtype=float)
+                for s_i, item in enumerate(ug.idx_arr):
+                    if item is not None:
+                        samp = item[0] if isinstance(item, (tuple, list)) else float(item)
+                        lat_ms[s_i] = (samp / sr) * 1000.0
+                valid_idx = np.where(~np.isnan(lat_ms))[0]
+                out = np.full(n_ev, np.nan, dtype=float)
+                if len(valid_idx) > 1:
+                    out[valid_idx[1:]] = np.diff(lat_ms[valid_idx])
+            else:
+                latencies = ug.get_latencies(self.state.event_signal)
+                idx_na = np.isnan(latencies)
+                current_spike_diffs = np.diff(latencies[~idx_na])
+                out = np.ones(latencies.shape) * np.nan
+                if len(np.where(~idx_na)[0]) > 1:
+                    diffs_mag = current_spike_diffs.rescale(pq.ms).magnitude if hasattr(current_spike_diffs, "magnitude") else current_spike_diffs
+                    out[np.where(~idx_na)[0][1:]] = diffs_mag
 
             self.right_ax_data = {
                 "Stim. Freq. (Hz)": stimFreq_data,
-                "Latency Diff.": (out, np.arange(len(latencies))),
+                "Latency Diff.": (out, np.arange(len(out))),
             }
         else:
             self.right_ax_data = {

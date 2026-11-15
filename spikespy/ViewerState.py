@@ -392,16 +392,35 @@ class ViewerState(QObject):
         self.tracking_manager = LiveTrackingManager(self)
         self.tracking_manager.spike_tracked.connect(self._on_async_spike_tracked)
 
+        from spikespy.ui_diagnostics import AdaptiveFrameScheduler, UIWatchdog
+        self.frame_scheduler = AdaptiveFrameScheduler(
+            self, base_interval_ms=self.ui_refresh_rate_ms
+        )
+        self.ui_watchdog = UIWatchdog(self, heartbeat_interval_ms=100, stall_threshold_ms=750.0)
+
     @Slot(int, int, int)
     def _on_async_spike_tracked(self, unit_idx: int, detected_sample: int, stimno: int):
-        self.setUnit(detected_sample, stimno=stimno, unit_idx=unit_idx)
+        self.setUnit(
+            detected_sample,
+            stimno=stimno,
+            unit_idx=unit_idx,
+            save_undo=not getattr(self, "is_streaming", False),
+        )
 
     def set_ui_refresh_rate_ms(self, interval_ms: int):
         self.ui_refresh_rate_ms = max(5, int(interval_ms))
+        if hasattr(self, "frame_scheduler") and self.frame_scheduler is not None:
+            self.frame_scheduler.set_base_interval_ms(self.ui_refresh_rate_ms)
         self.onUIRefreshRateChange.emit(self.ui_refresh_rate_ms)
 
     def get_ui_refresh_rate_ms(self) -> int:
         return getattr(self, "ui_refresh_rate_ms", 33)
+
+    def get_effective_refresh_rate_ms(self, view_name: str = None, weight: str = "normal") -> int:
+        if hasattr(self, "frame_scheduler") and self.frame_scheduler is not None:
+            return self.frame_scheduler.get_effective_interval_ms(view_name=view_name, weight=weight)
+        return getattr(self, "ui_refresh_rate_ms", 33)
+
     def add_channel_group(self, name: str, channels: List[str]):
         """Add or update a named channel group."""
         if not name or not channels:
@@ -713,7 +732,14 @@ class ViewerState(QObject):
     @Slot(int, int)
     @Slot(int)
     @Slot()
-    def setUnit(self, latency, stimno=None, unit_idx: Optional[int] = None, unitid: Optional[int] = None):
+    def setUnit(
+        self,
+        latency,
+        stimno=None,
+        unit_idx: Optional[int] = None,
+        unitid: Optional[int] = None,
+        save_undo: bool = True,
+    ):
         if unitid is not None:
             unit_idx = unitid
         if unit_idx is None:
@@ -733,19 +759,20 @@ class ViewerState(QObject):
         sg = self.spike_groups[unit_idx]
         evt = sg.event
 
-        def undo(
-            x=unit_idx,
-            evt=sg.event.copy(),
-            stimno=stimno,
-            self=self,
-        ):
-            evt.sort()
-            self.spike_groups[x].event = evt
-            self.update_idx_arrs()
-            self.onUnitChange.emit(stimno)
-            self.onNewSpikeEvents.emit(x)
+        if save_undo:
+            def undo(
+                x=unit_idx,
+                evt=sg.event.copy(),
+                stimno=stimno,
+                self=self,
+            ):
+                evt.sort()
+                self.spike_groups[x].event = evt
+                self.update_idx_arrs()
+                self.onUnitChange.emit(stimno)
+                self.onNewSpikeEvents.emit(x)
 
-        self.save_undo(undo)
+            self.save_undo(undo)
 
         if len(evt) > 0:
             to_keep = (evt < self.event_signal[stimno]) | (
@@ -845,6 +872,7 @@ class ViewerState(QObject):
             "latency_ms": lat_ms,
             "timestamp_s": ts_s,
             "fibre_type": str(sg.fibre_type),
+            "automated": not save_undo,
         })
 
         self.onUnitChange.emit(stimno)
@@ -1166,22 +1194,42 @@ class ViewerState(QObject):
     _peaks = None
 
     def get_peaks(self):
-        t = time.time()
         if self._peaks is not None:
             return self._peaks
-        from scipy.signal import find_peaks
 
-        dpts = self.get_erp()
-        all_pts = []
-        for d in dpts:
-            pts, _ = find_peaks(d)
-            pts_down, _ = find_peaks(-1 * d)
-            pts = np.sort(np.hstack([pts, pts_down]).flatten())
-            all_pts.append(pts)
-        self._peaks = all_pts
-        elapsed = time.time() - t
-        print(f"Finding peaks took {elapsed:.2f} seconds")
-        return all_pts
+        state_ref = self
+
+        class _LazyPeaksList(list):
+            def _compute_idx(self, idx: int):
+                from scipy.signal import find_peaks
+                dpts = state_ref.get_erp()
+                if dpts is None or idx < 0 or idx >= len(dpts):
+                    return np.empty(0, dtype=int)
+                d = dpts[idx]
+                if hasattr(d, "magnitude"):
+                    d = d.magnitude
+                d = np.asarray(d).flatten()
+                pts, _ = find_peaks(d)
+                pts_down, _ = find_peaks(-1 * d)
+                return np.sort(np.hstack([pts, pts_down]).flatten())
+
+            def __getitem__(self, index):
+                if isinstance(index, int):
+                    if index < 0:
+                        index += len(self)
+                    while len(self) <= index:
+                        super().append(None)
+                    val = super().__getitem__(index)
+                    if val is None:
+                        val = self._compute_idx(index)
+                        super().__setitem__(index, val)
+                    return val
+                return super().__getitem__(index)
+
+        erp = self.get_erp()
+        n_sweeps = len(erp) if erp is not None else 0
+        self._peaks = _LazyPeaksList([None] * n_sweeps)
+        return self._peaks
 
     def set_window_size(self, window_size):
         self.window_size = window_size * pq.ms
@@ -1370,8 +1418,12 @@ class ViewerState(QObject):
         self.is_streaming = True
         self.sampling_rate = int(sampling_rate)
         self.window_size = (window_size_ms / 1000.0) * pq.s
-        self._peaks = []
+        self._peaks = None
         self._get_erp.cache_clear()
+        if hasattr(self, "frame_scheduler") and self.frame_scheduler is not None:
+            self.frame_scheduler.reset_metrics()
+        if hasattr(self, "ui_watchdog") and self.ui_watchdog is not None:
+            self.ui_watchdog.start()
         self.onLoadNewFile.emit()
         self.onStreamStateChanged.emit(True)
 
@@ -1380,6 +1432,8 @@ class ViewerState(QObject):
         Stops the live streaming session.
         """
         self.is_streaming = False
+        if hasattr(self, "ui_watchdog") and self.ui_watchdog is not None:
+            self.ui_watchdog.stop()
         self.onStreamStateChanged.emit(False)
 
     def set_active_channel(self, channel_name_or_sig: Union[str, neo.AnalogSignal]):
@@ -1444,6 +1498,7 @@ class ViewerState(QObject):
         pre_offset_s: float = 0.0,
         spike_latencies_s: dict = None,
         aux_sweeps: dict = None,
+        emit_signals: bool = True,
     ) -> int:
         """
         Append a new stimulus sweep to the live session.
@@ -1615,19 +1670,9 @@ class ViewerState(QObject):
         if new_channels_added and hasattr(self, "onChannelGroupsChanged"):
             self.onChannelGroupsChanged.emit()
 
-        # Incrementally computes peaks (find_peaks(d) and find_peaks(-d)) for this single new sweep
-        if self._peaks is None:
-            self._peaks = []
-        from scipy.signal import find_peaks
-
-        d = primary_waveform
-        if hasattr(d, "magnitude"):
-            d = d.magnitude
-        d = np.asarray(d).flatten()
-        pts, _ = find_peaks(d)
-        pts_down, _ = find_peaks(-1 * d)
-        pts = np.sort(np.hstack([pts, pts_down]).flatten())
-        self._peaks.append(pts)
+        # Maintain lazy peak slot (computed on demand in get_peaks()[idx] only when snap navigation is used)
+        if self._peaks is not None:
+            self._peaks.append(None)
 
         # Appends None to sg.idx_arr for each sg in self.spike_groups
         for sg in self.spike_groups:
@@ -1646,11 +1691,38 @@ class ViewerState(QObject):
                     sg = self.spike_groups[key]
                     sg_idx = key
                 else:
+                    unit_name_str = str(key)
                     for idx_u, u in enumerate(self.spike_groups):
-                        if u.event.name == str(key):
+                        if u.event.name == unit_name_str:
                             sg = u
                             sg_idx = idx_u
                             break
+                    if sg is None:
+                        evt = neo.Event(
+                            np.array([], dtype=float) * pq.s,
+                            name=unit_name_str,
+                            units=pq.s,
+                        )
+                        primary_ch = getattr(self.analog_signal, "name", "CH0")
+                        neighbors = [c for c in getattr(self, "active_channel_names", []) if c != primary_ch]
+                        evt.annotations["type"] = "unit"
+                        evt.annotations["unit"] = len(self.spike_groups)
+                        evt.annotations["notes"] = ""
+                        evt.annotations["fibre_type"] = "C-fibre"
+                        evt.annotations["channel"] = primary_ch
+                        evt.annotations["neighbor_channels"] = neighbors
+                        sg = tracked_neuron_unit(
+                            event=evt,
+                            channel=primary_ch,
+                            neighbor_channels=neighbors,
+                            fibre_type="C-fibre",
+                            notes="",
+                            idx_arr=[None] * (new_stim_idx + 1),
+                        )
+                        self.spike_groups.append(sg)
+                        if self.segment is not None:
+                            self.segment.events.append(evt)
+                        sg_idx = len(self.spike_groups) - 1
                 if sg is not None and lat is not None:
                     lat_qty = (
                         lat * pq.s if not hasattr(lat, "rescale") else lat.rescale(pq.s)
@@ -1687,15 +1759,30 @@ class ViewerState(QObject):
             self.tracking_manager.track_stimulus_async(self, new_stim_idx)
 
         # Emits signals
-        self.onNewSweep.emit(new_stim_idx)
-        if self.follow_live:
-            if not hasattr(self, "_onStimNoChange_live_throttled"):
-                from spikespy.helpers import qsignal_throttle
-                self._onStimNoChange_live_throttled = qsignal_throttle(
-                    lambda: self.onStimNoChange.emit(self.stimno), 40
-                )
-            self._onStimNoChange_live_throttled()
-        self.onEventsUpdated.emit()
+        if emit_signals:
+            self.onNewSweep.emit(new_stim_idx)
+            if self.follow_live:
+                if not hasattr(self, "_onStimNoChange_live_throttled"):
+                    from spikespy.helpers import qsignal_throttle
+                    self._onStimNoChange_live_throttled = qsignal_throttle(
+                        lambda: self.onStimNoChange.emit(self.stimno),
+                        40,
+                        parent=self,
+                        weight="primary",
+                    )
+                self._onStimNoChange_live_throttled()
+            if not getattr(self, "is_streaming", False):
+                self.onEventsUpdated.emit()
+            else:
+                if not hasattr(self, "_onEventsUpdated_live_throttled"):
+                    from spikespy.helpers import qsignal_throttle
+                    self._onEventsUpdated_live_throttled = qsignal_throttle(
+                        lambda: self.onEventsUpdated.emit(),
+                        100,
+                        parent=self,
+                        weight="heavy",
+                    )
+                self._onEventsUpdated_live_throttled()
 
         return new_stim_idx
 

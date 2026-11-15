@@ -668,28 +668,50 @@ class MultiTraceView(QMainWindow):
         self.references.append(self.state.onLoadNewFile.connect(self.setup_figure))
         self.references.append(self.state.onLoadNewFile.connect(self.update_axis))
 
+        self.on_new_sweep_throttled = qsignal_throttle(
+            lambda: self.on_new_sweep(self.state.stimno),
+            40,
+            parent=self,
+            weight="heavy",
+        )
+        self.reset_right_axes_throttled = qsignal_throttle(
+            self.reset_right_axes_data,
+            250,
+            parent=self,
+            weight="heavy",
+        )
+
         def _on_unit_updated(*args):
-            self.render()
-            self.reset_right_axes_data()
+            if getattr(self.state, "is_streaming", False):
+                self._dirty = True
+            else:
+                self.render()
+                self.reset_right_axes_data()
 
         self.references.append(self.state.onUnitGroupChange.connect(_on_unit_updated))
         self.references.append(self.state.onUnitChange.connect(_on_unit_updated))
 
-        self.references.append(self.state.onStimNoChange.connect(self.update_ylim))
-        self.references.append(
-            self.state.onStimNoChange.connect(
-                lambda *args: self.plot_curstim_line(self.state.stimno)
-            )
-        )
+        def _on_stimno_changed(*args):
+            if getattr(self.state, "is_streaming", False):
+                self._dirty = True
+            else:
+                self.update_ylim(self.state.stimno)
+                self.plot_curstim_line(self.state.stimno)
+
+        self.references.append(self.state.onStimNoChange.connect(_on_stimno_changed))
 
         if hasattr(self.state, "onChannelChange"):
             self.references.append(self.state.onChannelChange.connect(self._on_channel_bar_changed))
 
         if hasattr(self.state, "onNewSweep"):
-            self.on_new_sweep_throttled = qsignal_throttle(lambda: self.on_new_sweep(self.state.stimno), 40)
             self.references.append(self.state.onNewSweep.connect(self.on_new_sweep_throttled))
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.references.append(self.state.onNewSpikeEvents.connect(lambda *args: self.render()))
+            def _on_spike_events(*args):
+                if getattr(self.state, "is_streaming", False):
+                    self._dirty = True
+                else:
+                    self.render()
+            self.references.append(self.state.onNewSpikeEvents.connect(_on_spike_events))
 
         if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
             self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
@@ -733,7 +755,7 @@ class MultiTraceView(QMainWindow):
 
     def _on_render_timer_tick(self):
         try:
-            if not self.isVisible():
+            if self.is_view_culled():
                 return
             if not getattr(self, "_dirty", False):
                 return
@@ -775,6 +797,10 @@ class MultiTraceView(QMainWindow):
         if self.is_view_culled():
             self._dirty = True
             return
+        from .helpers import run_adaptive_render
+        run_adaptive_render(self, lambda: self._on_new_sweep_core(stimno), weight="heavy")
+
+    def _on_new_sweep_core(self, stimno: int):
         self.render_count = getattr(self, "render_count", 0) + 1
         if self.state is None:
             return
@@ -858,7 +884,10 @@ class MultiTraceView(QMainWindow):
 
         self.plotter.highlight_stim(self.ax, self.state.stimno, partial=False)
         self.plot_spikegroups()
-        self.reset_right_axes_data()
+        if getattr(self.state, "is_streaming", False) and hasattr(self, "reset_right_axes_throttled"):
+            self.reset_right_axes_throttled()
+        else:
+            self.reset_right_axes_data()
         self.view.draw_idle()
 
     # @qsignal_throttle_wrapper(1000)
@@ -1042,24 +1071,44 @@ class MultiTraceView(QMainWindow):
 
     # @qsignal_throttle_wrapper(1000)
     def plot_right_axis(self):
+        active_items = [(k, v) for k, v in self.right_ax_data.items() if self.rightPlots.get(k, True)]
+        active_labels = [k for k, _ in active_items]
+
+        # Fast path: reuse existing subplots and Line2D artists when active labels match
+        if (
+            getattr(self, "_right_axis_labels", None) == active_labels
+            and len(self.ax_right) == len(active_items)
+            and len(active_items) > 0
+        ):
+            for ax, (label, data) in zip(self.ax_right, active_items):
+                x_d = data[0].magnitude if hasattr(data[0], "magnitude") else np.asarray(data[0])
+                y_d = data[1].magnitude if hasattr(data[1], "magnitude") else np.asarray(data[1])
+                if ax.lines:
+                    ax.lines[0].set_data(x_d, y_d)
+                    try:
+                        finite_x = x_d[np.isfinite(x_d)]
+                        if len(finite_x) > 0:
+                            xmin, xmax = float(np.min(finite_x)), float(np.max(finite_x))
+                            if xmin == xmax:
+                                xmin -= 1.0
+                                xmax += 1.0
+                            pad = 0.05 * (xmax - xmin)
+                            ax.set_xlim(xmin - pad, xmax + pad)
+                    except Exception:
+                        pass
+            return
+
         for ax in self.ax_right:
             ax.remove()
         self.ax_right = []
-        count_axes = len([x for x, v in self.rightPlots.items() if v])
-        # if count_axes == 0:
-        #     self.ax.set_position([0,0,1,1])
-        # TODO: when there are no plots, increase the width of the main plot to fill.
+        self._right_axis_labels = active_labels
+        count_axes = len(active_items)
 
         gs00 = matplotlib.gridspec.GridSpecFromSubplotSpec(
             1, max(count_axes, 1), subplot_spec=self.gs[0, 1]
         )
-        # plot right axes
         colorwheel = itertools.cycle(iter(["r", "g", "b", "orange", "purple", "green"]))
-        # self.fig.subfigures()
-        for i, (label, data) in enumerate(
-            [(k, v) for k, v in self.right_ax_data.items() if self.rightPlots.get(k, True)]
-        ):
-
+        for i, (label, data) in enumerate(active_items):
             self.ax_right.append(self.fig.add_subplot(gs00[0, i], sharey=self.ax))
             if i > 0:
                 self.ax_right[i].tick_params(axis="y", labelleft=False)
@@ -1068,12 +1117,6 @@ class MultiTraceView(QMainWindow):
             self.ax_right[i].set_xlabel(label)
             self.ax_right[i].xaxis.label.set_color(c)
             self.ax_right[i].tick_params(axis="y", colors=c)
-        for ax in self.ax_right:
-            try:
-                ax.draw(self.fig.canvas.get_renderer())
-            except:
-                pass
-        # self.view.draw_idle()  # TODO - this slows things down as it re-renders the image plot also.
 
     def update_ylim(self, curStim):
         if self.lock_to_stim:
@@ -1202,11 +1245,25 @@ class MultiTraceView(QMainWindow):
             if i >= len(self.state.spike_groups):
                 continue
             x_unit = self.state.spike_groups[i]
-            lats = x_unit.get_latencies(self.state.event_signal)
-            valid = ~np.isnan(lats)
-            sweeps = np.where(valid)[0]
-            lat_vals = [(float(lats[s].rescale(pq.s).magnitude) if hasattr(lats[s], "rescale") else float(lats[s])) for s in sweeps]
-            samples = np.array([int(round(lv * sr)) for lv in lat_vals], dtype=float)
+            if getattr(x_unit, "idx_arr", None) is not None and len(x_unit.idx_arr) == len(self.state.event_signal):
+                pts = [
+                    (a[0] if isinstance(a, (tuple, list)) else float(a), s_idx)
+                    for s_idx, a in enumerate(x_unit.idx_arr)
+                    if a is not None
+                ]
+                if pts:
+                    pts_arr = np.asarray(pts, dtype=float)
+                    samples = pts_arr[:, 0]
+                    sweeps = pts_arr[:, 1]
+                else:
+                    samples = np.empty(0, dtype=float)
+                    sweeps = np.empty(0, dtype=float)
+            else:
+                lats = x_unit.get_latencies(self.state.event_signal)
+                valid = ~np.isnan(lats)
+                sweeps = np.where(valid)[0]
+                lat_vals = [(float(lats[s].rescale(pq.s).magnitude) if hasattr(lats[s], "rescale") else float(lats[s])) for s in sweeps]
+                samples = np.array([int(round(lv * sr)) for lv in lat_vals], dtype=float)
 
             is_cur = (i == target_unit_idx)
             c = "red" if is_cur else colors[i % len(colors)]

@@ -27,6 +27,7 @@ import pyqtgraph as pg
 
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
+from .helpers import run_adaptive_render
 
 
 def _get_mpl_lut(name: str = "RdBu_r", n: int = 256) -> np.ndarray:
@@ -187,7 +188,7 @@ class UnitFootprintPGView(QMainWindow):
             if self.is_view_culled() or not getattr(self, "_dirty", False):
                 return
             self._dirty = False
-            self._do_update_plot()
+            run_adaptive_render(self, self._do_update_plot, weight="normal")
         except RuntimeError:
             pass
 

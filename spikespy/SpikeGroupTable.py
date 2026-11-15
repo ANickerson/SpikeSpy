@@ -197,9 +197,16 @@ class SpikeGroupTableView(QWidget):
             if self.is_view_culled() or not getattr(self, "_dirty", False):
                 return
             self._dirty = False
-            self._do_update_core()
+            from .helpers import run_adaptive_render
+            run_adaptive_render(self, self._do_update_core, weight="heavy")
         except RuntimeError:
             pass
+
+    def schedule_update(self, *args):
+        if self.state is not None and not getattr(self.state, "is_streaming", False):
+            self.update()
+        else:
+            self._dirty = True
 
     def setVisible(self, visible: bool):
         if not visible:
@@ -224,12 +231,13 @@ class SpikeGroupTableView(QWidget):
             self._dirty = False
             self._do_update_core()
 
-    def update(self):
+    def update(self, *args):
         if self.is_view_culled():
             self._dirty = True
             return
         self._dirty = False
-        self._do_update_core()
+        from .helpers import run_adaptive_render
+        run_adaptive_render(self, self._do_update_core, weight="heavy")
 
     def _do_update_core(self):
         if self.is_view_culled():
@@ -361,6 +369,12 @@ class SpikeGroupTableModel(QAbstractTableModel):
     def update(self):
         self.modelAboutToBeReset.emit()
         self.spikegroups = self.spikegroups_func()
+        self._row_windows = {}
+        for idx, sg in enumerate(self.spikegroups or []):
+            try:
+                self._row_windows[idx] = sg.get_window()
+            except Exception:
+                self._row_windows[idx] = None
         self.modelReset.emit()
 
     def data(
@@ -404,9 +418,11 @@ class SpikeGroupTableModel(QAbstractTableModel):
             if column == 0:  # name / SpikeID
                 return getattr(sg.event, "name", None) or row
             elif column in (1, 2):  # start/end
-                if sg.get_window() is None:
+                row_wins = getattr(self, "_row_windows", None)
+                win = row_wins.get(row) if row_wins is not None and row in row_wins else sg.get_window()
+                if win is None:
                     return ""
-                return sg.get_window()[column - 1]
+                return win[column - 1]
             elif column == 3:  # N (number of events)
                 if hasattr(sg, "event") and sg.event is not None and len(sg.event) > 0:
                     return len(sg.event)

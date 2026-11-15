@@ -62,7 +62,7 @@ class MultiTraceFixedView(QMatplotlib):
             return
 
         ug_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else getattr(self.state, "cur_spike_group", 0)
-        ug_spikes = len(self.state.spike_groups[ug_idx].idx_arr) if (self.state.spike_groups and 0 <= ug_idx < len(self.state.spike_groups) and getattr(self.state.spike_groups[ug_idx], "idx_arr", None) is not None) else 0
+        ug_spikes = len(self.state.spike_groups[ug_idx].event) if (self.state.spike_groups and 0 <= ug_idx < len(self.state.spike_groups) and getattr(self.state.spike_groups[ug_idx], "event", None) is not None) else 0
         primary_ch = self.channel_bar.get_primary_channel() if hasattr(self, "channel_bar") else getattr(getattr(self.state, "analog_signal", None), "name", "")
         erp = self.state.get_channel_erp(primary_ch) if hasattr(self.state, "get_channel_erp") else self.state.get_erp()
         n_sweeps = len(erp) if erp is not None else 0
@@ -71,7 +71,20 @@ class MultiTraceFixedView(QMatplotlib):
             return
         self._last_render_key = render_key
 
-        super().update_figure(should_clear=should_clear)
+        from .helpers import run_adaptive_render
+
+        def _do_draw():
+            if should_clear:
+                self.figure.clear()
+                self.setup_figure()
+            if self.draw_figure() is False:
+                return
+            if getattr(self.state, "is_streaming", False):
+                self.canvas.draw_idle()
+            else:
+                self.canvas.draw()
+
+        run_adaptive_render(self, _do_draw, weight="heavy")
 
     def setVisible(self, visible: bool):
         super().setVisible(visible)
@@ -102,18 +115,27 @@ class MultiTraceFixedView(QMatplotlib):
         if hasattr(self, "channel_bar"):
             self.channel_bar.setState(state)
         self.unsetCons()
-        con = self.state.onStimNoChange.connect(lambda x: self.update_figure())
+        from spikespy.helpers import qsignal_throttle
+        self._throttled_update = qsignal_throttle(
+            self.update_figure, 50, parent=self, weight="heavy"
+        )
+
+        def _on_live_or_direct(*args):
+            if getattr(self.state, "is_streaming", False):
+                self._throttled_update()
+            else:
+                self.update_figure()
+
+        con = self.state.onStimNoChange.connect(_on_live_or_direct)
         self.connections.append(con)
         if hasattr(self.state, "onChannelChange"):
             con_ch = self.state.onChannelChange.connect(lambda *args: self.update_figure())
             self.connections.append(con_ch)
         if hasattr(self.state, "onNewSweep"):
-            from spikespy.helpers import qsignal_throttle
-            self._throttled_update = qsignal_throttle(self.update_figure, 40)
             con2 = self.state.onNewSweep.connect(lambda *args: self._throttled_update())
             self.connections.append(con2)
         if hasattr(self.state, "onNewSpikeEvents"):
-            con3 = self.state.onNewSpikeEvents.connect(lambda *args: self.update_figure())
+            con3 = self.state.onNewSpikeEvents.connect(_on_live_or_direct)
             self.connections.append(con3)
         self.set_scale_setting()
 

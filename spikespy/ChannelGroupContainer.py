@@ -281,7 +281,12 @@ class ChannelGroupContainerView(QMainWindow):
 
     def _on_new_sweep_core(self, stimno: Optional[int] = None):
         if self.is_following_live():
-            self._sync_all_children()
+            avail = tuple(self.state.get_available_channels()) if (self.state and hasattr(self.state, "get_available_channels")) else ()
+            n_units = len(self.state.spike_groups) if (self.state and hasattr(self.state, "spike_groups")) else 0
+            sig = (avail, n_units, self.channel_bar.get_bound_unit())
+            if getattr(self, "_last_live_sync_sig", None) != sig:
+                self._last_live_sync_sig = sig
+                self._sync_all_children()
 
     def _on_new_sweep(self, stimno: Optional[int] = None):
         if hasattr(self, "_on_new_sweep_throttled"):

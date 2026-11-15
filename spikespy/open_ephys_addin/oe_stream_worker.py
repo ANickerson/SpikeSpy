@@ -582,16 +582,21 @@ class OpenEphysStreamWorker(QThread):
             sample_num = evt.get("sample_number", evt.get("sample_num", int(time.time() * self.sample_rate)))
             spike_ts = float(evt.get("timestamp", sample_num / self.sample_rate))
             self._spikes_count += 1
-            self.spikeEventsReady.emit(unit_name, np.array([spike_ts]))
 
-            # If there is a pending sweep covering sample_num, record spike latency
+            # If there is a pending sweep covering sample_num, record spike latency directly on the sweep
+            # so it is delivered atomically with sweepReady instead of flooding the GUI event loop.
+            matched_pending = False
             with self._pending_lock:
                 for sweep in self._pending_sweeps:
                     start_s = sweep.stim_sample - sweep.pre_samples
                     end_s = sweep.stim_sample + sweep.window_samples
                     if start_s <= sample_num <= end_s:
+                        matched_pending = True
                         if unit_name not in sweep.spike_latencies:
                             sweep.spike_latencies[unit_name] = (sample_num - sweep.stim_sample) / self.sample_rate
+
+            if not matched_pending:
+                self.spikeEventsReady.emit(unit_name, np.array([spike_ts]))
 
         # 3. Protocol / MessageCenter text event (e.g. APTrack stimulus protocol, setStimVoltage)
         elif evt_type in ("message", "text", "protocol") or "text" in evt:

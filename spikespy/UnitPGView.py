@@ -16,7 +16,7 @@ import pyqtgraph as pg
 
 from .ViewerState import ViewerState
 from .ChannelGroupBar import ChannelGroupBar
-from .helpers import qsignal_throttle
+from .helpers import qsignal_throttle, run_adaptive_render
 
 
 class UnitPGView(QMainWindow):
@@ -99,8 +99,28 @@ class UnitPGView(QMainWindow):
         if self.state is None:
             return
 
-        self.connections.append(self.state.onStimNoChange.connect(self.update_curstim_line))
-        self.connections.append(self.state.onUnitChange.connect(self.update_all))
+        self.connections.append(
+            self.state.onStimNoChange.connect(
+                lambda x: (
+                    self.on_new_sweep_throttled()
+                    if getattr(self.state, "is_streaming", False)
+                    else self.update_curstim_line(x)
+                )
+            )
+        )
+        self.connections.append(
+            self.state.onUnitChange.connect(
+                lambda *args: (
+                    self.on_new_sweep_throttled()
+                    if (
+                        getattr(self.state, "is_streaming", False)
+                        and getattr(self.state, "frame_scheduler", None) is not None
+                        and self.state.frame_scheduler.should_skip_nonessential_work()
+                    )
+                    else self.update_all()
+                )
+            )
+        )
         self.connections.append(self.state.onUnitGroupChange.connect(self.update_all))
         self.connections.append(self.state.onLoadNewFile.connect(self.update_all))
         if hasattr(self.state, "onChannelChange"):
@@ -151,7 +171,7 @@ class UnitPGView(QMainWindow):
             self.update_all()
 
     def _on_new_sweep_core(self, *args):
-        self.update_all()
+        run_adaptive_render(self, self.update_all, weight="normal", base_interval_ms=50.0)
 
     def on_new_sweep(self, *args):
         if hasattr(self, "on_new_sweep_throttled"):
@@ -215,9 +235,19 @@ class UnitPGView(QMainWindow):
             return
 
         idx_arr_list = list(idx_arr)
-        for i, idx, d in zip(range(len(sig_erp)), idx_arr_list, sig_erp):
+        n_erp = min(len(sig_erp), len(idx_arr_list))
+        if getattr(self.state, "is_streaming", False) and n_erp > 100:
+            sweep_indices = list(range(n_erp - 100, n_erp))
+            if 0 <= self.state.stimno < n_erp and self.state.stimno not in sweep_indices:
+                sweep_indices.append(self.state.stimno)
+        else:
+            sweep_indices = range(n_erp)
+
+        for i in sweep_indices:
+            idx = idx_arr_list[i]
             if idx is None:
                 continue
+            d = sig_erp[i]
 
             xmin = idx[0] - self.w
             xmax = idx[0] + self.w
