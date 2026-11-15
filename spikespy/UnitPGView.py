@@ -16,7 +16,7 @@ import pyqtgraph as pg
 
 from .ViewerState import ViewerState
 from .ChannelGroupBar import ChannelGroupBar
-from .helpers import qsignal_throttle, quiet_fail
+from .helpers import qsignal_throttle, quiet_fail, run_adaptive_render
 from .live_orchestrator import LiveFrameConsumerMixin
 from .viewer_worker import get_task_manager, TaskType, TaskPriority
 
@@ -241,7 +241,7 @@ class UnitPGView(LiveFrameConsumerMixin, QMainWindow):
             if self.state is not None:
                 self._dirty = True
             return
-        self._schedule_update_all()
+        run_adaptive_render(self, self._schedule_update_all, weight="normal", base_interval_ms=50.0)
 
     def on_new_sweep(self, *args):
         if hasattr(self, "on_new_sweep_throttled"):

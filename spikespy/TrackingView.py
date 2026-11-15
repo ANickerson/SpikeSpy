@@ -27,6 +27,7 @@ from .basic_tracking import track_basic, track_sweep_waveform
 from .dsp.detectors import DetectorParamSpec, SpikeDetectorRegistry
 from .ViewerState import ViewerState
 from .live_orchestrator import BatchingMode
+from .helpers import qsignal_throttle
 from neo import Event
 
 _CORE_PARAM_NAMES = {"window_ms", "window_size", "threshold", "max_skip", "track_limit"}
@@ -155,6 +156,8 @@ class TrackingView(QMainWindow):
         self.qsb_track_limit.valueChanged.connect(self._on_params_changed)
         self.qcb_auto_track.toggled.connect(self._on_params_changed)
 
+        self._sync_throttled = qsignal_throttle(self.sync_from_active_unit, 200, parent=self, weight="heavy")
+
         if state is not None:
             self.set_state(state)
 
@@ -171,7 +174,10 @@ class TrackingView(QMainWindow):
     @Slot(int)
     @Slot(int, int)
     def _on_state_unit_sync(self, *args):
-        self.sync_from_active_unit()
+        if self.state is not None and getattr(self.state, "is_streaming", False):
+            self._sync_throttled()
+        else:
+            self.sync_from_active_unit()
 
     def set_state(self, state: ViewerState):
         self.unset_connections()
@@ -306,6 +312,12 @@ class TrackingView(QMainWindow):
 
     def updateView(self):
         self.sync_from_active_unit()
+
+    def _on_unit_updated(self, *args):
+        if self.state is not None and getattr(self.state, "is_streaming", False):
+            self._sync_throttled()
+        else:
+            self.sync_from_active_unit()
 
     def sync_from_active_unit(self):
         if self._updating_ui or self.state is None:
@@ -479,6 +491,11 @@ class TrackingView(QMainWindow):
 
     def on_new_sweep(self, stimno: int):
         if self.state is None:
+            return
+        # ViewerState.append_sweep already dispatches background tracking on QThreadPool.
+        # Under UI strain, skip duplicate synchronous main-thread tracking.
+        sched = getattr(self.state, "frame_scheduler", None)
+        if sched is not None and sched.should_skip_nonessential_work():
             return
         self.state.track_stimulus_all_units(stimno)
 

@@ -7,13 +7,15 @@ and live stream diagnostics.
 
 from __future__ import annotations
 
+from collections import deque
+import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 import numpy as np
 import quantities as pq
 from neo import AnalogSignal, Event, Segment
-from PySide6.QtCore import Qt, Slot
+from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -55,6 +57,18 @@ class OpenEphysLiveView(QWidget):
         self.controller: Optional[OpenEphysController] = None
         self._demo_server_process = None
         self._is_streaming = False
+
+        self._sweep_queue: Deque[Dict[str, Any]] = deque(maxlen=256)
+        self._sweep_drain_timer = QTimer(self)
+        self._sweep_drain_timer.setSingleShot(True)
+        self._sweep_drain_timer.setInterval(0)
+        self._sweep_drain_timer.timeout.connect(self._drain_sweep_queue)
+
+        self._perf_timer = QTimer(self)
+        self._perf_timer.setInterval(500)
+        self._perf_timer.timeout.connect(self._update_perf_diagnostics)
+        self._perf_timer.start()
+        self._last_synced_annotation_key = None
 
         self._init_ui()
         self._init_controller()
@@ -208,11 +222,14 @@ class OpenEphysLiveView(QWidget):
         self.lbl_sweeps_count = QLabel("0")
         self.lbl_spikes_count = QLabel("0")
         self.lbl_stim_freq = QLabel("0.0 Hz")
+        self.lbl_ui_perf = QLabel("Normal (0.0 ms lag)")
+        self.lbl_ui_perf.setStyleSheet("color: #2b7a2b;")
 
         diag_layout.addRow("Status:", self.lbl_status)
         diag_layout.addRow("Sweeps Received:", self.lbl_sweeps_count)
         diag_layout.addRow("Spikes Detected:", self.lbl_spikes_count)
         diag_layout.addRow("Stimulus Frequency:", self.lbl_stim_freq)
+        diag_layout.addRow("UI Strain / Loop Lag:", self.lbl_ui_perf)
 
         # Demo stream parameter controls
         self.spin_demo_stim_freq = QDoubleSpinBox()
@@ -239,6 +256,10 @@ class OpenEphysLiveView(QWidget):
         self.btn_start_demo.setStyleSheet("background-color: #2b5c8f; color: white; font-weight: bold; padding: 6px;")
         self.btn_start_demo.clicked.connect(self.start_demo_stream)
         diag_layout.addRow(self.btn_start_demo)
+
+        self.btn_dump_diag = QPushButton("Show UI Performance & Freeze Diagnostics")
+        self.btn_dump_diag.clicked.connect(self._show_ui_diagnostics_dialog)
+        diag_layout.addRow(self.btn_dump_diag)
 
         main_layout.addWidget(diag_group)
         main_layout.addStretch()
@@ -520,7 +541,35 @@ class OpenEphysLiveView(QWidget):
 
     @Slot(dict)
     def _on_sweep_ready(self, payload: Dict[str, Any]):
-        """Handler for newly sliced sweep."""
+        """Handler for newly sliced sweep.
+
+        If multiple sweeps queue up while the GUI thread is busy rendering multiple windows,
+        they are drained in a batch where intermediate sweeps skip redundant UI signal emissions.
+        """
+        self._sweep_queue.append(payload)
+        if len(self._sweep_queue) == 1 and not self._sweep_drain_timer.isActive():
+            # Process first sweep immediately if not already in a drain batch
+            self._drain_sweep_queue()
+        elif not self._sweep_drain_timer.isActive():
+            self._sweep_drain_timer.start(0)
+
+    def _drain_sweep_queue(self):
+        if not self._sweep_queue:
+            return
+        # Drain up to 16 queued sweeps per event-loop slice so we never starve OS messages
+        batch: List[Dict[str, Any]] = []
+        while self._sweep_queue and len(batch) < 16:
+            batch.append(self._sweep_queue.popleft())
+
+        n_batch = len(batch)
+        for idx, payload in enumerate(batch):
+            is_last = (idx == n_batch - 1) and (len(self._sweep_queue) == 0)
+            self._process_single_sweep_payload(payload, emit_signals=is_last)
+
+        if self._sweep_queue and not self._sweep_drain_timer.isActive():
+            self._sweep_drain_timer.start(5)
+
+    def _process_single_sweep_payload(self, payload: Dict[str, Any], emit_signals: bool = True):
         waveform = payload["waveform"]
         stim_ts = payload["stim_timestamp_s"]
         pre_offset_s = payload.get("pre_offset_s", 0.0)
@@ -539,13 +588,23 @@ class OpenEphysLiveView(QWidget):
                     aux_channels=[f"CH{c}" for c in active_chans],
                 )
             self.state.follow_live = self.chk_follow_live.isChecked()
-            self.state.append_sweep(
-                stim_timestamp=stim_ts,
-                sweep_waveform=waveform,
-                pre_offset_s=pre_offset_s,
-                spike_latencies_s=spikes,
-                aux_sweeps=aux_sweeps,
-            )
+            try:
+                self.state.append_sweep(
+                    stim_timestamp=stim_ts,
+                    sweep_waveform=waveform,
+                    pre_offset_s=pre_offset_s,
+                    spike_latencies_s=spikes,
+                    aux_sweeps=aux_sweeps,
+                    emit_signals=emit_signals,
+                )
+            except TypeError:
+                self.state.append_sweep(
+                    stim_timestamp=stim_ts,
+                    sweep_waveform=waveform,
+                    pre_offset_s=pre_offset_s,
+                    spike_latencies_s=spikes,
+                    aux_sweeps=aux_sweeps,
+                )
         else:
             if self.state.analog_signal is None or len(self.state.event_signal or []) == 0:
                 asig = AnalogSignal(waveform, pq.uV, sampling_rate=sample_rate * pq.Hz, name="CH1")
@@ -561,7 +620,7 @@ class OpenEphysLiveView(QWidget):
             for unit_name, lat_s in spikes.items():
                 self._append_spike_to_state(unit_name, stim_ts + lat_s)
 
-            if self.chk_follow_live.isChecked() and self.state.event_signal is not None:
+            if emit_signals and self.chk_follow_live.isChecked() and self.state.event_signal is not None:
                 total_sweeps = len(self.state.event_signal)
                 if total_sweeps > 0 and self.state.stimno != total_sweeps - 1:
                     self.state.setStimNo(total_sweeps - 1)
@@ -652,6 +711,75 @@ class OpenEphysLiveView(QWidget):
         freq = stats.get("last_stim_freq_hz", 0.0)
         self.lbl_stim_freq.setText(f"{freq:.2f} Hz")
 
+    @Slot()
+    def _update_perf_diagnostics(self):
+        watchdog = getattr(self.state, "ui_watchdog", None)
+        scheduler = getattr(self.state, "frame_scheduler", None)
+        lag_ms = watchdog.ema_loop_lag_ms if watchdog is not None else 0.0
+        if scheduler is not None and watchdog is not None:
+            scheduler.update_loop_lag(lag_ms)
+
+        strain = scheduler.strain_level if scheduler is not None else 0.0
+        render_ms = scheduler.ema_total_render_ms if scheduler is not None else 0.0
+        eff_ms = scheduler.get_effective_interval_ms(weight="heavy") if scheduler is not None else 33
+
+        if strain >= 1.5 or lag_ms >= 80.0:
+            self.lbl_ui_perf.setText(
+                f"High Strain (render {render_ms:.1f}ms, lag {lag_ms:.0f}ms, throttle {eff_ms}ms)"
+            )
+            self.lbl_ui_perf.setStyleSheet("color: #d9534f; font-weight: bold;")
+        elif strain >= 0.4 or lag_ms >= 30.0:
+            self.lbl_ui_perf.setText(
+                f"Moderate Load (render {render_ms:.1f}ms, lag {lag_ms:.0f}ms, throttle {eff_ms}ms)"
+            )
+            self.lbl_ui_perf.setStyleSheet("color: #d9822b; font-weight: bold;")
+        else:
+            self.lbl_ui_perf.setText(f"Normal (render {render_ms:.1f}ms, lag {lag_ms:.1f}ms)")
+            self.lbl_ui_perf.setStyleSheet("color: #2b7a2b;")
+
+    @Slot()
+    def _show_ui_diagnostics_dialog(self):
+        scheduler = getattr(self.state, "frame_scheduler", None)
+        watchdog = getattr(self.state, "ui_watchdog", None)
+        summary = scheduler.get_diagnostics_summary() if scheduler is not None else {}
+        reports = watchdog.reports if watchdog is not None else []
+
+        lines = [
+            f"Base Refresh Interval: {summary.get('base_interval_ms', 33)} ms",
+            f"Current Strain Level: {summary.get('strain_level', 0.0)}",
+            f"EMA Frame Render Time: {summary.get('ema_total_render_ms', 0.0)} ms",
+            f"Event Loop Lag (EMA / Max): "
+            f"{watchdog.ema_loop_lag_ms:.1f} ms / {watchdog.max_loop_lag_ms:.1f} ms"
+            if watchdog is not None
+            else "Event Loop Watchdog: inactive",
+            f"Queued Sweeps Backlog: {len(self._sweep_queue)}",
+            "",
+            "--- Per-View Render Timings (Slowest First) ---",
+        ]
+        views = summary.get("views", {})
+        if views:
+            for vname, vinfo in views.items():
+                lines.append(
+                    f"  {vname} [{vinfo['weight']}]: EMA {vinfo['ema_ms']} ms "
+                    f"(last {vinfo['last_ms']} ms, n={vinfo['count']}) -> interval {vinfo['effective_interval_ms']} ms"
+                )
+        else:
+            lines.append("  (No view renders recorded yet)")
+
+        lines.append("")
+        lines.append(f"--- Detected Freeze / Stall Reports ({len(reports)}) ---")
+        if reports:
+            for idx, r in enumerate(reports[-3:], 1):
+                lines.append(f"\n[Stall #{idx}: {r.duration_ms:.0f} ms]\n{r.stack_trace}")
+        else:
+            lines.append("  No main-thread freezes (>750 ms) detected.")
+
+        QMessageBox.information(
+            self,
+            "SpikeSpy UI Performance & Freeze Diagnostics",
+            "\n".join(lines),
+        )
+
     @Slot(bool, str)
     def _on_connection_status_changed(self, connected: bool, message: str):
         if connected:
@@ -728,7 +856,18 @@ class OpenEphysLiveView(QWidget):
 
     @Slot(dict)
     def _on_unit_annotated(self, annotation_info: Dict[str, Any]):
-        if self.chk_sync_annotations.isChecked():
+        if not self.chk_sync_annotations.isChecked():
+            return
+        dedup_key = (
+            annotation_info.get("unit_idx", annotation_info.get("unit")),
+            annotation_info.get("stimno"),
+            annotation_info.get("latency_samples"),
+        )
+        self._last_synced_annotation_key = dedup_key
+        is_automated = bool(annotation_info.get("automated", False))
+        if self._is_streaming and is_automated and hasattr(self.controller, "sync_unit_annotation_async"):
+            self.controller.sync_unit_annotation_async(annotation_info)
+        else:
             self.controller.sync_unit_annotation(annotation_info)
 
     @Slot(int)
@@ -749,21 +888,27 @@ class OpenEphysLiveView(QWidget):
 
         latency_samples = None
         latency_ms = None
-        if self.state.event_signal is not None and stimno < len(self.state.event_signal) and hasattr(sg, "get_latencies"):
+        if getattr(sg, "idx_arr", None) is not None and 0 <= stimno < len(sg.idx_arr):
+            item = sg.idx_arr[stimno]
+            if item is not None:
+                latency_samples = item[0] if isinstance(item, (tuple, list)) else int(item)
+                latency_ms = (latency_samples / sr) * 1000.0
+        elif self.state.event_signal is not None and stimno < len(self.state.event_signal) and hasattr(sg, "get_latencies"):
             cur_ev = self.state.event_signal[stimno]
             lat = sg.get_latencies(np.array([cur_ev.magnitude]) * cur_ev.units)[0]
             if not np.isnan(lat):
                 sec = float(lat.rescale(pq.s).magnitude) if hasattr(lat, "rescale") else float(lat)
                 latency_samples = int(round(sec * sr))
                 latency_ms = float(lat.rescale(pq.ms).magnitude) if hasattr(lat, "rescale") else (sec * 1000.0)
-        elif getattr(sg, "idx_arr", None) is not None and stimno < len(sg.idx_arr):
-            item = sg.idx_arr[stimno]
-            if item is not None:
-                latency_samples = item[0]
-                latency_ms = (latency_samples / sr) * 1000.0
 
         if latency_samples is None:
             return
+
+        dedup_key = (self.state.cur_spike_group, int(stimno), int(latency_samples))
+        if dedup_key == self._last_synced_annotation_key:
+            # Already handled by _on_unit_annotated from the same setUnit() call
+            return
+        self._last_synced_annotation_key = dedup_key
 
         channel = getattr(sg, "channel", "") or getattr(
             self.state.analog_signal, "name", f"CH{self.spin_rec_chan.value()}"
@@ -779,9 +924,15 @@ class OpenEphysLiveView(QWidget):
             "channel": channel,
             "neighbor_channels": neighbor_channels,
         }
-        self.controller.sync_unit_annotation(info)
+        if self._is_streaming and hasattr(self.controller, "sync_unit_annotation_async"):
+            self.controller.sync_unit_annotation_async(info)
+        else:
+            self.controller.sync_unit_annotation(info)
 
     def closeEvent(self, event):
+        self._perf_timer.stop()
+        self._sweep_drain_timer.stop()
+        self._sweep_queue.clear()
         self.stop_stream()
         if self._demo_server_process is not None:
             self._demo_server_process.stop()

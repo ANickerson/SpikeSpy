@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional
 
 from PySide6.QtCore import QObject, Signal, Slot
 
@@ -35,7 +38,7 @@ class OpenEphysController(QObject):
         host: str = "127.0.0.1",
         port: int = 37497,
         parent: Optional[QObject] = None,
-        timeout: float = 2.0,
+        timeout: float = 0.5,
     ) -> None:
         super().__init__(parent)
         self.host = host
@@ -43,6 +46,12 @@ class OpenEphysController(QObject):
         self.timeout = timeout
         self.target_processor_id: Optional[int] = None
         self._last_status: str = "DISCONNECTED"
+        self._last_failure_ts: float = 0.0
+        self._failure_backoff_s: float = 2.0
+
+        self._async_queue: Deque[Dict[str, Any]] = deque(maxlen=16)
+        self._async_lock = threading.Lock()
+        self._async_worker_running = False
 
     @property
     def base_url(self) -> str:
@@ -53,6 +62,7 @@ class OpenEphysController(QObject):
         method: str,
         path: str,
         payload: Optional[Dict[str, Any]] = None,
+        timeout_override: Optional[float] = None,
     ) -> tuple[int, Any]:
         """Perform an HTTP request to the Open Ephys server."""
         url = f"{self.base_url}{path}"
@@ -63,18 +73,20 @@ class OpenEphysController(QObject):
         }
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
-            headers["Content-Type"] = "application/json"
+            headers["Content-Type": "application/json"] if False else headers.__setitem__("Content-Type", "application/json")
 
+        req_timeout = timeout_override if timeout_override is not None else self.timeout
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             if self.host in ("127.0.0.1", "localhost", "::1"):
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                resp_ctx = opener.open(req, timeout=self.timeout)
+                resp_ctx = opener.open(req, timeout=req_timeout)
             else:
-                resp_ctx = urllib.request.urlopen(req, timeout=self.timeout)
+                resp_ctx = urllib.request.urlopen(req, timeout=req_timeout)
             with resp_ctx as resp:
                 status_code = resp.status
                 body = resp.read().decode("utf-8")
+                self._last_failure_ts = 0.0
                 if body:
                     try:
                         return status_code, json.loads(body)
@@ -86,6 +98,7 @@ class OpenEphysController(QObject):
             logger.warning("HTTPError %d for %s %s: %s", e.code, method, url, err_body)
             return e.code, {"error": str(e), "body": err_body}
         except Exception as e:
+            self._last_failure_ts = time.monotonic()
             logger.debug("Request failed for %s %s: %s", method, url, e)
             return -1, {"error": str(e)}
 
@@ -241,3 +254,37 @@ class OpenEphysController(QObject):
             self.send_processor_config(self.target_processor_id, msg)
 
         return ok
+
+    def sync_unit_annotation_async(self, annotation_info: Dict[str, Any]) -> None:
+        """Queue a unit annotation to be sent on a background worker thread without blocking the GUI."""
+        if (time.monotonic() - self._last_failure_ts) < self._failure_backoff_s:
+            return
+        with self._async_lock:
+            self._async_queue.append(dict(annotation_info))
+            if not self._async_worker_running:
+                self._async_worker_running = True
+                t = threading.Thread(
+                    target=self._drain_async_annotations,
+                    name="SpikeSpy-OEHttpSync",
+                    daemon=True,
+                )
+                t.start()
+
+    def _drain_async_annotations(self) -> None:
+        while True:
+            with self._async_lock:
+                if not self._async_queue:
+                    self._async_worker_running = False
+                    return
+                # Coalesce bursts to the latest queued annotation per unit
+                info = self._async_queue.popleft()
+            if (time.monotonic() - self._last_failure_ts) < self._failure_backoff_s:
+                with self._async_lock:
+                    self._async_queue.clear()
+                    self._async_worker_running = False
+                return
+            try:
+                self.sync_unit_annotation(info)
+            except Exception:
+                pass
+

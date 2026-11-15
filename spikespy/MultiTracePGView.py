@@ -519,15 +519,21 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
     @Slot()
     @Slot(int)
     def _on_stim_no_changed(self, stimno: int = -1):
-        target = self.state.stimno if stimno < 0 and self.state is not None else stimno
-        if target is not None:
-            self.update_ylim(target)
-            self.plot_curstim_line(target)
+        if getattr(self.state, "is_streaming", False):
+            self.on_new_sweep_throttled()
+        else:
+            target = self.state.stimno if stimno < 0 and self.state is not None else stimno
+            if target is not None:
+                self.update_ylim(target)
+                self.plot_curstim_line(target)
 
     @Slot()
     @Slot(int)
     def _on_new_spike_events(self, *args):
-        self._schedule_spike_group_update()
+        if getattr(self.state, "is_streaming", False):
+            self.on_new_sweep_throttled()
+        else:
+            self._schedule_spike_group_update()
 
     def set_state(self, state: ViewerState):
         self.unset_connections()
@@ -556,19 +562,37 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             name="reload_setup",
         )
 
-        self._connect_state(self.state.onUnitGroupChange, self._on_unit_updated)
-        self._connect_state(self.state.onUnitChange, self._on_unit_updated)
+        self.on_new_sweep_throttled = qsignal_throttle(
+            lambda: self.on_new_sweep(self.state.stimno if self.state else 0),
+            40,
+            parent=self,
+            weight="primary",
+        )
+        self.reset_right_axes_throttled = qsignal_throttle(
+            self.reset_right_axes_data,
+            200,
+            parent=self,
+            weight="heavy",
+        )
 
+        def _on_unit_updated(*args):
+            if getattr(self.state, "is_streaming", False):
+                self.on_new_sweep_throttled()
+            else:
+                self.render()
+                self._schedule_right_axis_update(force=True)
+
+        self._connect_state(self.state.onUnitGroupChange, _on_unit_updated)
+        self._connect_state(self.state.onUnitChange, _on_unit_updated)
         self._connect_state(self.state.onStimNoChange, self._on_stim_no_changed)
 
         if hasattr(self.state, "onChannelChange"):
             self._connect_state(self.state.onChannelChange, self._on_channel_change)
 
-        if hasattr(self.state, "onNewSweep"):
-            self.on_new_sweep_throttled = qsignal_throttle(lambda: self.on_new_sweep(self.state.stimno if self.state else 0), 40)
         # Live sweeps arrive through the state's LiveOrchestrator (LIFO);
         # the GUI-side throttle keeps render scheduling rate-limited.
-        self._register_live_frames(state, lambda _stimno: self.on_new_sweep_throttled())
+        if hasattr(self.state, "onNewSweep"):
+            self._register_live_frames(state, lambda _stimno: self.on_new_sweep_throttled())
         if hasattr(self.state, "onNewSpikeEvents"):
             self._connect_state(self.state.onNewSpikeEvents, self._on_new_spike_events)
 
@@ -584,7 +608,10 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             return
         if self.state is None:
             return
+        from .helpers import run_adaptive_render
+        run_adaptive_render(self, lambda: self._on_new_sweep_core(stimno), weight="primary")
 
+    def _on_new_sweep_core(self, stimno: Optional[int] = None):
         live_buf = self.get_live_buffer()
         if live_buf is not None and len(live_buf) > 0:
             erp = live_buf.data
@@ -1054,14 +1081,9 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
                 pass
         self.legend_items.clear()
 
-        for scat in self.other_unit_scatters:
-            try:
-                self.main_plot.removeItem(scat)
-            except Exception:
-                pass
-        self.other_unit_scatters.clear()
-
         target_unit_idx = self.get_target_unit_idx()
+        show_legend = hasattr(self, "showLegend") and self.showLegend.isChecked()
+        other_idx = 0
 
         # 1. Other Units (only if "Others" checkbox is checked)
         if self.includeAllUnitsCheckBox.isChecked():
@@ -1074,23 +1096,40 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
                 pts_arr = np.array(points)
                 c = SET2_COLORS[i % len(SET2_COLORS)]
 
-                scat = pg.ScatterPlotItem(
-                    x=pts_arr[:, 0],
-                    y=pts_arr[:, 1],
-                    size=8,
-                    symbol="s",
-                    pen=None,
-                    brush=pg.mkBrush(*c, 200),
-                )
-                self.main_plot.addItem(scat)
-                self.other_unit_scatters.append(scat)
+                if other_idx < len(self.other_unit_scatters):
+                    scat = self.other_unit_scatters[other_idx]
+                    scat.setData(
+                        x=pts_arr[:, 0],
+                        y=pts_arr[:, 1],
+                        size=8,
+                        symbol="s",
+                        pen=None,
+                        brush=pg.mkBrush(*c, 200),
+                    )
+                    scat.setVisible(True)
+                else:
+                    scat = pg.ScatterPlotItem(
+                        x=pts_arr[:, 0],
+                        y=pts_arr[:, 1],
+                        size=8,
+                        symbol="s",
+                        pen=None,
+                        brush=pg.mkBrush(*c, 200),
+                    )
+                    self.main_plot.addItem(scat)
+                    self.other_unit_scatters.append(scat)
+                other_idx += 1
 
-                if hasattr(self, "showLegend") and self.showLegend.isChecked():
+                if show_legend:
                     unit_name = unit.event.name or str(i)
                     lbl = pg.TextItem(text=unit_name, color=c, fill=pg.mkBrush(255, 255, 255, 220))
                     lbl.setPos(pts_arr[0, 0], pts_arr[0, 1])
                     self.main_plot.addItem(lbl)
                     self.legend_items.append(lbl)
+
+        for idx_unused in range(other_idx, len(self.other_unit_scatters)):
+            self.other_unit_scatters[idx_unused].clear()
+            self.other_unit_scatters[idx_unused].setVisible(False)
 
         # 2. Tracked Unit (Red) - strictly target_unit_idx only
         if self.includeUnitCheckbox.isChecked() and 0 <= target_unit_idx < len(self.state.spike_groups):
@@ -1112,7 +1151,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
                 )
                 self.tracked_unit_scatter.setVisible(True)
 
-                if hasattr(self, "showLegend") and self.showLegend.isChecked():
+                if show_legend:
                     unit_name = sg.event.name or str(target_unit_idx)
                     lbl = pg.TextItem(text=unit_name, color=(255, 0, 0), fill=pg.mkBrush(255, 255, 255, 220))
                     lbl.setPos(pts_arr[0, 0], pts_arr[0, 1])

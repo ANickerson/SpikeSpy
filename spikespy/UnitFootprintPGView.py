@@ -28,7 +28,7 @@ import pyqtgraph as pg
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .live_orchestrator import LiveFrameConsumerMixin
 from .ChannelGroupBar import ChannelGroupBar
-from .helpers import quiet_fail
+from .helpers import quiet_fail, run_adaptive_render
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +215,7 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
             if self.is_view_culled() or not getattr(self, "_dirty", False):
                 return
             self._dirty = False
-            self._do_update_plot()
+            run_adaptive_render(self, self._do_update_plot, weight="normal")
         except RuntimeError:
             pass
         except Exception:

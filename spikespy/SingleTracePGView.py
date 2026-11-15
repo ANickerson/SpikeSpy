@@ -16,7 +16,7 @@ import pyqtgraph as pg
 
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
-from .helpers import quiet_fail
+from .helpers import quiet_fail, run_adaptive_render
 from .live_orchestrator import LiveFrameConsumerMixin
 from .viewer_worker import get_task_manager, TaskType, TaskPriority
 
@@ -1130,7 +1130,9 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
             self._dirty = True
             return
         self._dirty = False
+        run_adaptive_render(self, lambda: self._do_update_figure_core(force=force), weight="primary")
 
+    def _do_update_figure_core(self, force: bool = False):
         if self.state is None or self.state.event_signal is None:
             return
 

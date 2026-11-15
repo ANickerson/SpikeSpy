@@ -699,30 +699,50 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
             name="reload_setup",
         )
 
+        self.on_new_sweep_throttled = qsignal_throttle(
+            lambda: self.on_new_sweep(self.state.stimno),
+            40,
+            parent=self,
+            weight="heavy",
+        )
+        self.reset_right_axes_throttled = qsignal_throttle(
+            self.reset_right_axes_data,
+            250,
+            parent=self,
+            weight="heavy",
+        )
+
         def _on_unit_updated(*args):
-            self.render()
-            self._schedule_right_axis_update()
+            if getattr(self.state, "is_streaming", False):
+                self._dirty = True
+            else:
+                self.render()
+                self._schedule_right_axis_update()
 
         self.references.append(self.state.onUnitGroupChange.connect(_on_unit_updated))
         self.references.append(self.state.onUnitChange.connect(_on_unit_updated))
 
-        self.references.append(self.state.onStimNoChange.connect(self.update_ylim))
-        self.references.append(
-            self.state.onStimNoChange.connect(
-                lambda *args: self.plot_curstim_line(self.state.stimno)
-            )
-        )
+        def _on_stimno_changed(*args):
+            if getattr(self.state, "is_streaming", False):
+                self._dirty = True
+            else:
+                self.update_ylim(self.state.stimno)
+                self.plot_curstim_line(self.state.stimno)
+
+        self.references.append(self.state.onStimNoChange.connect(_on_stimno_changed))
 
         if hasattr(self.state, "onChannelChange"):
             self.references.append(self.state.onChannelChange.connect(self._on_channel_bar_changed))
 
         if hasattr(self.state, "onNewSweep"):
-            self.on_new_sweep_throttled = qsignal_throttle(lambda: self._schedule_render(self.state.stimno), 40)
-        # Live sweeps arrive through the state's LiveOrchestrator (LIFO);
-        # the GUI-side throttle keeps render scheduling rate-limited.
-        self._register_live_frames(state, lambda _stimno: self.on_new_sweep_throttled())
+            self._register_live_frames(state, lambda _stimno: self.on_new_sweep_throttled())
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.references.append(self.state.onNewSpikeEvents.connect(lambda *args: self._schedule_spike_group_update()))
+            def _on_spike_events(*args):
+                if getattr(self.state, "is_streaming", False):
+                    self._dirty = True
+                else:
+                    self._schedule_spike_group_update()
+            self.references.append(self.state.onNewSpikeEvents.connect(_on_spike_events))
 
         if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
             self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
@@ -1034,7 +1054,7 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
 
     def _on_render_timer_tick(self):
         try:
-            if not self.isVisible():
+            if self.is_view_culled():
                 return
             if not getattr(self, "_dirty", False):
                 return
@@ -1127,6 +1147,10 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
         if self.is_view_culled():
             self._dirty = True
             return
+        from ..helpers import run_adaptive_render
+        run_adaptive_render(self, lambda: self._on_new_sweep_core(stimno), weight="heavy")
+
+    def _on_new_sweep_core(self, stimno: int):
         self.render_count = getattr(self, "render_count", 0) + 1
         if self.state is None:
             return
@@ -1291,24 +1315,44 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
 
     # @qsignal_throttle_wrapper(1000)
     def plot_right_axis(self):
+        active_items = [(k, v) for k, v in self.right_ax_data.items() if self.rightPlots.get(k, True)]
+        active_labels = [k for k, _ in active_items]
+
+        # Fast path: reuse existing subplots and Line2D artists when active labels match
+        if (
+            getattr(self, "_right_axis_labels", None) == active_labels
+            and len(self.ax_right) == len(active_items)
+            and len(active_items) > 0
+        ):
+            for ax, (label, data) in zip(self.ax_right, active_items):
+                x_d = data[0].magnitude if hasattr(data[0], "magnitude") else np.asarray(data[0])
+                y_d = data[1].magnitude if hasattr(data[1], "magnitude") else np.asarray(data[1])
+                if ax.lines:
+                    ax.lines[0].set_data(x_d, y_d)
+                    try:
+                        finite_x = x_d[np.isfinite(x_d)]
+                        if len(finite_x) > 0:
+                            xmin, xmax = float(np.min(finite_x)), float(np.max(finite_x))
+                            if xmin == xmax:
+                                xmin -= 1.0
+                                xmax += 1.0
+                            pad = 0.05 * (xmax - xmin)
+                            ax.set_xlim(xmin - pad, xmax + pad)
+                    except Exception:
+                        pass
+            return
+
         for ax in self.ax_right:
             ax.remove()
         self.ax_right = []
-        count_axes = len([x for x, v in self.rightPlots.items() if v])
-        # if count_axes == 0:
-        #     self.ax.set_position([0,0,1,1])
-        # TODO: when there are no plots, increase the width of the main plot to fill.
+        self._right_axis_labels = active_labels
+        count_axes = len(active_items)
 
         gs00 = matplotlib.gridspec.GridSpecFromSubplotSpec(
             1, max(count_axes, 1), subplot_spec=self.gs[0, 1]
         )
-        # plot right axes
         colorwheel = itertools.cycle(iter(["r", "g", "b", "orange", "purple", "green"]))
-        # self.fig.subfigures()
-        for i, (label, data) in enumerate(
-            [(k, v) for k, v in self.right_ax_data.items() if self.rightPlots.get(k, True)]
-        ):
-
+        for i, (label, data) in enumerate(active_items):
             self.ax_right.append(self.fig.add_subplot(gs00[0, i], sharey=self.ax))
             if i > 0:
                 self.ax_right[i].tick_params(axis="y", labelleft=False)
@@ -1317,12 +1361,6 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
             self.ax_right[i].set_xlabel(label)
             self.ax_right[i].xaxis.label.set_color(c)
             self.ax_right[i].tick_params(axis="y", colors=c)
-        for ax in self.ax_right:
-            try:
-                ax.draw(self.fig.canvas.get_renderer())
-            except:
-                pass
-        # self.view.draw_idle()  # TODO - this slows things down as it re-renders the image plot also.
 
     def update_ylim(self, curStim):
         if self.lock_to_stim:
