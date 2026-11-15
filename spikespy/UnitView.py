@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 
 from .ViewerState import ViewerState
 from .QMatplotlib import QMatplotlib
+from .live_orchestrator import LiveFrameConsumerMixin
 from .ChannelGroupBar import ChannelGroupBar
 
 mplstyle.use("fast")
@@ -164,13 +165,16 @@ class UnitView(QMatplotlib):
         self.state.onStimNoChange.connect(self.update_curstim_line)
         self.state.onUnitChange.connect(self.updateAll)
         self.state.onUnitGroupChange.connect(self.updateAll)
-        self.state.onLoadNewFile.connect(self.updateAll)
+        self._register_data_reload(state, self.updateAll)
         if hasattr(self.state, "onNewSpikeEvents"):
             self.state.onNewSpikeEvents.connect(lambda *args: self.updateAll())
         if hasattr(self.state, "onChannelChange"):
             self.state.onChannelChange.connect(self.updateAll)
         if hasattr(self.state, "onNewSweep"):
-            self.state.onNewSweep.connect(lambda *args: self.schedule_update())
+            self._register_live_frames(
+                self.state,
+                lambda _stimno: self.schedule_update(),
+            )
         if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
             self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
             self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)

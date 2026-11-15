@@ -28,3 +28,9 @@ def synthetic_state():
 
     state.set_data(analog_signal=asig, event_signal=ev, spike_groups=[sg])
     return state
+
+
+@pytest.fixture(autouse=True)
+def _synchronous_live_frames(monkeypatch):
+    """Emit live UI updates per sweep so tests can assert right after append_sweep."""
+    monkeypatch.setattr(ViewerState, "live_frame_interval_ms", 0)

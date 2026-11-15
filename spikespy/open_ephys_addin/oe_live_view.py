@@ -379,7 +379,7 @@ class OpenEphysLiveView(QWidget):
             parent=self,
         )
 
-        self.worker.sweepReady.connect(self._on_sweep_ready)
+        self.worker.sweepsReady.connect(self._on_sweeps_ready)
         self.worker.spikeEventsReady.connect(self._on_spike_events_ready)
         self.worker.protocolEventReady.connect(self._on_protocol_event_ready)
         self.worker.statsUpdated.connect(self._on_stats_updated)
@@ -504,6 +504,20 @@ class OpenEphysLiveView(QWidget):
         # Start stream worker automatically
         self.start_stream()
 
+    @Slot(list)
+    def _on_sweeps_ready(self, payloads: list):
+        """Handler for a batch of newly sliced sweeps.
+
+        Each payload is processed independently: a malformed or out-of-sync
+        sweep is logged and dropped instead of aborting the batch (and with
+        it the whole GUI event loop) at high input rates.
+        """
+        for payload in payloads:
+            try:
+                self._on_sweep_ready(payload)
+            except Exception:
+                logger.exception("Dropped malformed live sweep payload")
+
     @Slot(dict)
     def _on_sweep_ready(self, payload: Dict[str, Any]):
         """Handler for newly sliced sweep."""
@@ -618,11 +632,14 @@ class OpenEphysLiveView(QWidget):
     @Slot(str, object)
     def _on_spike_events_ready(self, unit_name: str, spike_ts_arr: np.ndarray):
         """Handler for upstream spike events arriving from Open Ephys."""
-        if hasattr(self.state, "append_unit_spikes"):
-            self.state.append_unit_spikes(unit_name, spike_ts_arr)
-        else:
-            for ts in spike_ts_arr:
-                self._append_spike_to_state(unit_name, float(ts))
+        try:
+            if hasattr(self.state, "append_unit_spikes"):
+                self.state.append_unit_spikes(unit_name, spike_ts_arr)
+            else:
+                for ts in spike_ts_arr:
+                    self._append_spike_to_state(unit_name, float(ts))
+        except Exception:
+            logger.exception("Failed to record spike events for %s", unit_name)
 
     @Slot(str, float, dict)
     def _on_protocol_event_ready(self, event_type: str, ts: float, details: dict):

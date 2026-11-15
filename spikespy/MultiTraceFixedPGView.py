@@ -21,7 +21,8 @@ import pyqtgraph as pg
 
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
-from .helpers import qsignal_throttle
+from .helpers import qsignal_throttle, quiet_fail
+from .live_orchestrator import LiveFrameConsumerMixin
 
 
 class FixedTimeAxisItem(pg.AxisItem):
@@ -31,7 +32,7 @@ class FixedTimeAxisItem(pg.AxisItem):
         return [f"{1000 * v:g}" for v in values]
 
 
-class MultiTraceFixedPGView(QMainWindow):
+class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
     """
     High-performance PyQtGraph port of MultiTraceFixedView.
     Displays N-pre and N-post sweeps around the active stimulus sweep.
@@ -191,14 +192,17 @@ class MultiTraceFixedPGView(QMainWindow):
         if self.state is None:
             return
 
-        self.connections.append(self.state.onStimNoChange.connect(lambda x: self.update_figure()))
+        self.connections.append(self.state.onStimNoChange.connect(self._on_stim_no_change))
         self.connections.append(self.state.onUnitChange.connect(lambda x: self.update_figure()))
         self.connections.append(self.state.onUnitGroupChange.connect(lambda: self.update_figure()))
-        self.connections.append(self.state.onLoadNewFile.connect(self._on_load_new_file))
+        self._register_data_reload(state, self._on_load_new_file)
         if hasattr(self.state, "onChannelChange"):
             self.connections.append(self.state.onChannelChange.connect(lambda *args: self.update_figure(force=True)))
         if hasattr(self.state, "onNewSweep"):
-            self.connections.append(self.state.onNewSweep.connect(self.on_new_sweep))
+            self._register_live_frames(
+                self.state,
+                lambda stimno: self.on_new_sweep(stimno),
+            )
         if hasattr(self.state, "onNewSpikeEvents"):
             self.connections.append(self.state.onNewSpikeEvents.connect(lambda *args: self.update_figure()))
 
@@ -253,6 +257,14 @@ class MultiTraceFixedPGView(QMainWindow):
         self._auto_scale_needed = True
         self.update_figure()
 
+    def _on_stim_no_change(self, *args):
+        """Route sweep-advance notifications through the throttled live path."""
+        if getattr(self.state, "is_streaming", False):
+            self.on_new_sweep(self.state.stimno)
+        else:
+            self.update_figure()
+
+    @quiet_fail
     def _on_new_sweep_core(self, *args):
         if getattr(self, "_auto_scale_needed", True):
             erp = self.get_erp_signal() if self.state else None
@@ -270,6 +282,7 @@ class MultiTraceFixedPGView(QMainWindow):
             self._on_new_sweep_core(*args)
 
     def unset_connections(self):
+        self._unregister_live_frames()
         if self.state is not None:
             for con in self.connections:
                 try:
@@ -278,6 +291,7 @@ class MultiTraceFixedPGView(QMainWindow):
                     pass
         self.connections.clear()
 
+    @quiet_fail
     def _auto_scale(self):
         if self.state is None or self.state.analog_signal is None:
             return
@@ -312,6 +326,7 @@ class MultiTraceFixedPGView(QMainWindow):
         except Exception:
             pass
 
+    @quiet_fail
     def update_figure(self, force: bool = False):
         if self.is_view_culled():
             self._dirty = True
@@ -446,6 +461,7 @@ class MultiTraceFixedPGView(QMainWindow):
             res["channel_bar"] = self.channel_bar.get_settings()
         return res
 
+    @quiet_fail
     def set_settings(self, values: Dict, update_spinners: bool = True):
         self.settings.update(values)
         if "xlim" in values:

@@ -27,6 +27,7 @@ import PySide6QtAds as QtAds
 from .ChannelGroupBar import ChannelGroupBar
 from .ViewerState import ViewerState
 from .helpers import qsignal_throttle
+from .live_orchestrator import LiveFrameConsumerMixin
 
 
 class SubViewCard(QFrame):
@@ -73,7 +74,7 @@ class SubViewCard(QFrame):
         layout.addWidget(child_widget, 1)
 
 
-class ChannelGroupContainerView(QMainWindow):
+class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
     """
     Sub-window container representing a Channel Group within SpikeSpy.
     Can host multiple nested sub-windows (e.g. MultiTrace, SingleTrace, UnitView)
@@ -305,8 +306,10 @@ class ChannelGroupContainerView(QMainWindow):
                 pass
         self._connections.clear()
 
-        if self.state is not None and hasattr(self.state, "onNewSweep"):
-            self._connections.append(self.state.onNewSweep.connect(self._on_new_sweep_throttled))
+        # Live sweeps arrive through the state's LiveOrchestrator (LIFO);
+        # the GUI-side throttle keeps child syncing rate-limited.
+        self._unregister_live_frames()
+        self._register_live_frames(state, lambda stimno: self._on_new_sweep(stimno))
 
     def add_view_by_key(self, key: str) -> Optional[QWidget]:
         """Creates a child view by string key and adds it into this container."""

@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from .ViewerState import ViewerState, tracked_neuron_unit
+from .live_orchestrator import LiveFrameConsumerMixin
 
 
 class ChannelGroupDialog(QDialog):
@@ -221,7 +222,7 @@ class ChannelGroupDialog(QDialog):
                     )
 
 
-class ChannelGroupBar(QToolBar):
+class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
     """
     A reusable toolbar component for independent channel selection and unit binding.
     Every view (MultiTraceView, SingleTraceView, MultiTraceFixedView, UnitView, UnitFootprintView)
@@ -321,7 +322,11 @@ class ChannelGroupBar(QToolBar):
         self.state = state
         if self.state is not None:
             self.state.onUnitGroupChange.connect(self.refresh_units)
-            self.state.onLoadNewFile.connect(self.refresh_all)
+            if hasattr(self.state, "onLoadNewFile"):
+                self._register_data_reload(
+                    self.state,
+                    lambda: self.refresh_all(),
+                )
             if hasattr(self.state, "onChannelGroupsChanged"):
                 self.state.onChannelGroupsChanged.connect(self.refresh_channels)
             if hasattr(self.state, "onChannelChange"):
@@ -329,7 +334,10 @@ class ChannelGroupBar(QToolBar):
             if hasattr(self.state, "onSharedChannelSetChanged"):
                 self.state.onSharedChannelSetChanged.connect(self._on_shared_set_changed)
             if hasattr(self.state, "onNewSweep"):
-                self.state.onNewSweep.connect(self._on_new_sweep)
+                self._register_live_frames(
+                    self.state,
+                    lambda stimno: self._on_new_sweep(stimno),
+                )
         self.refresh_all()
 
     def _build_group_menu(self):

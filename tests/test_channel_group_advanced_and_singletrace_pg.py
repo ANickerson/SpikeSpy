@@ -190,8 +190,18 @@ def test_channel_group_container_follow_live_inputs(mock_multichannel_state):
     mock_multichannel_state._live_aux_erp_buffers = {"CH2": buf_ch2}
     mock_multichannel_state.analog_signal.name = "CH1"
 
-    # Trigger new sweep arrival
-    mock_multichannel_state.onNewSweep.emit(0)
+    # Trigger new sweep arrival through the live orchestrator
+    from spikespy.live_orchestrator import LiveSweepItem
+
+    mock_multichannel_state.live_orchestrator.submit(
+        LiveSweepItem(
+            stim_index=0,
+            stim_timestamp_s=0.0,
+            channel_sweeps={"CH1": np.zeros(500, dtype=np.float32)},
+            sampling_rate=10000.0,
+        ),
+        synchronous=True,
+    )
     app.processEvents()
 
     # Container and child views should now follow the live streaming channels

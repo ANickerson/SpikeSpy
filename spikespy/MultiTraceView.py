@@ -1,7 +1,8 @@
 import itertools
 import sys
+import logging
 from dataclasses import dataclass, field
-
+from typing import List, Dict, Any
 import matplotlib
 import matplotlib.axes
 from matplotlib.collections import PatchCollection
@@ -17,6 +18,8 @@ from matplotlib.path import Path
 from matplotlib.widgets import PolygonSelector
 from neo import Event
 from PySide6.QtCore import Qt, Signal, Slot
+
+logger = logging.getLogger(__name__)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -44,6 +47,7 @@ from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
 
 from .QMatplotlib import QMatplotlib
+from .live_orchestrator import LiveFrameConsumerMixin
 from matplotlib.lines import Line2D
 import time
 
@@ -53,6 +57,7 @@ from matplotlib.axes import Axes
 from .helpers import qsignal_throttle_wrapper, qsignal_throttle
 from matplotlib.image import AxesImage
 from .CachedAxesImage import CachedAxesImage
+from .viewer_worker import get_task_manager, TaskType, TaskPriority
 
 
 class falling_leaf_plotter:
@@ -248,7 +253,7 @@ class falling_leaf_plotter:
         return [scat]
 
 
-class MultiTraceView(QMainWindow):
+class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
     right_ax_data = {}
 
     def __init__(
@@ -289,6 +294,11 @@ class MultiTraceView(QMainWindow):
         if self.state and hasattr(self.state, "onUIRefreshRateChange"):
             self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
 
+        # Background task manager for heavy computations
+        self._task_manager = get_task_manager()
+        self._viewer_id = f"multitrace_{id(self)}"
+        self._pending_render_task = None
+        
         # throttle the update for upateAll to every 500ms when using the comboboxes.
         self.update_timer = QTimer()
         self.update_timer.setSingleShot(True)
@@ -641,11 +651,15 @@ class MultiTraceView(QMainWindow):
             except Exception:
                 pass
         self.remove_references()
+        # Unregister from task manager
+        if hasattr(self, "_task_manager"):
+            self._task_manager.unregister_viewer(self._viewer_id)
         self.dialogPolySelect.close()
         self.settingsDialog.close()
         self.pg_selector.set_active(False)
 
     def remove_references(self, *args, **kwargs):
+        self._unregister_live_frames()
         if self.state is not None:
             for ref in self.references:
                 try:
@@ -662,15 +676,32 @@ class MultiTraceView(QMainWindow):
         if self.state is None:
             return
 
-        self.references.append(
-            self.state.onLoadNewFile.connect(self.reset_right_axes_data)
+        # Register with background task manager
+        self._task_manager.register_viewer(
+            self._viewer_id,
+            self.state,
+            {
+                TaskType.MULTI_TRACE_RENDER: self._on_multi_trace_result,
+                TaskType.RIGHT_AXIS_UPDATE: self._on_right_axis_result,
+                TaskType.SPIKE_GROUP_UPDATE: self._on_spike_group_result,
+            }
         )
-        self.references.append(self.state.onLoadNewFile.connect(self.setup_figure))
-        self.references.append(self.state.onLoadNewFile.connect(self.update_axis))
+
+        # Static file loads are processed through the same orchestrator
+        # pipeline as live sweeps (single point of view processing).
+        self._register_data_reload(
+            state,
+            lambda: (
+                self.reset_right_axes_data(),
+                self.setup_figure(),
+                self.update_axis(),
+            ),
+            name="reload_setup",
+        )
 
         def _on_unit_updated(*args):
             self.render()
-            self.reset_right_axes_data()
+            self._schedule_right_axis_update()
 
         self.references.append(self.state.onUnitGroupChange.connect(_on_unit_updated))
         self.references.append(self.state.onUnitChange.connect(_on_unit_updated))
@@ -686,10 +717,12 @@ class MultiTraceView(QMainWindow):
             self.references.append(self.state.onChannelChange.connect(self._on_channel_bar_changed))
 
         if hasattr(self.state, "onNewSweep"):
-            self.on_new_sweep_throttled = qsignal_throttle(lambda: self.on_new_sweep(self.state.stimno), 40)
-            self.references.append(self.state.onNewSweep.connect(self.on_new_sweep_throttled))
+            self.on_new_sweep_throttled = qsignal_throttle(lambda: self._schedule_render(self.state.stimno), 40)
+        # Live sweeps arrive through the state's LiveOrchestrator (LIFO);
+        # the GUI-side throttle keeps render scheduling rate-limited.
+        self._register_live_frames(state, lambda _stimno: self.on_new_sweep_throttled())
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.references.append(self.state.onNewSpikeEvents.connect(lambda *args: self.render()))
+            self.references.append(self.state.onNewSpikeEvents.connect(lambda *args: self._schedule_spike_group_update()))
 
         if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
             self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
@@ -698,8 +731,7 @@ class MultiTraceView(QMainWindow):
             self.channel_bar.setState(state)
 
         self.update_axis()
-        # self.state.onUnitChange.connect(lambda x:self.reset_right_axes_data())
-        self.reset_right_axes_data()
+        self._schedule_right_axis_update()
         self.update_window_title()
 
     def _on_channel_bar_changed(self):
@@ -707,6 +739,275 @@ class MultiTraceView(QMainWindow):
         if getattr(self, "pg_selector", None) is not None:
             self.setup_figure()
             self.render()
+
+    # ===== Background Task Scheduling =====
+    
+    def _schedule_render(self, stimno: int):
+        """Schedule a render task for the background worker."""
+        if self.is_view_culled() or self.state is None:
+            if self.state is not None:
+                self._dirty = True
+            return
+        
+        if hasattr(self, "channel_bar"):
+            chans = self.channel_bar.get_selected_channels()
+            if self.channel_bar.is_multichannel() and len(chans) > 1:
+                erp = self.state.get_multichannel_erp(chans, combine_mode="mean")
+                primary = chans[0] if chans else None
+            else:
+                primary = self.channel_bar.get_primary_channel()
+                erp = self.state.get_channel_erp(primary)
+        else:
+            primary = getattr(getattr(self.state, "analog_signal", None), "name", None)
+            erp = self.state.get_erp()
+        
+        if erp is not None and hasattr(erp, "magnitude"):
+            erp = erp.magnitude
+        if erp is None or erp.shape[0] == 0:
+            return
+        
+        # Submit to background thread (coalesces by viewer+type)
+        self._task_manager.submit_render(
+            self._viewer_id,
+            TaskType.MULTI_TRACE_RENDER,
+            {
+                "erp_data": erp,
+                "spike_groups": self.state.spike_groups,
+                "event_signal": self.state.event_signal,
+                "sampling_rate": self.state.sampling_rate,
+                "mode": self.mode,
+                "stimno": stimno,
+                "lock_to_stim": self.lock_to_stim,
+                "lower_percentile": self.lowerSpinBox.value(),
+                "upper_percentile": self.upperSpinBox.value(),
+                "follow_live": getattr(self.state, "follow_live", True),
+                "channel_names": self._get_channel_names(),
+                "viewer_ref": self,
+                "current_unit_idx": self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group,
+                "show_max": self.toggleMaxMeanButton.isChecked(),
+            },
+            priority=TaskPriority.HIGH,
+        )
+    
+    def _get_channel_names(self) -> List[str]:
+        """Get list of channel names for right axis computation."""
+        names = []
+        if hasattr(self, "channel_bar"):
+            chans = self.channel_bar.get_selected_channels()
+            names.extend(chans)
+        elif self.state.analog_signal is not None:
+            names.append(self.state.analog_signal.name)
+        return names
+    
+    def _schedule_right_axis_update(self):
+        """Schedule right axis data computation."""
+        if self.state is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
+            return
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        
+        erp = None
+        if hasattr(self, "channel_bar"):
+            chans = self.channel_bar.get_selected_channels()
+            if self.channel_bar.is_multichannel() and len(chans) > 1:
+                erp = self.state.get_multichannel_erp(chans, combine_mode="mean")
+            else:
+                primary = self.channel_bar.get_primary_channel()
+                erp = self.state.get_channel_erp(primary)
+        else:
+            erp = self.state.get_erp()
+        
+        if erp is not None and hasattr(erp, "magnitude"):
+            erp = erp.magnitude
+        if erp is None or erp.size == 0:
+            return
+        
+        self._task_manager.submit_render(
+            self._viewer_id,
+            TaskType.RIGHT_AXIS_UPDATE,
+            {
+                "erp_data": erp,
+                "event_signal": self.state.event_signal,
+                "spike_groups": self.state.spike_groups,
+                "sampling_rate": self.state.sampling_rate,
+                "viewer_ref": self,
+                "channel_names": self._get_channel_names(),
+                "show_max": self.toggleMaxMeanButton.isChecked(),
+            },
+            priority=TaskPriority.LOW,
+        )
+    
+    def _schedule_spike_group_update(self):
+        """Schedule spike group points computation."""
+        if self.state is None or self.state.event_signal is None:
+            return
+        if self.is_view_culled():
+            self._dirty = True
+            return
+        
+        self._task_manager.submit_render(
+            self._viewer_id,
+            TaskType.SPIKE_GROUP_UPDATE,
+            {
+                "event_signal": self.state.event_signal,
+                "spike_groups": self.state.spike_groups,
+                "sampling_rate": self.state.sampling_rate,
+                "current_unit_idx": self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group,
+            },
+            priority=TaskPriority.NORMAL,
+        )
+    
+    # ===== Background Task Result Handlers =====
+    
+    def _on_multi_trace_result(self, result: Dict[str, Any], error: str):
+        """Handle completed multi-trace render task."""
+        if error:
+            logger.error(f"MultiTrace render failed: {error}")
+            return
+        if not result:
+            return
+        
+        # Apply heatmap update
+        if self.mode == "heatmap" and self.plotter.ax_track_cmap is not None:
+            clipped_data = result.get("clipped_data")
+            extent = result.get("extent")
+            clim = result.get("clim")
+            if clipped_data is not None and extent is not None:
+                if hasattr(self.plotter.ax_track_cmap, "update_data_fast"):
+                    self.plotter.ax_track_cmap.update_data_fast(clipped_data, extent)
+                else:
+                    self.plotter.ax_track_cmap.set_data(clipped_data)
+                    self.plotter.ax_track_cmap.set_extent(extent)
+                if clim is not None:
+                    self.plotter.ax_track_cmap.set_clim(*clim)
+        
+        # Update ylim
+        ylim = result.get("ylim")
+        if ylim is not None:
+            self.ax.set_ylim(ylim)
+        
+        # Update xlim if needed
+        xlim = result.get("xlim")
+        if xlim is not None and abs(self.ax.get_xlim()[1] - self.ax.get_xlim()[0]) <= 1.0:
+            self.ax.set_xlim(xlim)
+            self.update_axis()
+        
+        # Highlight current stim
+        stimno = result.get("stimno")
+        if stimno is not None:
+            self.plotter.highlight_stim(self.ax, stimno, partial=False)
+        
+        # Spike groups will be handled by separate result
+        self.view.draw_idle()
+    
+    def _on_right_axis_result(self, result: Dict[str, Any], error: str):
+        """Handle completed right axis computation."""
+        if error:
+            logger.error(f"Right axis update failed: {error}")
+            return
+        if not result:
+            return
+        
+        self.right_ax_data = result
+        
+        # Update rightPlots dict
+        for k in self.right_ax_data.keys():
+            if k not in self.rightPlots:
+                self.rightPlots[k] = True
+        
+        # Recreate settings dialog if needed
+        cur_seg = getattr(self.state, "segment", None)
+        if self.settingsDialog is None or self._last_settings_segment != cur_seg:
+            if self.settingsDialog is not None:
+                try:
+                    self.settingsDialog.destroy()
+                except Exception:
+                    pass
+            self.settingsDialog = DialogSignalSelect(options=self.rightPlots)
+            self._last_settings_segment = cur_seg
+            
+            def updateView(k, v):
+                self.rightPlots[k] = v
+                self.plot_right_axis()
+                self.render()
+            
+            self.settingsDialog.changeSelection.connect(updateView)
+        
+        self.plot_right_axis()
+        self.view.draw_idle()
+    
+    def _on_spike_group_result(self, result: Dict[int, Dict], error: str):
+        """Handle completed spike group computation."""
+        if error:
+            logger.error(f"Spike group update failed: {error}")
+            return
+        if not result:
+            return
+        
+        # Update Patches with new data
+        import matplotlib
+        colors = matplotlib.colormaps["Set2"].colors
+        
+        target_unit_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group
+        active_unit_indices = set()
+        if self.includeAllUnitsCheckBox.isChecked():
+            active_unit_indices.update(range(len(self.state.spike_groups)))
+        if self.includeUnitCheckbox.isChecked() and target_unit_idx is not None:
+            active_unit_indices.add(target_unit_idx)
+        
+        # Hide unused
+        for u_idx, line in list(self.Patches.items()):
+            if u_idx not in active_unit_indices or u_idx >= len(self.state.spike_groups):
+                line.set_visible(False)
+        
+        legend = []
+        for i, data in result.items():
+            if i >= len(self.state.spike_groups):
+                continue
+            x_unit = self.state.spike_groups[i]
+            samples = data["samples"]
+            sweeps = data["sweeps"]
+            
+            is_cur = (i == target_unit_idx)
+            c = "red" if is_cur else colors[i % len(colors)]
+            alpha = (0.6 if self.mode == "heatmap" else 1.0) if is_cur else 0.8
+            zorder = 12 if is_cur else 11
+            
+            if i not in self.Patches or self.Patches[i] not in self.ax.lines:
+                line = Line2D(
+                    samples,
+                    sweeps,
+                    marker="s",
+                    linestyle="None",
+                    markersize=4,
+                    markerfacecolor="none",
+                    markeredgecolor=c,
+                    markeredgewidth=1.2,
+                    alpha=alpha,
+                    zorder=zorder,
+                )
+                self.ax.add_line(line)
+                self.Patches[i] = line
+            else:
+                line = self.Patches[i]
+                line.set_data(samples, sweeps)
+                line.set_markeredgecolor(c)
+                line.set_alpha(alpha)
+                line.set_zorder(zorder)
+                line.set_visible(True)
+            
+            if len(samples) > 0 and self.showLegend.isChecked():
+                ss = x_unit.event.name or f"unit_{i}"
+                tt = self.ax.text(samples[0], sweeps[0], ss)
+                tt.set_color(c)
+                tt.set_backgroundcolor("white")
+                tt.set_fontweight("bold")
+                legend.append(tt)
+        
+        self.legend = legend
+        self.points_spikegroups = list(self.Patches.values())
+        self.view.draw_idle()
 
     def update_window_title(self):
         if hasattr(self, "channel_bar"):
@@ -771,7 +1072,58 @@ class MultiTraceView(QMainWindow):
             self._dirty = False
             self.on_new_sweep(self.state.stimno if self.state else 0)
 
+    def _sync_right_axis_from_live_buffers(self):
+        """Populate right-axis data once from live row statistics.
+
+        LiveERPBuffer already maintains row_mean/row_max, so this is O(sweeps)
+        per channel and only runs on the first frame before async updates take over.
+        """
+        if self.state is None or self.state.event_signal is None:
+            return
+        if not getattr(self.state, "is_streaming", False):
+            return
+
+        data = {}
+        try:
+            stim_times = self.state.event_signal.times.rescale(pq.second).magnitude
+            if len(stim_times) > 1:
+                data["Stim. Freq. (Hz)"] = (
+                    1.0 / np.diff(stim_times),
+                    np.arange(1, len(stim_times)),
+                )
+        except Exception:
+            pass
+
+        chans = []
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            chans = list(self.channel_bar.get_selected_channels())
+        if not chans and self.state.analog_signal is not None:
+            chans = [self.state.analog_signal.name]
+
+        buffers = getattr(self.state, "_live_aux_erp_buffers", {}) or {}
+        for ch_name in chans:
+            buf = buffers.get(ch_name)
+            if buf is None:
+                primary_buf = getattr(self.state, "_live_erp_buffer", None)
+                if primary_buf is not None and ch_name == getattr(
+                    self.state.analog_signal, "name", None
+                ):
+                    buf = primary_buf
+            if buf is None or len(buf) == 0:
+                continue
+            values = buf.row_max if self.toggleMaxMeanButton.isChecked() else buf.row_mean
+            values = np.asarray(getattr(values, "magnitude", values))
+            data[ch_name] = (values, np.arange(len(values)))
+
+        if not data:
+            return
+        self.right_ax_data = data
+        for key in data:
+            self.rightPlots.setdefault(key, True)
+        self.plot_right_axis()
+
     def on_new_sweep(self, stimno: int):
+        """Lightweight sweep handler - schedules heavy work to background thread."""
         if self.is_view_culled():
             self._dirty = True
             return
@@ -779,6 +1131,7 @@ class MultiTraceView(QMainWindow):
         if self.state is None:
             return
 
+        # Get ERP data for std computation (lightweight)
         if hasattr(self, "channel_bar"):
             chans = self.channel_bar.get_selected_channels()
             if self.channel_bar.is_multichannel() and len(chans) > 1:
@@ -796,6 +1149,10 @@ class MultiTraceView(QMainWindow):
         if erp is None or erp.shape[0] == 0:
             return
 
+        if not self.right_ax_data:
+            self._sync_right_axis_from_live_buffers()
+
+        # Update running std (lightweight)
         live_buf = getattr(self.state, "_live_aux_erp_buffers", {}).get(
             primary, getattr(self.state, "_live_erp_buffer", None)
         )
@@ -810,35 +1167,16 @@ class MultiTraceView(QMainWindow):
                 last_std = float(np.std(erp[-1])) or 1.0
             self.std = 0.95 * float(self.std) + 0.05 * last_std
 
+        # Check if user is interacting (lightweight)
         toolbar = getattr(self, "toolbar", None)
         if toolbar is None and hasattr(self, "view") and hasattr(self.view, "canvas"):
             toolbar = getattr(self.view.canvas, "toolbar", None)
         is_user_interacting = toolbar is not None and getattr(toolbar, "mode", "") != ""
 
-        if self.mode == "heatmap" and self.plotter.ax_track_cmap is not None and abs(self.ax.get_xlim()[1] - self.ax.get_xlim()[0]) > 1.0:
-            if has_buf_match:
-                clipped_data = live_buf.clipped_data
-            else:
-                max_val = float(np.max(erp)) if erp.size else 1.0
-                clipped_data = np.clip(erp, 0, max_val)
+        # Schedule heavy rendering to background thread
+        self._schedule_render(stimno)
 
-            extent = (0, erp.shape[1], erp.shape[0], 0)
-            if hasattr(self.plotter.ax_track_cmap, "update_data_fast"):
-                self.plotter.ax_track_cmap.update_data_fast(clipped_data, extent)
-            else:
-                self.plotter.ax_track_cmap.set_data(clipped_data)
-                self.plotter.ax_track_cmap.set_extent(extent)
-            clim = (
-                self.std * self.lowerSpinBox.value(),
-                max(
-                    self.std * self.lowerSpinBox.value() + 0.001,
-                    self.std * self.upperSpinBox.value(),
-                ),
-            )
-            self.plotter.ax_track_cmap.set_clim(*clim)
-        elif not is_user_interacting:
-            self.setup_figure()
-
+        # Lightweight UI updates that must stay on UI thread
         if not is_user_interacting:
             if abs(self.ax.get_xlim()[1] - self.ax.get_xlim()[0]) <= 1.0:
                 self.ax.set_xlim(0, erp.shape[1])
@@ -857,102 +1195,13 @@ class MultiTraceView(QMainWindow):
                     self.ax.set_ylim(erp.shape[0], top_lim)
 
         self.plotter.highlight_stim(self.ax, self.state.stimno, partial=False)
-        self.plot_spikegroups()
-        self.reset_right_axes_data()
+        # plot_spikegroups and reset_right_axes_data now handled by background tasks
         self.view.draw_idle()
 
     # @qsignal_throttle_wrapper(1000)
     def reset_right_axes_data(self):
-        if self.state is None:
-            return
-        if self.state.event_signal is None or len(self.state.event_signal) == 0:
-            return
-
-        if len(self.state.event_signal.times) > 1:
-            stimFreq_data = (
-                1 / np.diff(self.state.event_signal.times).rescale(pq.second),
-                np.arange(1, len(self.state.event_signal.times)),
-            )
-        else:
-            stimFreq_data = (np.array([]), np.array([]))
-        ug = self.state.getUnitGroup()
-        if ug is not None:
-            latencies = ug.get_latencies(self.state.event_signal)
-            idx_na = np.isnan(latencies)
-
-            current_spike_diffs = np.diff(latencies[~idx_na])
-            out = np.ones(latencies.shape) * np.nan * pq.ms
-            out[np.where(~idx_na)[0][1:]] = current_spike_diffs
-            # out[np.isnan(out)] = 0 * pq.ms
-            self.right_ax_data = {
-                "Stim. Freq. (Hz)": stimFreq_data,
-                "Latency Diff.": (out, np.arange(len(latencies))),
-            }
-        else:
-            self.right_ax_data = {
-                "Stim. Freq. (Hz)": stimFreq_data,
-            }
-        sigs_to_check = []
-        if getattr(self.state, "segment", None) is not None and getattr(self.state.segment, "analogsignals", None):
-            sigs_to_check = list(self.state.segment.analogsignals)
-        elif getattr(self.state, "analog_signal", None) is not None:
-            sigs_to_check = [self.state.analog_signal]
-
-        for x in sigs_to_check:
-            try:
-                buf = None
-                if getattr(self.state, "is_streaming", False):
-                    if hasattr(self.state, "_live_aux_erp_buffers") and x.name in self.state._live_aux_erp_buffers:
-                        buf = self.state._live_aux_erp_buffers[x.name]
-                    elif (
-                        getattr(self.state, "_live_erp_buffer", None) is not None
-                        and self.state.analog_signal is not None
-                        and x.name == getattr(self.state.analog_signal, "name", None)
-                    ):
-                        buf = self.state._live_erp_buffer
-
-                if buf is not None:
-                    vals = buf.row_max if self.toggleMaxMeanButton.isChecked() else buf.row_mean
-                    self.right_ax_data[x.name] = (
-                        vals,
-                        np.arange(0, len(vals)),
-                    )
-                else:
-                    if self.toggleMaxMeanButton.isChecked():
-                        self.right_ax_data[x.name] = (
-                            np.max(self.state.get_erp(x, self.state.event_signal), axis=1),
-                            np.arange(0, len(self.state.event_signal.times)),
-                        )
-                    else:
-                        self.right_ax_data[x.name] = (
-                            np.mean(self.state.get_erp(x, self.state.event_signal), axis=1),
-                            np.arange(0, len(self.state.event_signal.times)),
-                        )
-            except:
-                pass
-
-        for k in self.right_ax_data.keys():
-            if k not in self.rightPlots:
-                self.rightPlots[k] = True
-
-        cur_seg = getattr(self.state, "segment", None)
-        if self.settingsDialog is None or self._last_settings_segment != cur_seg:
-            if self.settingsDialog is not None:
-                try:
-                    self.settingsDialog.destroy()
-                except Exception:
-                    pass
-            self.settingsDialog = DialogSignalSelect(options=self.rightPlots)
-            self._last_settings_segment = cur_seg
-
-            def updateView(k, v):
-                self.rightPlots[k] = v
-                self.plot_right_axis()
-                self.render()
-
-            self.settingsDialog.changeSelection.connect(updateView)
-
-        self.plot_right_axis()
+        """Schedule right axis data computation to background thread."""
+        self._schedule_right_axis_update()
         self.view.draw_idle()
 
     def setup_figure(self):
@@ -1152,101 +1401,95 @@ class MultiTraceView(QMainWindow):
         # )
         # self.ax.grid(True, which="both")
 
+    def _sync_spike_group_points(self):
+        """Build spike-group points directly for the first paint.
+
+        Later updates still come from the background SPIKE_GROUP_UPDATE task;
+        this only avoids an empty plot until the first async result arrives.
+        """
+        result = {}
+        if self.state is None or self.state.event_signal is None:
+            return result
+        target_unit_idx = (
+            self.channel_bar.get_target_unit_idx()
+            if hasattr(self, "channel_bar")
+            else self.state.cur_spike_group
+        )
+        for i, sg in enumerate(self.state.spike_groups):
+            idx_arr = getattr(sg, "idx_arr", None)
+            if not idx_arr:
+                continue
+            points = []
+            for sweep, item in enumerate(idx_arr):
+                if item is None:
+                    continue
+                sample = item[0] if isinstance(item, (tuple, list, np.ndarray)) else item
+                points.append((sample, sweep))
+            if not points:
+                continue
+            pts = np.asarray(points, dtype=float)
+            result[i] = {
+                "samples": pts[:, 0],
+                "sweeps": pts[:, 1],
+                "is_current": i == target_unit_idx,
+            }
+        return result
+
+    def _recolor_spike_group_patches(self):
+        """Keep patch colors/z-order in sync with the current target unit."""
+        if not self.Patches:
+            return
+        import matplotlib
+        colors = matplotlib.colormaps["Set2"].colors
+        target_unit_idx = (
+            self.channel_bar.get_target_unit_idx()
+            if hasattr(self, "channel_bar")
+            else self.state.cur_spike_group
+        )
+        for i, line in self.Patches.items():
+            is_cur = i == target_unit_idx
+            color = "red" if is_cur else colors[i % len(colors)]
+            alpha = (0.6 if self.mode == "heatmap" else 1.0) if is_cur else 0.8
+            line.set_markeredgecolor(color)
+            line.set_alpha(alpha)
+            line.set_zorder(12 if is_cur else 11)
+
     points_spikegroups = None
 
     def plot_spikegroups(self, sgidx=None):
+        """Lightweight UI update for spike groups - heavy computation done in background.
+        This method is kept for compatibility but the actual data comes from _on_spike_group_result."""
+        # This is now a no-op - the background task handles computation
+        # and _on_spike_group_result applies the results to the UI
+        if self.state is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
+            for line in getattr(self, "Patches", {}).values():
+                line.set_visible(False)
+            return list(getattr(self, "Patches", {}).values())
+        
+        # Just ensure Patches dict exists
         if not hasattr(self, "Patches") or self.Patches is None:
             self.Patches = {}
 
-        if self.legend is not None:
-            for txt in self.legend:
-                txt.remove()
-            self.legend = None
-
-        if self.state is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
-            for line in self.Patches.values():
-                line.set_visible(False)
-            return list(self.Patches.values())
-
-        sr = 10000.0
-        if hasattr(self.state, "sampling_rate") and self.state.sampling_rate is not None:
-            sr = (
-                float(self.state.sampling_rate.rescale(pq.Hz).magnitude)
-                if hasattr(self.state.sampling_rate, "magnitude")
-                else float(self.state.sampling_rate)
-            )
-        elif self.state.analog_signal is not None and hasattr(self.state.analog_signal, "sampling_rate"):
-            sr = (
-                float(self.state.analog_signal.sampling_rate.rescale(pq.Hz).magnitude)
-                if hasattr(self.state.analog_signal.sampling_rate, "magnitude")
-                else float(self.state.analog_signal.sampling_rate)
-            )
-
+        if not self.Patches:
+            result = self._sync_spike_group_points()
+            if result:
+                self._on_spike_group_result(result, "")
+        
+        # Hide any unused unit artists (based on checkboxes)
         target_unit_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group
         active_unit_indices = set()
         if self.includeAllUnitsCheckBox.isChecked():
             active_unit_indices.update(range(len(self.state.spike_groups)))
         if self.includeUnitCheckbox.isChecked() and target_unit_idx is not None:
             active_unit_indices.add(target_unit_idx)
-
-        # Hide any unused unit artists
+        
         for u_idx, line in list(self.Patches.items()):
             if u_idx not in active_unit_indices or u_idx >= len(self.state.spike_groups):
                 line.set_visible(False)
 
-        import matplotlib
-        colors = matplotlib.colormaps["Set2"].colors
-        legend = []
-
-        for i in active_unit_indices:
-            if i >= len(self.state.spike_groups):
-                continue
-            x_unit = self.state.spike_groups[i]
-            lats = x_unit.get_latencies(self.state.event_signal)
-            valid = ~np.isnan(lats)
-            sweeps = np.where(valid)[0]
-            lat_vals = [(float(lats[s].rescale(pq.s).magnitude) if hasattr(lats[s], "rescale") else float(lats[s])) for s in sweeps]
-            samples = np.array([int(round(lv * sr)) for lv in lat_vals], dtype=float)
-
-            is_cur = (i == target_unit_idx)
-            c = "red" if is_cur else colors[i % len(colors)]
-            alpha = (0.6 if self.mode == "heatmap" else 1.0) if is_cur else 0.8
-            zorder = 12 if is_cur else 11
-
-            if i not in self.Patches or self.Patches[i] not in self.ax.lines:
-                line = Line2D(
-                    samples,
-                    sweeps,
-                    marker="s",
-                    linestyle="None",
-                    markersize=4,
-                    markerfacecolor="none",
-                    markeredgecolor=c,
-                    markeredgewidth=1.2,
-                    alpha=alpha,
-                    zorder=zorder,
-                )
-                self.ax.add_line(line)
-                self.Patches[i] = line
-            else:
-                line = self.Patches[i]
-                line.set_data(samples, sweeps)
-                line.set_markeredgecolor(c)
-                line.set_alpha(alpha)
-                line.set_zorder(zorder)
-                line.set_visible(True)
-
-            if len(samples) > 0 and self.showLegend.isChecked():
-                ss = x_unit.event.name or f"unit_{i}"
-                tt = self.ax.text(samples[0], sweeps[0], ss)
-                tt.set_color(c)
-                tt.set_backgroundcolor("white")
-                tt.set_fontweight("bold")
-                legend.append(tt)
-
-        self.legend = legend
-        self.points_spikegroups = list(self.Patches.values())
-        return self.points_spikegroups
+        self._recolor_spike_group_patches()
+        
+        return list(self.Patches.values())
 
     # @qsignal_throttle_wrapper(interval=33)
     def render(self):

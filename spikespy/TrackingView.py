@@ -20,8 +20,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .basic_tracking import track_basic
+from .basic_tracking import track_basic, track_sweep_waveform
 from .ViewerState import ViewerState
+from .live_orchestrator import BatchingMode
 from neo import Event
 
 
@@ -132,8 +133,18 @@ class TrackingView(QMainWindow):
                 self.state.onUnitGroupChange.connect(self.sync_from_active_unit)
             if hasattr(self.state, "onUnitChange"):
                 self.state.onUnitChange.connect(self.sync_from_active_unit)
-            if hasattr(self.state, "onNewSweep"):
-                self.state.onNewSweep.connect(self.on_new_sweep)
+            # Auto-track new sweeps via the live orchestrator: detection runs
+            # off the GUI thread, batched over all sweeps accumulated while a
+            # previous batch is still being processed (LIFO, numpy-batched).
+            orch = getattr(self.state, "live_orchestrator", None)
+            if orch is not None:
+                orch.register(
+                    f"trackingview_{id(self)}",
+                    "auto_track",
+                    self._live_tracking_fn,
+                    self._on_live_tracking_result,
+                    batching=BatchingMode.BATCH,
+                )
             self.sync_from_active_unit()
 
     def sync_from_active_unit(self):
@@ -256,6 +267,98 @@ class TrackingView(QMainWindow):
         if self.state is None:
             return
         self.state.track_stimulus_all_units(stimno)
+
+    def _live_tracking_fn(self, batch):
+        """Runs on the orchestrator worker thread for a batch of new sweeps.
+
+        Mirrors ViewerState.track_stimulus_all_units detection without
+        mutating state: returns a list of (unit_idx, detected_sample, stimno)
+        detections computed from the batch waveforms.
+        """
+        state = self.state
+        detections = []
+        if state is None or state.event_signal is None or not batch.items:
+            return detections
+
+        sr = float(
+            state.sampling_rate
+            if state.sampling_rate is not None
+            else 30000.0
+        )
+        window_size = state.window_size
+
+        units = [
+            (i, sg)
+            for i, sg in enumerate(state.spike_groups)
+            if getattr(sg, "auto_track", False)
+        ]
+        if not units:
+            return detections
+
+        for item in batch.items:
+            stimno = item.stim_index
+            if stimno < 0 or stimno >= len(state.event_signal):
+                continue
+            for unit_idx, sg in units:
+                if sg.get_sweep_sample(stimno, state.event_signal, sr, window_size) is not None:
+                    continue
+                ch = (
+                    getattr(sg, "tracking_channel", "")
+                    or getattr(sg, "channel", "")
+                )
+                row = item.erp_row(ch) if ch else None
+                if row is None or row.size == 0:
+                    continue
+                # Preserve physical units so track_sweep_waveform applies the
+                # mV -> signal-unit threshold conversion exactly like the
+                # synchronous ViewerState.track_stimulus_all_units path.
+                sig_units = getattr(getattr(state, "analog_signal", None), "units", None)
+                if sig_units is not None:
+                    row = row * sig_units
+
+                prev_latency = None
+                max_skips = getattr(sg, "tracking_max_skips", 1)
+                min_stim = max(0, stimno - 1 - max_skips)
+                for prev_s in range(stimno - 1, min_stim - 1, -1):
+                    prev_sample = sg.get_sweep_sample(
+                        prev_s, state.event_signal, sr, window_size
+                    )
+                    if prev_sample is not None:
+                        prev_latency = (prev_sample / sr) * pq.s
+                        break
+                    idx_arr = getattr(sg, "idx_arr", None)
+                    if idx_arr is not None and prev_s < len(idx_arr) and idx_arr[prev_s] is not None:
+                        prev_latency = (idx_arr[prev_s][0] / sr) * pq.s
+                        break
+                if prev_latency is None:
+                    continue
+
+                detected = track_sweep_waveform(
+                    row,
+                    sr,
+                    prev_latency,
+                    threshold=getattr(sg, "tracking_threshold_mv", 0.01),
+                    window_ms=getattr(sg, "tracking_window_ms", 5.0),
+                )
+                if detected is not None:
+                    detections.append((unit_idx, int(detected), int(stimno)))
+
+        return detections
+
+    def _on_live_tracking_result(self, detections, error):
+        """Applies orchestrator detections on the GUI thread."""
+        if error or not detections or self.state is None:
+            return
+        for unit_idx, detected_sample, stimno in detections:
+            self.state.setUnit(detected_sample, stimno=stimno, unit_idx=unit_idx)
+
+    def closeEvent(self, event):
+        state = getattr(self, "state", None)
+        if state is not None:
+            orch = getattr(state, "live_orchestrator", None)
+            if orch is not None:
+                orch.unregister(f"trackingview_{id(self)}")
+        super().closeEvent(event)
 
 
     def updateThresholdFromUnit(self):

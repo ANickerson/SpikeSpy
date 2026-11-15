@@ -1,6 +1,8 @@
 import itertools
 import sys
-from typing import Dict, List, Optional
+import logging
+import time
+from typing import Dict, List, Optional, Any
 import numpy as np
 import quantities as pq
 from neo import Event
@@ -28,7 +30,11 @@ import matplotlib.pyplot as plt
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
 from .MultiTraceView import DialogSignalSelect, DialogPolySelect, DialogDeleteRegion
-from .helpers import qsignal_throttle
+from .helpers import qsignal_throttle, quiet_fail
+from .live_orchestrator import LiveFrameConsumerMixin
+from .viewer_worker import get_task_manager, TaskType, TaskPriority
+
+logger = logging.getLogger(__name__)
 
 
 def _get_mpl_lut(name: str = "gray_r", n: int = 256) -> np.ndarray:
@@ -65,7 +71,7 @@ class EphysTimeAxisItem(pg.AxisItem):
         return [f"{1000 * v / sr:g}" for v in values]
 
 
-class MultiTracePGView(QMainWindow):
+class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
     """
     High-performance PyQtGraph port of MultiTraceView.
     Delivers 60 FPS GPU-accelerated waterfall heatmaps, multi-trace visualization,
@@ -112,6 +118,11 @@ class MultiTracePGView(QMainWindow):
         self._user_hidden: bool = False
         self._was_shown: bool = False
         self._has_initialized_ranges: bool = False
+        self._last_setup_mode: Optional[str] = None
+
+        # Background task manager
+        self._task_manager = get_task_manager()
+        self._viewer_id = f"multitrace_pg_{id(self)}"
 
         # Build UI layout
         self._init_ui()
@@ -485,13 +496,32 @@ class MultiTracePGView(QMainWindow):
         if self.state is None:
             return
 
-        self.references.append(self.state.onLoadNewFile.connect(self.reset_right_axes_data))
-        self.references.append(self.state.onLoadNewFile.connect(self.setup_figure))
-        self.references.append(self.state.onLoadNewFile.connect(self.update_axis))
+        # Register with background task manager
+        self._task_manager.register_viewer(
+            self._viewer_id,
+            self.state,
+            {
+                TaskType.MULTI_TRACE_RENDER: self._on_multi_trace_result,
+                TaskType.RIGHT_AXIS_UPDATE: self._on_right_axis_result,
+                TaskType.SPIKE_GROUP_UPDATE: self._on_spike_group_result,
+            }
+        )
+
+        # Static file loads are processed through the same orchestrator
+        # pipeline as live sweeps (single point of view processing).
+        self._register_data_reload(
+            state,
+            lambda: (
+                self.reset_right_axes_data(),
+                self.setup_figure(),
+                self.update_axis(),
+            ),
+            name="reload_setup",
+        )
 
         def _on_unit_updated(*args):
             self.render()
-            self.reset_right_axes_data()
+            self._schedule_right_axis_update(force=True)
 
         self.references.append(self.state.onUnitGroupChange.connect(_on_unit_updated))
         self.references.append(self.state.onUnitChange.connect(_on_unit_updated))
@@ -503,16 +533,20 @@ class MultiTracePGView(QMainWindow):
             self.references.append(self.state.onChannelChange.connect(self._on_channel_change))
 
         if hasattr(self.state, "onNewSweep"):
-            self.on_new_sweep_throttled = qsignal_throttle(lambda: self.on_new_sweep(self.state.stimno if self.state else 0), 40)
-            self.references.append(self.state.onNewSweep.connect(self.on_new_sweep_throttled))
+            self.on_new_sweep_throttled = qsignal_throttle(lambda: self._schedule_render(self.state.stimno if self.state else 0), 40)
+        # Live sweeps arrive through the state's LiveOrchestrator (LIFO);
+        # the GUI-side throttle keeps render scheduling rate-limited.
+        self._register_live_frames(state, lambda _stimno: self.on_new_sweep_throttled())
         if hasattr(self.state, "onNewSpikeEvents"):
-            self.references.append(self.state.onNewSpikeEvents.connect(lambda *args: self.render()))
+            self.references.append(self.state.onNewSpikeEvents.connect(lambda *args: self._schedule_spike_group_update()))
 
         self.update_axis()
-        self.reset_right_axes_data()
+        self._schedule_right_axis_update(force=True)
         self.update_window_title()
 
+    @quiet_fail
     def on_new_sweep(self, stimno: Optional[int] = None):
+        """Lightweight sweep handler - schedules heavy work to background thread."""
         if self.is_view_culled():
             self._dirty = True
             return
@@ -534,6 +568,7 @@ class MultiTracePGView(QMainWindow):
 
         has_buf_match = live_buf is not None and len(live_buf) == erp_mag.shape[0]
 
+        # Update running std (lightweight)
         if not hasattr(self, "std") or self.std == 0 or self.std is None or erp_mag.shape[0] <= 5:
             std_val = np.std(erp_mag)
             self.std = float(std_val.magnitude if hasattr(std_val, "magnitude") else std_val) if std_val > 0 else 1.0
@@ -547,44 +582,7 @@ class MultiTracePGView(QMainWindow):
 
         n_sweeps, n_samples = erp_mag.shape
 
-        if self.mode == "heatmap":
-            vmin = self.std * self.lowerSpinBox.value()
-            vmax = self.std * self.upperSpinBox.value()
-            self.lines_curve.setVisible(False)
-            self.active_sweep_curve.setVisible(False)
-            self.img_item.setVisible(True)
-            self.stim_line.setVisible(True)
-
-            if has_buf_match:
-                clipped = live_buf.clipped_data
-            else:
-                clipped = erp_mag
-
-            self.img_item.setImage(clipped, autoLevels=False, levels=(vmin, max(vmin + 0.001, vmax)))
-            self.img_item.setRect(QRectF(0, 0, n_samples, n_sweeps))
-        elif self.mode == "lines":
-            self.img_item.setVisible(False)
-            self.stim_line.setVisible(False)
-            self.lines_curve.setVisible(True)
-            self.active_sweep_curve.setVisible(True)
-
-            p90 = float(self.std.magnitude if hasattr(self.std, "magnitude") else self.std) * 10
-            norm_erp = np.clip(erp_mag, -p90, p90) / (p90 * 2)
-            ys = (norm_erp * -1) + np.arange(n_sweeps)[:, np.newaxis]
-            x = np.arange(n_samples)
-
-            all_x = np.tile(np.append(x, np.nan), n_sweeps)
-            all_y = np.column_stack([ys, np.full(n_sweeps, np.nan)]).ravel()
-            self.lines_curve.setData(all_x, all_y, pen=pg.mkPen(color=(150, 150, 150), width=1), connect="finite")
-
-            stim_idx = min(max(self.state.stimno, 0), n_sweeps - 1)
-            self.active_sweep_curve.setData(x, ys[stim_idx], pen=pg.mkPen(color="purple", width=2))
-        elif self.mode == "unitonly":
-            self.img_item.setVisible(False)
-            self.lines_curve.setVisible(False)
-            self.active_sweep_curve.setVisible(False)
-            self.stim_line.setVisible(False)
-
+        # Lightweight UI updates that must stay on UI thread
         # Adapt xlim and ylim as sweeps arrive without resetting user zoom
         if not getattr(self, "_has_initialized_ranges", False):
             self.main_plot.setXRange(0, n_samples, padding=0)
@@ -597,11 +595,285 @@ class MultiTracePGView(QMainWindow):
             if abs(current_yrange[1] - n_sweeps) <= 3:
                 self.main_plot.setYRange(current_yrange[0], n_sweeps, padding=0)
 
+        # Schedule heavy rendering to background thread
+        if self.mode != getattr(self, "_last_setup_mode", None):
+            self.setup_figure()
+            return
+        self._schedule_render(stimno)
+
+        # Lightweight UI updates
         self.plot_curstim_line(self.state.stimno)
-        self.plot_spikegroups()
-        self.reset_right_axes_data()
+        # plot_spikegroups and reset_right_axes_data now handled by background tasks
+
+    # ===== Background Task Scheduling =====
+
+    def _schedule_render(self, stimno: Optional[int]):
+        """Schedule a render task for the background worker."""
+        if self.is_view_culled() or self.state is None:
+            return
+        
+        live_buf = self.get_live_buffer()
+        if live_buf is not None and len(live_buf) > 0:
+            erp = live_buf.data
+        else:
+            erp = self.get_erp_signal()
+        
+        if erp is None or len(erp) == 0:
+            return
+        
+        erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
+        full_shape = tuple(erp_mag.shape)
+        display = None
+        if live_buf is not None and (full_shape[0] > 2048 or full_shape[1] > 2048):
+            candidate = live_buf.heatmap_decimated_data
+            if candidate is not None and candidate.size > 0:
+                display = candidate.magnitude if hasattr(candidate, "magnitude") else candidate
+
+        payload = {
+            "erp_data": display if display is not None else erp_mag,
+            "erp_full_shape": full_shape,
+            "spike_groups": self.state.spike_groups,
+            "event_signal": self.state.event_signal,
+            "sampling_rate": self.state.sampling_rate,
+            "mode": self.mode,
+            "stimno": self.state.stimno,
+            "lock_to_stim": self.lock_to_stim,
+            "lower_percentile": self.lowerSpinBox.value(),
+            "upper_percentile": self.upperSpinBox.value(),
+            "follow_live": getattr(self.state, "follow_live", True),
+            "channel_names": self._get_channel_names(),
+            "viewer_ref": self,
+            "current_unit_idx": self.get_target_unit_idx(),
+            "show_max": self.toggleMaxMeanButton.isChecked(),
+        }
+        if display is not None:
+            payload["erp_display"] = display
+            payload["erp_display_shape"] = tuple(display.shape)
+
+        self._task_manager.submit_render(
+            self._viewer_id,
+            TaskType.MULTI_TRACE_RENDER,
+            payload,
+            priority=TaskPriority.HIGH,
+        )
+    
+    def _get_channel_names(self) -> List[str]:
+        """Get list of channel names for right axis computation."""
+        names = []
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            chans = self.channel_bar.get_selected_channels()
+            names.extend(chans)
+        elif self.state.analog_signal is not None:
+            names.append(self.state.analog_signal.name)
+        return names
+    
+    def _schedule_right_axis_update(self, force: bool = False):
+        """Schedule right axis data computation."""
+        if self.state is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
+            return
+        
+        live_buf = self.get_live_buffer()
+        if live_buf is not None and len(live_buf) > 0:
+            erp = live_buf.data
+        else:
+            erp = self.get_erp_signal()
+        
+        if erp is None or len(erp) == 0:
+            return
+
+        now = time.monotonic()
+        if not force and now - getattr(self, "_last_right_axis_update_time", 0.0) < 0.1:
+            return
+        self._last_right_axis_update_time = now
+        
+        erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
+        
+        self._task_manager.submit_render(
+            self._viewer_id,
+            TaskType.RIGHT_AXIS_UPDATE,
+            {
+                "erp_data": erp_mag,
+                "event_signal": self.state.event_signal,
+                "spike_groups": self.state.spike_groups,
+                "sampling_rate": self.state.sampling_rate,
+                "viewer_ref": self,
+                "channel_names": self._get_channel_names(),
+                "show_max": self.toggleMaxMeanButton.isChecked(),
+            },
+            priority=TaskPriority.LOW,
+        )
+    
+    def _schedule_spike_group_update(self):
+        """Schedule spike group points computation."""
+        if self.state is None or self.state.event_signal is None:
+            return
+        
+        self._task_manager.submit_render(
+            self._viewer_id,
+            TaskType.SPIKE_GROUP_UPDATE,
+            {
+                "event_signal": self.state.event_signal,
+                "spike_groups": self.state.spike_groups,
+                "sampling_rate": self.state.sampling_rate,
+                "current_unit_idx": self.get_target_unit_idx(),
+            },
+            priority=TaskPriority.NORMAL,
+        )
+    
+    # ===== Background Task Result Handlers =====
+
+    def _on_multi_trace_result(self, result: Dict[str, Any], error: str):
+        """Handle completed multi-trace render task."""
+        if error:
+            return
+        if not result:
+            return
+
+        full_shape = result.get("full_shape")
+        if not full_shape:
+            return
+        n_sweeps, n_samples = full_shape
+        
+        if self.mode == "heatmap":
+            vmin = result.get("clim", (None, None))[0]
+            vmax = result.get("clim", (None, None))[1]
+            if vmin is not None and vmax is not None:
+                self.img_item.setLevels((vmin, max(vmin + 0.001, vmax)))
+            
+            clipped_data = result.get("clipped_data")
+            if clipped_data is not None:
+                self.img_item.setImage(clipped_data, autoLevels=False, levels=(vmin, max(vmin + 0.001, vmax)))
+                self.img_item.setRect(QRectF(0, 0, n_samples, n_sweeps))
+        
+        elif self.mode == "lines":
+            # Lines mode rendering is handled in setup_figure
+            pass
+        
+        # Update ylim if provided
+        ylim = result.get("ylim")
+        if ylim is not None:
+            self.main_plot.setYRange(ylim[1], ylim[0], padding=0)
+        
+        # Stim line
+        stimno = result.get("stimno")
+        if stimno is not None:
+            self.plot_curstim_line(stimno)
+        
+        # Spike groups handled by separate result
+    
+    def _on_right_axis_result(self, result: Dict[str, Any], error: str):
+        """Handle completed right axis computation."""
+        if error:
+            return
+        if not result:
+            return
+        
+        self.right_ax_data = result
+        
+        # Update rightPlots dict
+        for k in self.right_ax_data.keys():
+            if k not in self.rightPlots:
+                self.rightPlots[k] = True
+        
+        # Recreate settings dialog if needed
+        if self.settingsDialog is None:
+            self.settingsDialog = DialogSignalSelect(options=self.rightPlots)
+
+            def updateView(k, v):
+                self.rightPlots[k] = v
+                self.plot_right_axis()
+                self.render()
+            
+            self.settingsDialog.changeSelection.connect(updateView)
+        
+        self.plot_right_axis()
+    
+    def _on_spike_group_result(self, result: Dict[int, Dict], error: str):
+        """Handle completed spike group computation."""
+        if error:
+            return
+        if not result:
+            return
+        
+        # Update scatter plots with new data
+        target_unit_idx = self.get_target_unit_idx()
+        
+        # Clear existing scatter items
+        for scat in self.other_unit_scatters:
+            try:
+                self.main_plot.removeItem(scat)
+            except Exception:
+                pass
+        self.other_unit_scatters.clear()
+        
+        for item in self.legend_items:
+            try:
+                self.main_plot.removeItem(item)
+            except Exception:
+                pass
+        self.legend_items.clear()
+        
+        # 1. Other Units (only if "Others" checkbox is checked)
+        if self.includeAllUnitsCheckBox.isChecked():
+            for i, unit in enumerate(self.state.spike_groups):
+                if i == target_unit_idx or getattr(unit, "idx_arr", None) is None:
+                    continue
+                # Use pre-computed points from result
+                if i in result:
+                    data = result[i]
+                    pts_arr = np.column_stack([data["samples"], data["sweeps"]])
+                    if len(pts_arr) > 0:
+                        c = SET2_COLORS[i % len(SET2_COLORS)]
+                        scat = pg.ScatterPlotItem(
+                            x=pts_arr[:, 0],
+                            y=pts_arr[:, 1],
+                            size=8,
+                            symbol="s",
+                            pen=None,
+                            brush=pg.mkBrush(*c, 200),
+                        )
+                        self.main_plot.addItem(scat)
+                        self.other_unit_scatters.append(scat)
+                        
+                        if self.showLegend.isChecked():
+                            unit_name = unit.event.name or str(i)
+                            lbl = pg.TextItem(text=unit_name, color=c, fill=pg.mkBrush(255, 255, 255, 220))
+                            lbl.setPos(pts_arr[0, 0], pts_arr[0, 1])
+                            self.main_plot.addItem(lbl)
+                            self.legend_items.append(lbl)
+        
+        # 2. Tracked Unit (Red)
+        if self.includeUnitCheckbox.isChecked() and 0 <= target_unit_idx < len(self.state.spike_groups):
+            if target_unit_idx in result:
+                data = result[target_unit_idx]
+                pts_arr = np.column_stack([data["samples"], data["sweeps"]])
+                if len(pts_arr) > 0:
+                    self.tracked_unit_scatter.setData(
+                        x=pts_arr[:, 0],
+                        y=pts_arr[:, 1],
+                        size=10,
+                        symbol="s",
+                        pen=None,
+                        brush=pg.mkBrush(255, 0, 0, 220),
+                    )
+                    self.tracked_unit_scatter.setVisible(True)
+                    
+                    if self.showLegend.isChecked():
+                        sg = self.state.spike_groups[target_unit_idx]
+                        unit_name = sg.event.name or str(target_unit_idx)
+                        lbl = pg.TextItem(text=unit_name, color=(255, 0, 0), fill=pg.mkBrush(255, 255, 255, 220))
+                        lbl.setPos(pts_arr[0, 0], pts_arr[0, 1])
+                        self.main_plot.addItem(lbl)
+                        self.legend_items.append(lbl)
+                else:
+                    self.tracked_unit_scatter.clear()
+            else:
+                self.tracked_unit_scatter.clear()
+        else:
+            self.tracked_unit_scatter.clear()
 
     def remove_references(self):
+        self._unregister_live_frames()
         if self.state is not None:
             for ref in self.references:
                 try:
@@ -610,6 +882,7 @@ class MultiTracePGView(QMainWindow):
                     pass
             self.references.clear()
 
+    @quiet_fail
     def update_axis(self):
         if self.state is None or self.state.analog_signal is None or self.state.event_signal is None:
             return
@@ -624,6 +897,7 @@ class MultiTracePGView(QMainWindow):
         self.main_plot.setYRange(0, max(n_sweeps, 1), padding=0)
         self._has_initialized_ranges = True
 
+    @quiet_fail
     def update_ylim(self, curStim: int):
         if self.lock_to_stim and self.state and self.state.event_signal is not None:
             y_range = self.main_plot.viewRange()[1]
@@ -639,6 +913,7 @@ class MultiTracePGView(QMainWindow):
         vmax = self.std * self.upperSpinBox.value()
         self.img_item.setLevels((vmin, max(vmin + 0.001, vmax)))
 
+    @quiet_fail
     def setup_figure(self):
         if self.state is None or self.state.analog_signal is None or self.state.event_signal is None:
             return
@@ -698,7 +973,9 @@ class MultiTracePGView(QMainWindow):
         self.plot_curstim_line(self.state.stimno)
         self.plot_spikegroups()
         self.plot_right_axis()
+        self._last_setup_mode = self.mode
 
+    @quiet_fail
     def plot_curstim_line(self, stimNo: Optional[int] = None, force: bool = False):
         if stimNo is None:
             return
@@ -717,6 +994,7 @@ class MultiTracePGView(QMainWindow):
                 x = np.arange(len(y))
                 self.active_sweep_curve.setData(x, y, pen=pg.mkPen(color="purple", width=2))
 
+    @quiet_fail
     def plot_spikegroups(self):
         if self.state is None or self.state.event_signal is None:
             return
@@ -801,93 +1079,8 @@ class MultiTracePGView(QMainWindow):
         self.plot_spikegroups()
 
     def reset_right_axes_data(self):
-        if self.state is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
-            return
-
-        if len(self.state.event_signal.times) > 1:
-            stimFreq_data = (
-                (1 / np.diff(self.state.event_signal.times).rescale(pq.second)).magnitude,
-                np.arange(1, len(self.state.event_signal.times)),
-            )
-        else:
-            stimFreq_data = (np.array([]), np.array([]))
-
-        ug = self.get_target_unit()
-        if ug is not None:
-            latencies = ug.get_latencies(self.state.event_signal)
-            idx_na = np.isnan(latencies)
-
-            current_spike_diffs = np.diff(latencies[~idx_na])
-            out = np.ones(latencies.shape) * np.nan
-            if len(np.where(~idx_na)[0]) > 1:
-                diffs_mag = current_spike_diffs.rescale(pq.ms).magnitude if hasattr(current_spike_diffs, "magnitude") else current_spike_diffs
-                out[np.where(~idx_na)[0][1:]] = diffs_mag
-
-            self.right_ax_data = {
-                "Stim. Freq. (Hz)": stimFreq_data,
-                "Latency Diff.": (out, np.arange(len(latencies))),
-            }
-        else:
-            self.right_ax_data = {
-                "Stim. Freq. (Hz)": stimFreq_data,
-            }
-
-        sigs_to_check = []
-        if getattr(self.state, "segment", None) is not None and getattr(self.state.segment, "analogsignals", None):
-            sigs_to_check = list(self.state.segment.analogsignals)
-        elif getattr(self.state, "analog_signal", None) is not None:
-            sigs_to_check = [self.state.analog_signal]
-
-        for x in sigs_to_check:
-            try:
-                buf = None
-                if getattr(self.state, "is_streaming", False):
-                    if hasattr(self.state, "_live_aux_erp_buffers") and x.name in self.state._live_aux_erp_buffers:
-                        buf = self.state._live_aux_erp_buffers[x.name]
-                    elif (
-                        getattr(self.state, "_live_erp_buffer", None) is not None
-                        and self.state.analog_signal is not None
-                        and x.name == getattr(self.state.analog_signal, "name", None)
-                    ):
-                        buf = self.state._live_erp_buffer
-
-                if buf is not None:
-                    vals = buf.row_max if self.toggleMaxMeanButton.isChecked() else buf.row_mean
-                    vals_mag = vals.magnitude if hasattr(vals, "magnitude") else vals
-                    self.right_ax_data[x.name] = (
-                        vals_mag,
-                        np.arange(0, len(vals_mag)),
-                    )
-                else:
-                    erp_sig = self.state.get_erp(x, self.state.event_signal)
-                    if erp_sig is not None and len(erp_sig) > 0:
-                        erp_sig_mag = erp_sig.magnitude if hasattr(erp_sig, "magnitude") else erp_sig
-                        if self.toggleMaxMeanButton.isChecked():
-                            vals = np.max(erp_sig_mag, axis=1)
-                        else:
-                            vals = np.mean(erp_sig_mag, axis=1)
-                        vals_mag = vals.magnitude if hasattr(vals, "magnitude") else vals
-                        self.right_ax_data[x.name] = (
-                            vals_mag,
-                            np.arange(0, len(self.state.event_signal.times)),
-                        )
-            except Exception:
-                pass
-
-        for k in self.right_ax_data.keys():
-            if k not in self.rightPlots:
-                self.rightPlots[k] = True
-
-        if self.settingsDialog is None:
-            self.settingsDialog = DialogSignalSelect(options=self.rightPlots)
-
-            def updateView(k, v):
-                self.rightPlots[k] = v
-                self.plot_right_axis()
-
-            self.settingsDialog.changeSelection.connect(updateView)
-
-        self.plot_right_axis()
+        """Schedule right axis data computation to background thread."""
+        self._schedule_right_axis_update(force=True)
 
     def plot_right_axis(self):
         active_axes = [(k, v) for k, v in self.right_ax_data.items() if self.rightPlots.get(k, False)]
@@ -1122,6 +1315,9 @@ class MultiTracePGView(QMainWindow):
 
     def closeEvent(self, event):
         self.remove_references()
+        # Unregister from task manager
+        if hasattr(self, "_task_manager"):
+            self._task_manager.unregister_viewer(self._viewer_id)
         if hasattr(self, "dialogPolySelect"):
             self.dialogPolySelect.close()
         if hasattr(self, "settingsDialog"):

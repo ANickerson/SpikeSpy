@@ -29,11 +29,12 @@ from PySide6.QtWidgets import (
 )
 
 from .ViewerState import ViewerState
+from .live_orchestrator import LiveFrameConsumerMixin
 from .ChannelGroupBar import ChannelGroupDialog
 from PySide6.QtWidgets import QComboBox
 
 
-class SpikeGroupTableView(QWidget):
+class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
     def __init__(
         self,
         parent: Optional[PySide6.QtWidgets.QWidget] = None,
@@ -65,11 +66,15 @@ class SpikeGroupTableView(QWidget):
         if state is not None:
             state.onUnitChange.connect(self.update)
             state.onUnitGroupChange.connect(self.update)
-            state.onLoadNewFile.connect(self.update)
+            if hasattr(state, "onLoadNewFile"):
+                self._register_data_reload(state, self.update)
             if hasattr(state, "onNewSpikeEvents"):
                 state.onNewSpikeEvents.connect(self.update)
             if hasattr(state, "onNewSweep"):
-                state.onNewSweep.connect(self.update)
+                self._register_live_frames(
+                    state,
+                    lambda _stimno: self.update(),
+                )
 
         self.tbl.setSelectionBehavior(QTableView.SelectRows)
         # self.tbl.setSelectionMode(QAbstractItemView.SingleSelection)

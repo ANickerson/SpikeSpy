@@ -6,9 +6,10 @@ from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvas, NavigationToolbar2QT
 
 from spikespy.ViewerState import ViewerState
+from spikespy.live_orchestrator import LiveFrameConsumerMixin
 
 
-class QMatplotlib(QMainWindow):
+class QMatplotlib(LiveFrameConsumerMixin, QMainWindow):
     # Define a custom signal for updating the plot
     plot_update_signal = Signal(bool)
 
@@ -57,7 +58,9 @@ class QMatplotlib(QMainWindow):
         self.state: ViewerState = state
         self.state.onUnitChange.connect(self.onUnitChange)
         self.state.onUnitGroupChange.connect(self.onUnitGroupChange)
-        self.state.onLoadNewFile.connect(self.onLoadNewFile)
+        # Static file loads are processed through the same orchestrator
+        # pipeline as live sweeps (single point of view processing).
+        self._register_data_reload(state, self.onLoadNewFile, name="reload_redraw")
         self.plot_update_signal.emit(True)
         if self.figure is not None:
 

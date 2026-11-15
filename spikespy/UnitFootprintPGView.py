@@ -26,7 +26,11 @@ from PySide6.QtWidgets import (
 import pyqtgraph as pg
 
 from .ViewerState import ViewerState, tracked_neuron_unit
+from .live_orchestrator import LiveFrameConsumerMixin
 from .ChannelGroupBar import ChannelGroupBar
+from .helpers import quiet_fail
+
+logger = logging.getLogger(__name__)
 
 
 def _get_mpl_lut(name: str = "RdBu_r", n: int = 256) -> np.ndarray:
@@ -36,7 +40,7 @@ def _get_mpl_lut(name: str = "RdBu_r", n: int = 256) -> np.ndarray:
     return (colors * 255).astype(np.uint8)
 
 
-class UnitFootprintPGView(QMainWindow):
+class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
     """
     High-performance PyQtGraph port of UnitFootprintView.
     Delivers GPU-accelerated spatiotemporal footprint waterfall heatmaps across
@@ -60,6 +64,19 @@ class UnitFootprintPGView(QMainWindow):
         self._user_hidden: bool = False
         self._was_shown: bool = False
         self.grid_plots: List[Tuple[pg.PlotItem, int, str]] = []
+        self.heat_plot = None
+        self.img_item = None
+        self.zero_line = None
+        self.snips_curve = None
+        self.mean_curve = None
+        self.bar_plot = None
+        self.lag_scatter = None
+        self.trend_line = None
+        self.bars = []
+        self.lag_labels = []
+        self._built_mode = None
+        self._grid_items = []
+        self._grid_layout_size = None
 
         # Color LUT for diverging footprint heatmap
         self._cmap_lut = _get_mpl_lut("RdBu_r")
@@ -190,6 +207,8 @@ class UnitFootprintPGView(QMainWindow):
             self._do_update_plot()
         except RuntimeError:
             pass
+        except Exception:
+            logger.exception("UnitFootprint render failed; skipping frame")
 
     def setVisible(self, visible: bool):
         if not visible:
@@ -224,13 +243,19 @@ class UnitFootprintPGView(QMainWindow):
             if hasattr(self.state, "onUnitGroupChange"):
                 self.state.onUnitGroupChange.connect(lambda *args: self.schedule_update())
             if hasattr(self.state, "onLoadNewFile"):
-                self.state.onLoadNewFile.connect(lambda *args: self.schedule_update())
+                self._register_data_reload(
+                    self.state,
+                    lambda: self.schedule_update(),
+                )
             if hasattr(self.state, "onNewSpikeEvents"):
                 self.state.onNewSpikeEvents.connect(lambda *args: self.schedule_update())
             if hasattr(self.state, "onChannelChange"):
                 self.state.onChannelChange.connect(lambda *args: self.schedule_update())
             if hasattr(self.state, "onNewSweep"):
-                self.state.onNewSweep.connect(lambda *args: self.schedule_update())
+                self._register_live_frames(
+                    self.state,
+                    lambda _stimno: self.schedule_update(),
+                )
             if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
                 self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
                 self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
@@ -299,15 +324,24 @@ class UnitFootprintPGView(QMainWindow):
         if ref_chan not in channels:
             ref_chan = channels[0]
 
-        # Extract last N valid sweep indices and sample latencies for this unit
+        # Extract last N valid sweep indices and sample latencies for this unit.
+        # The scan is bounded to the tail of the sweep history: during live
+        # streaming this runs per render frame, and walking thousands of
+        # historical sweeps each frame would freeze the UI at fast input rates.
         valid_sweeps = []
         valid_samples = []
 
         if getattr(sg, "idx_arr", None) is not None and len(sg.idx_arr) > 0:
-            for s_idx, a in enumerate(list(sg.idx_arr)):
+            idx_arr = sg.idx_arr
+            for s_idx in range(len(idx_arr) - 1, -1, -1):
+                a = idx_arr[s_idx]
                 if a is not None and len(a) > 0 and a[0] is not None:
                     valid_sweeps.append(s_idx)
                     valid_samples.append(int(a[0]))
+                    if len(valid_sweeps) >= last_n:
+                        break
+            valid_sweeps.reverse()
+            valid_samples.reverse()
         elif getattr(sg, "event", None) is not None and len(sg.event) > 0 and self.state.event_signal is not None:
             sw_arr, sa_arr = sg.get_valid_sweep_indices_and_samples(
                 self.state.event_signal, sr, self.state.window_size
@@ -322,7 +356,6 @@ class UnitFootprintPGView(QMainWindow):
         if len(valid_sweeps) > last_n:
             valid_sweeps = valid_sweeps[-last_n:]
             valid_samples = valid_samples[-last_n:]
-
         window_samples = max(8, int(round((window_ms / 1000.0) * sr)))
         if window_samples % 2 != 0:
             window_samples += 1
@@ -481,47 +514,150 @@ class UnitFootprintPGView(QMainWindow):
         """Forces an immediate render pass (useful in tests and manual refreshes)."""
         self._do_update_plot()
 
+    def _reset_graphics_pools(self):
+        self.grid_plots = []
+        self.current_channels = []
+        self.heat_plot = None
+        self.img_item = None
+        self.zero_line = None
+        self.snips_curve = None
+        self.mean_curve = None
+        self.bar_plot = None
+        self.lag_scatter = None
+        self.trend_line = None
+        self.bars = []
+        self.lag_labels = []
+        self._built_mode = None
+        self._grid_items = []
+        self._grid_layout_size = None
+
+    @quiet_fail
     def _do_update_plot(self):
         if self.is_view_culled():
             self._dirty = True
             return
 
         self.render_count = getattr(self, "render_count", 0) + 1
-        self.glw.clear()
-        self.grid_plots = []
-        self.current_channels = []
-        self.heat_plot = None
-        self.img_item = None
-        self.bar_plot = None
-        self.lag_scatter = None
-        self.trend_line = None
-        self.bars = []
 
         if self.state is None:
+            if self._built_mode is not None:
+                self.glw.clear()
+                self._reset_graphics_pools()
             return
 
         mode_idx = self.combo_mode.currentIndex()
+        if mode_idx != self._built_mode:
+            self.glw.clear()
+            self._reset_graphics_pools()
+            self._built_mode = mode_idx
+
         if mode_idx == 0:
             self._plot_single_unit_composite()
         else:
             self._plot_multi_unit_grid()
 
+    def _show_composite_placeholder(self, text: str):
+        if self.heat_plot is not None and getattr(self.heat_plot, "placeholder_text", None) is not None:
+            self.heat_plot.placeholder_text.setText(text)
+            return
+        self.glw.clear()
+        self._reset_graphics_pools()
+        self._built_mode = 0
+        p = self.glw.addPlot(row=0, col=0)
+        p.showGrid(False, False)
+        txt = pg.TextItem(text=text, color=(100, 100, 100), anchor=(0.5, 0.5))
+        p.addItem(txt)
+        p.placeholder_text = txt
+        self.heat_plot = p
+        self.current_channels = []
+
+    def _ensure_composite_layout(self):
+        if self.heat_plot is not None and getattr(self.heat_plot, "placeholder_text", None) is None:
+            return
+        self.glw.clear()
+        self._reset_graphics_pools()
+        self._built_mode = 0
+
+        heat_plot = self.glw.addPlot(row=0, col=0)
+        heat_plot.invertY(True)
+        heat_plot.setLabel("bottom", "Time", units="ms")
+        heat_plot.setLabel("left", "Recording Channel")
+        heat_plot.showGrid(x=True, y=True, alpha=0.2)
+        heat_plot.placeholder_text = None
+
+        img_item = pg.ImageItem(axisOrder="row-major")
+        img_item.setLookupTable(self._cmap_lut)
+        heat_plot.addItem(img_item)
+
+        zero_line = pg.InfiniteLine(pos=0.0, angle=90, pen=pg.mkPen("black", width=1.5, style=Qt.DashLine))
+        heat_plot.addItem(zero_line)
+
+        snips_curve = pg.PlotDataItem(
+            connect="finite", pen=pg.mkPen(color=(120, 120, 120, 50), width=1)
+        )
+        heat_plot.addItem(snips_curve)
+
+        mean_curve = pg.PlotDataItem(connect="finite", pen=pg.mkPen("black", width=2))
+        heat_plot.addItem(mean_curve)
+
+        lag_scatter = pg.ScatterPlotItem(
+            symbol="d", size=12, brush=pg.mkBrush("#00e5ff"), pen=pg.mkPen("black", width=1.2)
+        )
+        heat_plot.addItem(lag_scatter)
+
+        trend_line = pg.PlotDataItem(pen=pg.mkPen(color="#ff1744", width=2, style=Qt.DashLine))
+        heat_plot.addItem(trend_line)
+
+        bar_plot = self.glw.addPlot(row=0, col=1)
+        bar_plot.invertY(True)
+        bar_plot.setYLink(heat_plot)
+        bar_plot.getAxis("left").setStyle(showValues=False)
+        bar_plot.setLabel("bottom", "PTP Amplitude (uV)")
+        bar_plot.showGrid(x=True, y=True, alpha=0.2)
+
+        self.glw.ci.layout.setColumnStretchFactor(0, 4)
+        self.glw.ci.layout.setColumnStretchFactor(1, 1)
+
+        self.heat_plot = heat_plot
+        self.img_item = img_item
+        self.zero_line = zero_line
+        self.snips_curve = snips_curve
+        self.mean_curve = mean_curve
+        self.lag_scatter = lag_scatter
+        self.trend_line = trend_line
+        self.bar_plot = bar_plot
+
+    def _ensure_bars(self, n_ch: int):
+        while len(self.bars) > n_ch:
+            bar = self.bars.pop()
+            self.bar_plot.removeItem(bar)
+        while len(self.bars) < n_ch:
+            bar = pg.BarGraphItem(x0=0, y0=0, width=0, height=0.6, brush=pg.mkBrush("#cfd8dc"), pen=pg.mkPen("black", width=0.8))
+            self.bar_plot.addItem(bar)
+            self.bars.append(bar)
+
+    def _ensure_lag_labels(self, n: int):
+        while len(self.lag_labels) > n:
+            lbl = self.lag_labels.pop()
+            self.heat_plot.removeItem(lbl)
+        while len(self.lag_labels) < n:
+            lbl = pg.TextItem(text="", color="white", fill=pg.mkBrush(0, 0, 0, 180))
+            self.heat_plot.addItem(lbl)
+            self.lag_labels.append(lbl)
+
     def _plot_single_unit_composite(self):
         sg = self.get_target_unit()
         if sg is None:
-            p = self.glw.addPlot(row=0, col=0)
-            txt = pg.TextItem(text="No unit selected", color=(100, 100, 100), anchor=(0.5, 0.5))
-            p.addItem(txt)
-            p.showGrid(False, False)
+            self._show_composite_placeholder("No unit selected")
             return
 
         fp = self.compute_unit_footprint(sg)
         if fp is None:
-            p = self.glw.addPlot(row=0, col=0)
-            txt = pg.TextItem(text="Insufficient events or channel data for unit footprint", color=(100, 100, 100), anchor=(0.5, 0.5))
-            p.addItem(txt)
-            p.showGrid(False, False)
+            self._show_composite_placeholder("Insufficient events or channel data for unit footprint")
             return
+
+        self._ensure_composite_layout()
+        self.heat_plot.placeholder_text = None
 
         channels = fp["channels"]
         self.current_channels = channels
@@ -534,47 +670,25 @@ class UnitFootprintPGView(QMainWindow):
         snippets = fp["snippets"]
         n_ch = len(channels)
 
-        # 1. Left Plot: Spatiotemporal Footprint Heatmap & Waveforms
-        heat_plot = self.glw.addPlot(row=0, col=0)
-        heat_plot.invertY(True)
-        heat_plot.setLabel("bottom", "Time", units="ms")
-        heat_plot.setLabel("left", "Recording Channel")
-        heat_plot.showGrid(x=True, y=True, alpha=0.2)
+        vmax = float(np.max(np.abs(mean_matrix))) if np.max(np.abs(mean_matrix)) > 0 else 1.0
+        scale = 0.38 / (vmax if vmax > 0 else 1.0)
 
-        # Set Custom Channel Ticks on Y-axis
         ticks = [(i, ch) for i, ch in enumerate(channels)]
-        heat_plot.getAxis("left").setTicks([ticks])
+        self.heat_plot.getAxis("left").setTicks([ticks])
 
-        # Title
         unit_name = (
             getattr(sg.event, "name", f"Unit {self.get_target_unit_idx()}")
             if hasattr(sg, "event") and sg.event is not None
             else f"Unit {self.get_target_unit_idx()}"
         )
-        heat_plot.setTitle(f"<b>{unit_name} Footprint ({fp['n_events']} events, Ref: {ref_chan})</b>")
+        self.heat_plot.setTitle(f"<b>{unit_name} Footprint ({fp['n_events']} events, Ref: {ref_chan})</b>")
 
-        # Heatmap ImageItem
-        vmax = float(np.max(np.abs(mean_matrix))) if np.max(np.abs(mean_matrix)) > 0 else 1.0
-        img_item = pg.ImageItem(axisOrder="row-major")
-        img_item.setLookupTable(self._cmap_lut)
-        img_item.setImage(mean_matrix, autoLevels=False, levels=(-vmax, vmax))
-        img_item.setRect(QRectF(t_ms[0], -0.5, t_ms[-1] - t_ms[0], n_ch))
-        heat_plot.addItem(img_item)
+        self.img_item.setImage(mean_matrix, autoLevels=False, levels=(-vmax, vmax))
+        self.img_item.setRect(QRectF(t_ms[0], -0.5, t_ms[-1] - t_ms[0], n_ch))
 
-        # Reference Zero Time Vertical Line
-        zero_line = pg.InfiniteLine(pos=0.0, angle=90, pen=pg.mkPen("black", width=1.5, style=Qt.DashLine))
-        heat_plot.addItem(zero_line)
-
-        self.heat_plot = heat_plot
-        self.img_item = img_item
-        self.zero_line = zero_line
-
-        # Waveforms Overlay & Lag Markers
         if self.chk_overlay_traces.isChecked():
-            scale = 0.38 / (vmax if vmax > 0 else 1.0)
             n_events = snippets.shape[1]
 
-            # Individual traces in gray
             all_snip_x = []
             all_snip_y = []
             for ch_i in range(n_ch):
@@ -585,15 +699,10 @@ class UnitFootprintPGView(QMainWindow):
                     all_snip_y.extend([y_tr, [np.nan]])
 
             if all_snip_x:
-                snips_curve = pg.PlotDataItem(
-                    np.concatenate(all_snip_x),
-                    np.concatenate(all_snip_y),
-                    pen=pg.mkPen(color=(120, 120, 120, 50), width=1),
-                    connect="finite",
-                )
-                heat_plot.addItem(snips_curve)
+                self.snips_curve.setData(np.concatenate(all_snip_x), np.concatenate(all_snip_y))
+            else:
+                self.snips_curve.setData([], [])
 
-            # Mean waveforms in black
             all_mean_x = []
             all_mean_y = []
             for ch_i in range(n_ch):
@@ -603,82 +712,90 @@ class UnitFootprintPGView(QMainWindow):
                 all_mean_y.extend([y_mean, [np.nan]])
 
             if all_mean_x:
-                mean_curve = pg.PlotDataItem(
-                    np.concatenate(all_mean_x),
-                    np.concatenate(all_mean_y),
-                    pen=pg.mkPen("black", width=2),
-                    connect="finite",
-                )
-                heat_plot.addItem(mean_curve)
+                self.mean_curve.setData(np.concatenate(all_mean_x), np.concatenate(all_mean_y))
+            else:
+                self.mean_curve.setData([], [])
 
-            # Lag Scatter Points (Diamonds)
-            lag_scatter = pg.ScatterPlotItem(
-                x=lag_ms,
-                y=np.arange(n_ch),
-                symbol="d",
-                size=12,
-                brush=pg.mkBrush("#00e5ff"),
-                pen=pg.mkPen("black", width=1.2),
-            )
-            heat_plot.addItem(lag_scatter)
-            self.lag_scatter = lag_scatter
+            self.lag_scatter.setData(x=lag_ms, y=np.arange(n_ch))
 
-            # Lag Trend Line for detected channels
             det_indices = [i for i, ch in enumerate(channels) if ch in detected_channels]
             if len(det_indices) > 1:
                 det_sorted = sorted(det_indices)
                 det_x = [lag_ms[i] for i in det_sorted]
                 det_y = det_sorted
-                trend_line = pg.PlotDataItem(
-                    det_x,
-                    det_y,
-                    pen=pg.mkPen(color="#ff1744", width=2, style=Qt.DashLine),
-                )
-                heat_plot.addItem(trend_line)
-                self.trend_line = trend_line
+                self.trend_line.setData(det_x, det_y)
+                self.trend_line.show()
+            else:
+                self.trend_line.hide()
 
-            # Lag text callouts
             dt_range = t_ms[-1] - t_ms[0]
-            for i in det_indices:
+            self._ensure_lag_labels(len(det_indices))
+            for lbl_i, i in enumerate(det_indices):
                 lag = lag_ms[i]
-                txt = f"{lag:+.2f} ms"
-                lbl = pg.TextItem(text=txt, color="white", fill=pg.mkBrush(0, 0, 0, 180))
-                lbl.setPos(lag + (dt_range * 0.02), i)
-                heat_plot.addItem(lbl)
+                self.lag_labels[lbl_i].setText(f"{lag:+.2f} ms")
+                self.lag_labels[lbl_i].setPos(lag + (dt_range * 0.02), i)
+                self.lag_labels[lbl_i].show()
+            self.snips_curve.show()
+            self.mean_curve.show()
+            self.lag_scatter.show()
+        else:
+            self.snips_curve.hide()
+            self.mean_curve.hide()
+            self.lag_scatter.hide()
+            self.trend_line.hide()
+            self._ensure_lag_labels(0)
 
-        heat_plot.setXRange(t_ms[0], t_ms[-1], padding=0)
-        heat_plot.setYRange(-0.5, n_ch - 0.5, padding=0)
+        self.heat_plot.setXRange(t_ms[0], t_ms[-1], padding=0)
+        self.heat_plot.setYRange(-0.5, n_ch - 0.5, padding=0)
 
-        # 2. Right Plot: PTP Amplitude Bar Chart
-        bar_plot = self.glw.addPlot(row=0, col=1)
-        bar_plot.invertY(True)
-        bar_plot.setYLink(heat_plot)
-        bar_plot.getAxis("left").setStyle(showValues=False)
-        bar_plot.setLabel("bottom", "PTP Amplitude (uV)")
-        bar_plot.showGrid(x=True, y=True, alpha=0.2)
-        self.bar_plot = bar_plot
-
-        # Draw bars categorized by channel status
-        y_pos = np.arange(n_ch)
+        self._ensure_bars(n_ch)
         for i, ch in enumerate(channels):
             amp = ptp_amp[i]
             if ch == ref_chan:
-                c = "#1976d2"  # Primary reference: Blue
+                c = "#1976d2"
             elif ch in detected_channels:
-                c = "#388e3c"  # Significant footprint neighbor: Green
+                c = "#388e3c"
             else:
-                c = "#cfd8dc"  # Background contact: Gray
-
-            bar = pg.BarGraphItem(x0=0, y0=i - 0.3, width=amp, height=0.6, brush=pg.mkBrush(c), pen=pg.mkPen("black", width=0.8))
-            bar_plot.addItem(bar)
-            self.bars.append(bar)
+                c = "#cfd8dc"
+            self.bars[i].setOpts(x0=0, y0=i - 0.3, width=amp, height=0.6, brush=pg.mkBrush(c), pen=pg.mkPen("black", width=0.8))
 
         max_amp = float(np.max(ptp_amp)) if len(ptp_amp) > 0 else 1.0
-        bar_plot.setXRange(0, max_amp * 1.35 if max_amp > 0 else 1.0, padding=0)
-        bar_plot.setYRange(-0.5, n_ch - 0.5, padding=0)
+        self.bar_plot.setXRange(0, max_amp * 1.35 if max_amp > 0 else 1.0, padding=0)
+        self.bar_plot.setYRange(-0.5, n_ch - 0.5, padding=0)
 
-        self.glw.ci.layout.setColumnStretchFactor(0, 4)
-        self.glw.ci.layout.setColumnStretchFactor(1, 1)
+    def _ensure_grid_layout(self, n_units: int, n_cols: int):
+        expected = (n_units, n_cols)
+        if self._grid_layout_size == expected and len(self._grid_items) == n_units:
+            return
+        self.glw.clear()
+        self._reset_graphics_pools()
+        self._built_mode = 1
+        self._grid_layout_size = expected
+
+        for u_idx in range(n_units):
+            row = u_idx // n_cols
+            col = u_idx % n_cols
+            plot = self.glw.addPlot(row=row, col=col)
+            plot.invertY(True)
+
+            img_item = pg.ImageItem(axisOrder="row-major")
+            img_item.setLookupTable(self._cmap_lut)
+            plot.addItem(img_item)
+
+            zero_line = pg.InfiniteLine(pos=0.0, angle=90, pen=pg.mkPen("black", width=1, style=Qt.DashLine))
+            plot.addItem(zero_line)
+
+            mean_curve = pg.PlotDataItem(connect="finite", pen=pg.mkPen("black", width=1.2))
+            plot.addItem(mean_curve)
+
+            lag_scatter = pg.ScatterPlotItem(
+                symbol="d", size=8, brush=pg.mkBrush("#00e5ff"), pen=pg.mkPen("black", width=0.8)
+            )
+            plot.addItem(lag_scatter)
+
+            self._grid_items.append((plot, img_item, zero_line, mean_curve, lag_scatter))
+            if col != 0:
+                plot.getAxis("left").setStyle(showValues=False)
 
     def _plot_multi_unit_grid(self):
         units = [
@@ -689,19 +806,16 @@ class UnitFootprintPGView(QMainWindow):
         if not units:
             units = [sg for sg in self.state.spike_groups if sg is not None]
         if not units:
-            p = self.glw.addPlot(row=0, col=0)
-            txt = pg.TextItem(text="No tracked units available", color=(100, 100, 100), anchor=(0.5, 0.5))
-            p.addItem(txt)
-            p.showGrid(False, False)
+            self._show_composite_placeholder("No tracked units available")
             return
 
         n_units = len(units)
         n_cols = min(n_units, 3)
+        self._ensure_grid_layout(n_units, n_cols)
+        del self.grid_plots[:]
 
         for u_idx, sg in enumerate(units):
-            row = u_idx // n_cols
-            col = u_idx % n_cols
-            plot = self.glw.addPlot(row=row, col=col)
+            plot, img_item, zero_line, mean_curve, lag_scatter = self._grid_items[u_idx]
             plot.invertY(True)
 
             fp = self.compute_unit_footprint(sg)
@@ -714,6 +828,10 @@ class UnitFootprintPGView(QMainWindow):
                 plot.setTitle(f"<small>{unit_title} (No Data)</small>")
                 plot.showAxis("left", False)
                 plot.showAxis("bottom", False)
+                img_item.clear()
+                mean_curve.setData([], [])
+                lag_scatter.setData(x=[], y=[])
+                self.grid_plots.append((plot, -1, None))
                 continue
 
             channels = fp["channels"]
@@ -731,17 +849,10 @@ class UnitFootprintPGView(QMainWindow):
                 if sg in self.state.spike_groups
                 else u_idx
             )
-            self.grid_plots.append((plot, sg_original_idx, best_ch))
 
             vmax = float(np.max(np.abs(mean_matrix))) if np.max(np.abs(mean_matrix)) > 0 else 1.0
-            img_item = pg.ImageItem(axisOrder="row-major")
-            img_item.setLookupTable(self._cmap_lut)
             img_item.setImage(mean_matrix, autoLevels=False, levels=(-vmax, vmax))
             img_item.setRect(QRectF(t_ms[0], -0.5, t_ms[-1] - t_ms[0], n_ch))
-            plot.addItem(img_item)
-
-            zero_line = pg.InfiniteLine(pos=0.0, angle=90, pen=pg.mkPen("black", width=1, style=Qt.DashLine))
-            plot.addItem(zero_line)
 
             if self.chk_overlay_traces.isChecked():
                 scale = 0.38 / (vmax if vmax > 0 else 1.0)
@@ -754,30 +865,24 @@ class UnitFootprintPGView(QMainWindow):
                     all_mean_y.extend([y_mean, [np.nan]])
 
                 if all_mean_x:
-                    mean_curve = pg.PlotDataItem(
-                        np.concatenate(all_mean_x),
-                        np.concatenate(all_mean_y),
-                        pen=pg.mkPen("black", width=1.2),
-                        connect="finite",
-                    )
-                    plot.addItem(mean_curve)
+                    mean_curve.setData(np.concatenate(all_mean_x), np.concatenate(all_mean_y))
+                else:
+                    mean_curve.setData([], [])
+                lag_scatter.setData(x=lag_ms, y=np.arange(n_ch))
+                mean_curve.show()
+                lag_scatter.show()
+            else:
+                mean_curve.hide()
+                lag_scatter.hide()
 
-                lag_scatter = pg.ScatterPlotItem(
-                    x=lag_ms,
-                    y=np.arange(n_ch),
-                    symbol="d",
-                    size=8,
-                    brush=pg.mkBrush("#00e5ff"),
-                    pen=pg.mkPen("black", width=0.8),
-                )
-                plot.addItem(lag_scatter)
-
-            if col == 0:
+            if u_idx % n_cols == 0:
                 ticks = [(i, ch) for i, ch in enumerate(channels)]
                 plot.getAxis("left").setTicks([ticks])
+                plot.showAxis("left", True)
             else:
                 plot.getAxis("left").setStyle(showValues=False)
 
+            plot.showAxis("bottom", True)
             plot.setXRange(t_ms[0], t_ms[-1], padding=0)
             plot.setYRange(-0.5, n_ch - 0.5, padding=0)
 
@@ -787,6 +892,8 @@ class UnitFootprintPGView(QMainWindow):
                 else f"Unit {u_idx}"
             )
             plot.setTitle(f"<b>{unit_name}</b> (N={fp['n_events']}, Best: {best_ch})")
+
+            self.grid_plots.append((plot, sg_original_idx, best_ch))
 
     def _on_scene_clicked(self, event):
         """Unified click handler dispatching to composite or grid mode handler."""

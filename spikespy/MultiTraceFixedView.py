@@ -17,6 +17,7 @@ from matplotlib.ticker import Formatter
 from matplotlib.collections import LineCollection
 from spikespy.ViewerState import ViewerState
 from .ChannelGroupBar import ChannelGroupBar
+from .live_orchestrator import LiveFrameConsumerMixin
 import matplotlib.style as mplstyle
 
 mplstyle.use("fast")
@@ -110,8 +111,9 @@ class MultiTraceFixedView(QMatplotlib):
         if hasattr(self.state, "onNewSweep"):
             from spikespy.helpers import qsignal_throttle
             self._throttled_update = qsignal_throttle(self.update_figure, 40)
-            con2 = self.state.onNewSweep.connect(lambda *args: self._throttled_update())
-            self.connections.append(con2)
+        # Live sweeps arrive through the state's LiveOrchestrator (LIFO);
+        # the GUI-side throttle keeps redraws rate-limited.
+        self._register_live_frames(state, lambda _stimno: self._throttled_update())
         if hasattr(self.state, "onNewSpikeEvents"):
             con3 = self.state.onNewSpikeEvents.connect(lambda *args: self.update_figure())
             self.connections.append(con3)
@@ -194,6 +196,7 @@ class MultiTraceFixedView(QMatplotlib):
         return toolbar
 
     def unsetCons(self):
+        self._unregister_live_frames()
         for con in self.connections:
             try:
                 self.state.disconnect(con)

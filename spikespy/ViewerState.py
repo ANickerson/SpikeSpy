@@ -14,7 +14,7 @@ import numpy as np
 import quantities as pq
 from neo import Event
 from neo.io import NixIO, NixIOFr
-from PySide6.QtCore import QObject, Qt, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -56,11 +56,14 @@ from .io_manager import (
 from .processing import (
     BoundedERPCache,
     LiveERPBuffer,
+    DiskRowStore,
+    clear_live_cache_dir,
     MultiAnalogSignal,
     MultiChannelTemplateMatcher,
     create_erp_signals,
 )
 from . import basic_tracking
+from .live_orchestrator import LiveSweepItem
 from .tracking_worker import LiveTrackingManager
 
 lru_numpy_memmap = BoundedERPCache
@@ -343,6 +346,9 @@ class ViewerState(QObject):
     onUnitGroupChange = Signal()
     onStimNoChange = Signal(int)
     onNewSweep = Signal(int)
+    # Live UI refresh period; sweeps arriving within one period trigger a single redraw.
+    # Set to 0 to emit per sweep (synchronous).
+    live_frame_interval_ms: int = 20
     onNewSpikeEvents = Signal(int)
     onStreamStateChanged = Signal(bool)
     onEventsUpdated = Signal()
@@ -363,6 +369,11 @@ class ViewerState(QObject):
         self.analog_signal: neo.AnalogSignal = None
         self.sampling_rate = None
         self.event_signal: neo.Event = None
+        # Growable backing store for live stimulus timestamps. Events are views into
+        # this buffer, so growth must reallocate instead of resizing in place.
+        self._stim_times_buf = np.empty(0, dtype=np.float64)
+        self._stim_times_count = 0
+        self._stim_times_event = None
         self.window_size = 0.5 * pq.s
         self.undo_queue = []
         self.MAX_UNDO = 10
@@ -384,6 +395,11 @@ class ViewerState(QObject):
         self.auto_track_enabled: bool = False
         self.auto_switch_unit_channel: bool = False
         self._live_erp_buffer: Optional[LiveERPBuffer] = None
+        # Store live sweeps in memory-mapped temp files instead of RAM
+        self.live_disk_cache: bool = True
+        self._live_frame_timer = None
+        self._live_frame_pending_idx = None
+        self._live_raw_stores: dict = {}
         self._live_aux_erp_buffers: dict = {}
         self._live_channel_signals: dict = {}
         self.active_channel_names: List[str] = []
@@ -391,6 +407,24 @@ class ViewerState(QObject):
 
         self.tracking_manager = LiveTrackingManager(self)
         self.tracking_manager.spike_tracked.connect(self._on_async_spike_tracked)
+
+        # Orchestrator running view-registered processors on new live sweeps.
+        # Created lazily by `live_orchestrator` when a view first registers.
+        self._live_orchestrator = None
+
+    @property
+    def live_orchestrator(self):
+        """LiveOrchestrator executing view-registered functions on new sweeps.
+
+        Views register processing functions here instead of connecting to
+        onNewSweep with per-view throttles; the orchestrator applies LIFO
+        (latest wins) and numpy-friendly batching.
+        """
+        from .live_orchestrator import LiveOrchestrator
+
+        if self._live_orchestrator is None:
+            self._live_orchestrator = LiveOrchestrator(self)
+        return self._live_orchestrator
 
     @Slot(int, int, int)
     def _on_async_spike_tracked(self, unit_idx: int, detected_sample: int, stimno: int):
@@ -1167,11 +1201,23 @@ class ViewerState(QObject):
 
     def get_peaks(self):
         t = time.time()
+        dpts = self.get_erp()
+        n_sweeps = len(dpts) if dpts is not None else 0
         if self._peaks is not None:
+            from scipy.signal import find_peaks
+
+            for idx_p in range(len(self._peaks)):
+                if self._peaks[idx_p] is None and idx_p < n_sweeps:
+                    d = dpts[idx_p]
+                    if hasattr(d, "magnitude"):
+                        d = d.magnitude
+                    d = np.asarray(d).flatten()
+                    pts, _ = find_peaks(d)
+                    pts_down, _ = find_peaks(-1 * d)
+                    self._peaks[idx_p] = np.sort(np.hstack([pts, pts_down]).flatten())
             return self._peaks
         from scipy.signal import find_peaks
 
-        dpts = self.get_erp()
         all_pts = []
         for d in dpts:
             pts, _ = find_peaks(d)
@@ -1186,6 +1232,7 @@ class ViewerState(QObject):
     def set_window_size(self, window_size):
         self.window_size = window_size * pq.ms
         self._get_erp.cache_clear()
+        self._notify_dataset_loaded("window")
         self.onLoadNewFile.emit()
 
     def get_unit_suggestions(self):
@@ -1217,11 +1264,13 @@ class ViewerState(QObject):
         if self.event_signal is None:
             event_signal = neo.Event()
 
+        self._sync_stim_times_buffer()
         self.sampling_rate = int(np.array(self.analog_signal.sampling_rate.magnitude))
         if len(self.spike_groups) == 0:
             self.spike_groups.append(tracked_neuron_unit(event=Event()))
 
         self.update_idx_arrs()
+        self._notify_dataset_loaded("load")
         self.onLoadNewFile.emit()
         self.undo_queue = []
 
@@ -1314,6 +1363,7 @@ class ViewerState(QObject):
                     if ch_str not in self.active_channel_names:
                         self.active_channel_names.append(ch_str)
 
+        self._release_live_disk_cache()
         self.segment = neo.Segment(name="OpenEphys Live")
         self._live_channel_signals = {}
         self._live_aux_erp_buffers = {}
@@ -1326,6 +1376,7 @@ class ViewerState(QObject):
             sig.units = units
             self._live_channel_signals[ch] = sig
             self._live_aux_erp_buffers[ch] = LiveERPBuffer(
+                disk_backed=self.live_disk_cache,
                 window_samples=window_samples,
                 units=units,
             )
@@ -1340,6 +1391,7 @@ class ViewerState(QObject):
             units=pq.s,
         )
         self.segment.events.append(self.event_signal)
+        self._sync_stim_times_buffer()
 
         if self.spike_groups and len(self.spike_groups) > 0:
             for sg in self.spike_groups:
@@ -1372,6 +1424,7 @@ class ViewerState(QObject):
         self.window_size = (window_size_ms / 1000.0) * pq.s
         self._peaks = []
         self._get_erp.cache_clear()
+        self._notify_dataset_loaded("live_start")
         self.onLoadNewFile.emit()
         self.onStreamStateChanged.emit(True)
 
@@ -1379,6 +1432,7 @@ class ViewerState(QObject):
         """
         Stops the live streaming session.
         """
+        self.flush_live_frame()
         self.is_streaming = False
         self.onStreamStateChanged.emit(False)
 
@@ -1401,6 +1455,7 @@ class ViewerState(QObject):
                 self._get_erp.cache_clear()
                 self.update_idx_arrs()
                 self.onChannelChange.emit(ch_name)
+                self._notify_dataset_loaded("channel")
                 self.onLoadNewFile.emit()
                 if self.event_signal is not None and len(self.event_signal) > 0:
                     self.onStimNoChange.emit(self.stimno)
@@ -1429,6 +1484,7 @@ class ViewerState(QObject):
                 self._get_erp.cache_clear()
                 self.update_idx_arrs()
                 self.onChannelChange.emit(sig_name)
+                self._notify_dataset_loaded("channel")
                 self.onLoadNewFile.emit()
                 if self.event_signal is not None and len(self.event_signal) > 0:
                     self.onStimNoChange.emit(self.stimno)
@@ -1436,6 +1492,80 @@ class ViewerState(QObject):
             else:
                 self.set_data(analog_signal=sig)
                 self.onChannelChange.emit(sig_name)
+
+    def _schedule_live_frame(self, stim_idx: int):
+        """
+        Record that new sweeps arrived and emit onNewSweep/onStimNoChange/onEventsUpdated
+        at most once per live_frame_interval_ms, however many sweeps arrived meanwhile.
+        """
+        self._live_frame_pending_idx = stim_idx
+        if self.live_frame_interval_ms <= 0:
+            self._emit_live_frame()
+            return
+        if self._live_frame_timer is None:
+            self._live_frame_timer = QTimer(self)
+            self._live_frame_timer.setSingleShot(True)
+            self._live_frame_timer.timeout.connect(self._emit_live_frame)
+        if not self._live_frame_timer.isActive():
+            self._live_frame_timer.start(self.live_frame_interval_ms)
+
+    def _emit_live_frame(self):
+        idx = self._live_frame_pending_idx
+        if idx is None:
+            return
+        self._live_frame_pending_idx = None
+        self.onNewSweep.emit(idx)
+        if self.follow_live:
+            self.onStimNoChange.emit(self.stimno)
+        self.onEventsUpdated.emit()
+
+    def flush_live_frame(self):
+        """Emit any pending coalesced live update immediately."""
+        if self._live_frame_timer is not None:
+            self._live_frame_timer.stop()
+        self._emit_live_frame()
+
+    def _store_raw_sweep(self, ch_name: str, wave) -> np.ndarray:
+        """Return a float32 1D array for a raw sweep, disk-backed when live_disk_cache is on."""
+        arr = np.asarray(getattr(wave, "magnitude", wave), dtype=np.float32).ravel()
+        if not self.live_disk_cache:
+            return arr
+        store = self._live_raw_stores.get(ch_name)
+        if store is None:
+            store = DiskRowStore(len(arr), np.float32)
+            self._live_raw_stores[ch_name] = store
+        if store.row_len != len(arr):
+            return arr.copy()  # variable-length sweep: keep in RAM
+        return store.append(arr)
+
+    def _release_live_disk_cache(self):
+        """Drop references to the previous session's disk stores and remove stale cache files."""
+        for store in getattr(self, "_live_raw_stores", {}).values():
+            store.close()
+        self._live_raw_stores = {}
+        clear_live_cache_dir()
+
+    def _sync_stim_times_buffer(self):
+        """Rebuild the growable stimulus buffer from the current event_signal."""
+        ev = self.event_signal
+        self._stim_times_event = ev
+        if ev is None:
+            self._stim_times_buf = np.empty(0, dtype=np.float64)
+            self._stim_times_count = 0
+            return
+        arr = ev.as_array() if hasattr(ev, "as_array") else np.asarray(ev)
+        arr = np.ascontiguousarray(arr, dtype=np.float64).ravel()
+        self._stim_times_buf = arr.copy()
+        self._stim_times_count = arr.size
+
+    def _grow_stim_times_buffer(self, min_capacity: int):
+        """Double the stimulus buffer capacity, preserving live Event views on the old one."""
+        cap = self._stim_times_buf.size if self._stim_times_buf is not None else 0
+        new_cap = max(16, cap * 2, int(min_capacity))
+        new_buf = np.empty(new_cap, dtype=np.float64)
+        if cap > 0:
+            new_buf[: self._stim_times_count] = self._stim_times_buf[: self._stim_times_count]
+        self._stim_times_buf = new_buf
 
     def append_sweep(
         self,
@@ -1455,20 +1585,30 @@ class ViewerState(QObject):
             stim_ts_q = stim_timestamp.rescale(pq.s)
 
         # Append stim_timestamp to self.event_signal (updating self.segment.events[0] as well)
-        new_times = np.append(self.event_signal.as_array(), stim_ts_q.magnitude) * pq.s
+        ev = self.event_signal
+        if ev is None:
+            ev = neo.Event(np.array([], dtype=float) * pq.s, name="env.stim", units=pq.s)
+            self.event_signal = ev
+        if self._stim_times_event is not ev or self._stim_times_count != len(ev):
+            self._sync_stim_times_buffer()
+        new_stim_idx = self._stim_times_count
+        if new_stim_idx >= self._stim_times_buf.size:
+            self._grow_stim_times_buffer(new_stim_idx + 1)
+        self._stim_times_buf[new_stim_idx] = float(stim_ts_q.magnitude)
+        self._stim_times_count = new_stim_idx + 1
         new_event = neo.Event(
-            new_times,
-            name=self.event_signal.name,
+            self._stim_times_buf[: new_stim_idx + 1],
+            name=ev.name,
             units=pq.s,
-            **self.event_signal.annotations,
+            **ev.annotations,
         )
         if self.segment is not None and len(self.segment.events) > 0:
-            for idx_ev, ev in enumerate(self.segment.events):
-                if ev.name == self.event_signal.name or id(ev) == id(self.event_signal):
+            for idx_ev, seg_ev in enumerate(self.segment.events):
+                if seg_ev.name == ev.name or id(seg_ev) == id(ev):
                     self.segment.events[idx_ev] = new_event
                     break
         self.event_signal = new_event
-        new_stim_idx = len(self.event_signal) - 1
+        self._stim_times_event = new_event
 
         units = self.analog_signal.units if self.analog_signal is not None else pq.uV
         sr = (
@@ -1503,6 +1643,7 @@ class ViewerState(QObject):
                         else int(sr_val * float(self.window_size.rescale(pq.s).magnitude if hasattr(self.window_size, "magnitude") else self.window_size))
                     )
                     self._live_aux_erp_buffers[ch_name] = LiveERPBuffer(
+                        disk_backed=self.live_disk_cache,
                         window_samples=w_samples,
                         units=units,
                     )
@@ -1520,7 +1661,7 @@ class ViewerState(QObject):
                     new_channels_added = True
 
                 sig_slice = neo.AnalogSignal(
-                    ch_wave,
+                    self._store_raw_sweep(ch_name, ch_wave),
                     units=units,
                     sampling_rate=sr,
                     t_start=stim_ts_q - (pre_offset_s * pq.s),
@@ -1547,7 +1688,7 @@ class ViewerState(QObject):
         else:
             # 1D waveform
             sig_slice = neo.AnalogSignal(
-                sweep_waveform,
+                self._store_raw_sweep(getattr(self.analog_signal, "name", "rd.0"), sweep_waveform),
                 units=units,
                 sampling_rate=sr,
                 t_start=stim_ts_q - (pre_offset_s * pq.s),
@@ -1581,6 +1722,7 @@ class ViewerState(QObject):
                                 else int(sr_val * float(self.window_size.rescale(pq.s).magnitude if hasattr(self.window_size, "magnitude") else self.window_size))
                             )
                             self._live_aux_erp_buffers[aux_ch] = LiveERPBuffer(
+                                disk_backed=self.live_disk_cache,
                                 window_samples=w_samples,
                                 units=units,
                             )
@@ -1602,7 +1744,7 @@ class ViewerState(QObject):
                         aux_buf.append_sweep(erp_aux)
                     if hasattr(self, "_live_channel_signals") and aux_ch in self._live_channel_signals:
                         aux_sig = neo.AnalogSignal(
-                            aux_wave,
+                            self._store_raw_sweep(aux_ch, aux_wave),
                             units=units,
                             sampling_rate=sr,
                             t_start=stim_ts_q - (pre_offset_s * pq.s),
@@ -1615,19 +1757,10 @@ class ViewerState(QObject):
         if new_channels_added and hasattr(self, "onChannelGroupsChanged"):
             self.onChannelGroupsChanged.emit()
 
-        # Incrementally computes peaks (find_peaks(d) and find_peaks(-d)) for this single new sweep
+        # Defer peak finding until requested by get_peaks() to avoid GUI thread work per sweep
         if self._peaks is None:
             self._peaks = []
-        from scipy.signal import find_peaks
-
-        d = primary_waveform
-        if hasattr(d, "magnitude"):
-            d = d.magnitude
-        d = np.asarray(d).flatten()
-        pts, _ = find_peaks(d)
-        pts_down, _ = find_peaks(-1 * d)
-        pts = np.sort(np.hstack([pts, pts_down]).flatten())
-        self._peaks.append(pts)
+        self._peaks.append(None)
 
         # Appends None to sg.idx_arr for each sg in self.spike_groups
         for sg in self.spike_groups:
@@ -1686,18 +1819,92 @@ class ViewerState(QObject):
         if getattr(self, "auto_track_enabled", False) or any(getattr(sg, "auto_track", False) for sg in self.spike_groups):
             self.tracking_manager.track_stimulus_async(self, new_stim_idx)
 
-        # Emits signals
-        self.onNewSweep.emit(new_stim_idx)
-        if self.follow_live:
-            if not hasattr(self, "_onStimNoChange_live_throttled"):
-                from spikespy.helpers import qsignal_throttle
-                self._onStimNoChange_live_throttled = qsignal_throttle(
-                    lambda: self.onStimNoChange.emit(self.stimno), 40
-                )
-            self._onStimNoChange_live_throttled()
-        self.onEventsUpdated.emit()
+        # Feed the raw sweep to view-registered orchestrator processors.
+        self._submit_live_item(
+            new_stim_idx,
+            stim_ts_q,
+            sweep_waveform,
+            aux_sweeps,
+            spike_latencies_s,
+            pre_offset_s,
+            is_2d,
+            sr_val,
+        )
+
+        # Coalesce UI notifications: views redraw once per frame, not once per sweep
+        self._schedule_live_frame(new_stim_idx)
 
         return new_stim_idx
+
+    def _submit_live_item(
+        self,
+        stim_idx: int,
+        stim_ts_q,
+        sweep_waveform,
+        aux_sweeps,
+        spike_latencies_s,
+        pre_offset_s: float,
+        is_2d: bool,
+        sr_val: float,
+    ):
+        """Submit one ingested sweep to the live orchestrator (no-op if no view registered)."""
+        orch = self._live_orchestrator
+        if orch is None:
+            return
+
+        channel_sweeps = {}
+        if is_2d and hasattr(sweep_waveform, "shape") and sweep_waveform.ndim == 2:
+            names = list(getattr(self, "active_channel_names", None) or [])
+            for ch_i in range(sweep_waveform.shape[0]):
+                ch_name = names[ch_i] if ch_i < len(names) else f"CH{ch_i}"
+                channel_sweeps[ch_name] = sweep_waveform[ch_i]
+        elif sweep_waveform is not None:
+            ch_name = getattr(self.analog_signal, "name", "") or "CH0"
+            channel_sweeps[ch_name] = sweep_waveform
+        for aux_ch, aux_wave in (aux_sweeps or {}).items():
+            channel_sweeps.setdefault(str(aux_ch), aux_wave)
+
+        ts_s = float(getattr(stim_ts_q, "magnitude", stim_ts_q))
+
+        orch.submit(
+            LiveSweepItem(
+                stim_index=stim_idx,
+                stim_timestamp_s=ts_s,
+                channel_sweeps=channel_sweeps,
+                spike_latencies_s=spike_latencies_s,
+                pre_offset_s=pre_offset_s or 0.0,
+                sampling_rate=sr_val,
+            ),
+            synchronous=self.live_frame_interval_ms <= 0,
+        )
+
+    def _notify_dataset_loaded(self, reason: str):
+        """Submit a static dataset (re)load event to the live orchestrator.
+
+        This keeps static file processing in the same pipeline as live
+        sweeps (single point of view processing); it is a no-op when no view
+        has registered with the orchestrator yet.
+        """
+        orch = self._live_orchestrator
+        if orch is None:
+            return
+        from .live_orchestrator import LiveReloadItem
+
+        sr = (
+            float(np.array(self.sampling_rate.magnitude))
+            if self.sampling_rate is not None and hasattr(self.sampling_rate, "magnitude")
+            else None
+        )
+        n_sweeps = len(self.event_signal) if self.event_signal is not None else 0
+        orch.submit(
+            LiveReloadItem(
+                reason=reason,
+                n_sweeps=n_sweeps,
+                sampling_rate=sr,
+                segment_name=getattr(self.segment, "name", "") or "",
+            ),
+            synchronous=self.live_frame_interval_ms <= 0,
+        )
 
     def append_unit_spikes(
         self,
@@ -1764,13 +1971,26 @@ class ViewerState(QObject):
         )
 
         if len(sg.event) == 0:
-            combined_mag = spikes_mag
+            combined_mag = np.asarray(spikes_mag, dtype=np.float64)
+        elif len(spikes_mag) == 0:
+            combined_mag = np.asarray(ev_mag, dtype=np.float64)
         else:
-            combined_mag = np.concatenate([ev_mag, spikes_mag])
+            combined_mag = np.concatenate(
+                [np.asarray(ev_mag, dtype=np.float64), np.asarray(spikes_mag, dtype=np.float64)]
+            )
 
-        unique_times = np.unique(combined_mag) * pq.s
+        if combined_mag.size > 1 and not np.all(combined_mag[1:] >= combined_mag[:-1]):
+            unique_mag = np.unique(combined_mag)
+        elif combined_mag.size > 1:
+            keep = np.empty(combined_mag.size, dtype=bool)
+            keep[0] = True
+            np.not_equal(combined_mag[1:], combined_mag[:-1], out=keep[1:])
+            unique_mag = combined_mag[keep]
+        else:
+            unique_mag = combined_mag
+
         sg.event = neo.Event(
-            unique_times,
+            unique_mag * pq.s,
             name=sg.event.name,
             units=pq.s,
             **sg.event.annotations,
@@ -1789,31 +2009,37 @@ class ViewerState(QObject):
             while len(sg.idx_arr) < len(self.event_signal):
                 sg.idx_arr.append(None)
 
-            for spike in spikes_q:
-                i = (
-                    int(
-                        np.searchsorted(
-                            self.event_signal.rescale("s"), spike, side="right"
-                        ).base
-                    )
-                    - 1
+            stim_mag = self.event_signal.rescale(pq.s).magnitude
+            spikes_mag_s = spikes_q.rescale(pq.s).magnitude
+            idx = np.searchsorted(stim_mag, spikes_mag_s, side="right") - 1
+            valid = (idx >= 0) & (idx < len(stim_mag))
+            if np.any(valid):
+                clipped = np.clip(idx, 0, len(stim_mag) - 1)
+                lat_s = spikes_mag_s - stim_mag[clipped]
+                window_s = (
+                    float(self.window_size.rescale(pq.s).magnitude)
+                    if hasattr(self.window_size, "rescale")
+                    else float(self.window_size)
                 )
-                if 0 <= i < len(self.event_signal):
-                    lat_s = spike - self.event_signal[i]
-                    if 0 * pq.s <= lat_s <= self.window_size:
-                        sr_val = (
-                            self.sampling_rate
-                            if self.sampling_rate is not None
-                            else (
-                                self.analog_signal.sampling_rate.magnitude
-                                if self.analog_signal is not None
-                                else 30000
-                            )
+                win_mask = valid & (lat_s >= 0) & (lat_s <= window_s)
+                if np.any(win_mask):
+                    sr_src = (
+                        self.sampling_rate
+                        if self.sampling_rate is not None
+                        else (
+                            self.analog_signal.sampling_rate
+                            if self.analog_signal is not None
+                            else 30000
                         )
-                        lat_samples = int(
-                            np.round((lat_s * (sr_val * pq.Hz)).simplified.magnitude)
-                        )
-                        sg.idx_arr[i] = (lat_samples, 1)
+                    )
+                    sr_val = (
+                        float(sr_src.rescale(pq.Hz).magnitude)
+                        if hasattr(sr_src, "rescale")
+                        else float(sr_src)
+                    )
+                    lat_samples = np.round(lat_s[win_mask] * sr_val)
+                    for i, lat_val in zip(idx[win_mask], lat_samples):
+                        sg.idx_arr[int(i)] = (int(lat_val), 1)
 
         self.onNewSpikeEvents.emit(unit_idx)
         self.onEventsUpdated.emit()

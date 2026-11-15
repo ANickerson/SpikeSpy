@@ -1,3 +1,4 @@
+import logging
 from PySide6.QtCore import QTimer
 
 
@@ -13,6 +14,27 @@ def qsignal_throttle(func, interval=33):
             throttleSignalTimer.start()
 
     return start
+
+
+def quiet_fail(func):
+    """Run a data-driven UI callback, logging instead of propagating failures.
+
+    Live streaming drives view update callbacks many times per second; an
+    error raised inside one frame must be logged and dropped, never
+    propagated into the Qt event loop where it can abort the whole
+    application.
+    """
+    log = logging.getLogger(func.__module__)
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            log.exception("Suppressed error in %s", func.__qualname__)
+            return None
+
+    return wrapper
 
 
 from PySide6.QtCore import QTimer

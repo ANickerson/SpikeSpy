@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
 from scipy.signal import fftconvolve, find_peaks
 from .processing import create_erp_signals
 from .ViewerState import ViewerState
+from .live_orchestrator import LiveFrameConsumerMixin
 from .ChannelGroupBar import ChannelGroupBar
 import quantities as pq
 from matplotlib.ticker import Formatter
@@ -89,7 +90,7 @@ class SweepConvProxy:
 # Custom formatter class
 
 
-class SingleTraceView(QMainWindow):
+class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
     def __init__(
         self,
         parent: Optional[PySide6.QtWidgets.QWidget] = None,
@@ -190,7 +191,7 @@ class SingleTraceView(QMainWindow):
         self.spin_chan_spacing.valueChanged.connect(self.updateFigure)
 
         if self.state is not None:
-            self.state.onLoadNewFile.connect(self.updateFigure)
+            self._register_data_reload(state, self.updateFigure)
 
             self.state.onUnitChange.connect(lambda *args: setattr(self, "_histogram_dirty", True))
             self.state.onUnitChange.connect(self.updateFigure)
@@ -201,8 +202,10 @@ class SingleTraceView(QMainWindow):
             self.state.onUnitGroupChange.connect(self.updateHistogram)
             self.state.onStimNoChange.connect(self.updateFigure)
 
-            if hasattr(self.state, "onNewSweep"):
-                self.state.onNewSweep.connect(self.on_new_sweep)
+            self._register_live_frames(
+                self.state,
+                lambda stimno: self.on_new_sweep(stimno),
+            )
             if hasattr(self.state, "onNewSpikeEvents"):
                 self.state.onNewSpikeEvents.connect(lambda *args: setattr(self, "_histogram_dirty", True))
                 self.state.onNewSpikeEvents.connect(lambda *args: self.updateFigure())
