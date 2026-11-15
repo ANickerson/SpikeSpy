@@ -171,8 +171,11 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
         self.glw.ci.layout.setRowStretchFactor(0, 1)
         self.glw.ci.layout.setRowStretchFactor(1, 5)
 
-        # Waveform line
+        # Waveform line: use native PyQtGraph view-aware peak downsampling so
+        # zooming in preserves 100% of samples while zoomed-out views stay fast.
         self.trace_curve = pg.PlotDataItem(pen=pg.mkPen("purple", width=1.5))
+        self.trace_curve.setDownsampling(auto=True, method="peak")
+        self.trace_curve.setClipToView(True)
         self.main_plot.addItem(self.trace_curve)
 
         # Identified spike vertical line
@@ -254,6 +257,8 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
             plot.showGrid(x=True, y=True, alpha=0.3)
             plot.setXLink(self.main_plot)
             curve = pg.PlotDataItem(pen=pg.mkPen(100, 149, 237, width=1.2))
+            curve.setDownsampling(auto=True, method="peak")
+            curve.setClipToView(True)
             plot.addItem(curve)
             self.glw.ci.layout.setRowStretchFactor(row, 5)
             self._aux_plot_by_channel[ch_name] = plot
@@ -304,7 +309,10 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
             return
         if getattr(self.state, "is_streaming", False):
             self._update_sweep_label()
-            self.on_new_sweep(stimno)
+            target_stim = self.state.stimno if stimno is None else int(stimno)
+            if getattr(self, "_last_live_rendered_stim", -1) != target_stim:
+                self._last_live_rendered_stim = target_stim
+                self.on_new_sweep(target_stim)
         else:
             self.update_figure()
 
@@ -355,9 +363,14 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
         self.connections.append(self.state.onUnitChange.connect(self.update_histogram))
         if hasattr(self.state, "onChannelChange"):
             self.connections.append(self.state.onChannelChange.connect(self._on_channel_change_event))
+        def _on_live_frame_cb(stimno):
+            target = self.state.stimno if stimno is None else int(stimno)
+            self._last_live_rendered_stim = target
+            self.on_new_sweep(target)
+
         self._register_live_frames(
             self.state,
-            lambda stimno: self.on_new_sweep(stimno),
+            _on_live_frame_cb,
         )
         if hasattr(self.state, "onNewSpikeEvents"):
             self.connections.append(self.state.onNewSpikeEvents.connect(self.update_histogram))
@@ -436,6 +449,40 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
             # This is kept for compatibility but the throttling is now in _on_new_sweep_core
             self._on_new_sweep_core(stimno)
 
+    def find_candidates_with_detector(
+        self,
+        algorithm: Optional[str] = None,
+        params: Optional[Dict[str, Any]] = None,
+        min_idx: int = 0,
+        max_idx: Optional[int] = None,
+        stim_idx: Optional[int] = None,
+    ):
+        """Find candidate spike peaks on the current sweep using SpikeDetectorRegistry."""
+        from .dsp.detectors import CandidatePeaks, SpikeDetectorRegistry
+
+        erp = self.get_erp_signal()
+        if erp is None or len(erp) == 0 or self.state is None:
+            return CandidatePeaks(np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64))
+        raw_stim = self.state.stimno if stim_idx is None else int(stim_idx)
+        stimno = max(0, min(int(raw_stim), len(erp) - 1))
+        sweep = erp[stimno] if getattr(erp, "ndim", 1) == 2 else erp
+        ug = self.get_target_unit()
+        algo = algorithm or (getattr(ug, "tracking_algorithm", "basic") if ug is not None else "basic")
+        merged = dict(getattr(ug, "tracking_params", {}) or {}) if ug is not None else {}
+        if ug is not None:
+            merged.setdefault("window_ms", float(getattr(ug, "tracking_window_ms", 5.0)))
+            merged.setdefault("threshold", float(getattr(ug, "tracking_threshold_mv", 0.01)))
+        if params:
+            merged.update(params)
+        return SpikeDetectorRegistry.find_candidates(
+            algo,
+            sweep,
+            fs_hz=self._sampling_rate_hz(),
+            params=merged,
+            min_idx=min_idx,
+            max_idx=max_idx,
+        )
+
     # ===== Background Task Scheduling =====
 
     def _schedule_render(self, stimno: Optional[int]):
@@ -498,6 +545,7 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
                 "conv_channels": list(conv_sweeps.keys()),
                 "templates": templates,
                 "skip_convolution": is_streaming,  # Flag to skip fftconvolve in worker
+                "decimate": False,
             },
             priority=TaskPriority.HIGH,
         )

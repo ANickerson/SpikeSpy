@@ -116,8 +116,15 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
 
         self.addButton.clicked.disconnect()
         self.addButton.clicked.connect(self.add_row_and_select)
-        self.spike_tablemodel.dataChanged.connect(self.state.onUnitGroupChange)
+        self.spike_tablemodel.dataChanged.connect(self._on_model_data_changed)
         self.update()
+
+    def _on_model_data_changed(self, *args):
+        if (
+            not getattr(self.spike_tablemodel, "_in_model_update", False)
+            and self.state is not None
+        ):
+            self.state.onUnitGroupChange.emit()
 
     def on_table_context_menu(self, pos):
         index = self.tbl.indexAt(pos)
@@ -339,6 +346,8 @@ class SpikeGroupTableModel(QAbstractTableModel):
         )
         self.spikegroups_func = spikegroups_func
         self.spikegroups = self.spikegroups_func()
+        self._last_row_count = len(self.spikegroups or [])
+        self._in_model_update = False
         self.headers = ["name", "start", "end", "N", "type", "notes", "channel", "neighbors", "track", "win (ms)", "thresh (mV)"]
         self.annotations_to_show = {
             "notes": "notes",
@@ -364,9 +373,21 @@ class SpikeGroupTableModel(QAbstractTableModel):
 
     @Slot()
     def update(self):
-        self.modelAboutToBeReset.emit()
-        self.spikegroups = self.spikegroups_func()
-        self.modelReset.emit()
+        new_groups = self.spikegroups_func() or []
+        new_count = len(new_groups)
+        self.spikegroups = new_groups
+        self._in_model_update = True
+        try:
+            if new_count == self._last_row_count and new_count > 0:
+                top_left = self.index(0, 0)
+                bottom_right = self.index(new_count - 1, self.columnCount() - 1)
+                self.dataChanged.emit(top_left, bottom_right)
+            else:
+                self.modelAboutToBeReset.emit()
+                self._last_row_count = new_count
+                self.modelReset.emit()
+        finally:
+            self._in_model_update = False
 
     def data(
         self,

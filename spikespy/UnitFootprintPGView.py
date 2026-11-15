@@ -69,6 +69,7 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
         self.zero_line = None
         self.snips_curve = None
         self.mean_curve = None
+        self.live_trace_curve = None
         self.bar_plot = None
         self.lag_scatter = None
         self.trend_line = None
@@ -121,6 +122,12 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
         self.chk_overlay_traces.setChecked(True)
         self.chk_overlay_traces.setToolTip("Overlay mean waveforms, individual traces, and peak lag markers")
 
+        self.chk_show_live_trace = QCheckBox("Live Sweep", self)
+        self.chk_show_live_trace.setChecked(False)
+        self.chk_show_live_trace.setToolTip(
+            "Overlay the latest stimulus sweep waveform aligned to the unit's mean latency"
+        )
+
         self.btn_auto_assign_channels = QPushButton("Auto-Detect Unit Channels", self)
         self.btn_auto_assign_channels.setToolTip(
             "Auto-identify primary and neighbor channels based on footprint amplitude"
@@ -136,6 +143,7 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
         self.control_toolbar.addSeparator()
         self.control_toolbar.addWidget(self.chk_align_peaks)
         self.control_toolbar.addWidget(self.chk_overlay_traces)
+        self.control_toolbar.addWidget(self.chk_show_live_trace)
         self.control_toolbar.addSeparator()
         self.control_toolbar.addWidget(self.btn_auto_assign_channels)
         self.addToolBar(self.control_toolbar)
@@ -166,6 +174,7 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
         self.spin_window_ms.valueChanged.connect(self.update_plot)
         self.chk_align_peaks.toggled.connect(self.update_plot)
         self.chk_overlay_traces.toggled.connect(self.update_plot)
+        self.chk_show_live_trace.toggled.connect(self.update_plot)
         self.btn_auto_assign_channels.clicked.connect(lambda: self.auto_detect_unit_channels())
 
         if state is not None:
@@ -283,6 +292,7 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
         last_n: Optional[int] = None,
         window_ms: Optional[float] = None,
         align_peaks: Optional[bool] = None,
+        include_latest_sweep: Optional[bool] = None,
     ) -> Optional[dict]:
         """
         Extracts and aligns spatiotemporal snippets across all available neural channels
@@ -297,173 +307,23 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
             window_ms = self.spin_window_ms.value()
         if align_peaks is None:
             align_peaks = self.chk_align_peaks.isChecked()
-
-        sr = float(
-            self.state.sampling_rate
-            if self.state.sampling_rate is not None
-            else (
-                self.state.analog_signal.sampling_rate.rescale(pq.Hz).magnitude
-                if self.state.analog_signal is not None
-                else 30000.0
+        if include_latest_sweep is None:
+            include_latest_sweep = (
+                self.chk_show_live_trace.isChecked()
+                if hasattr(self, "chk_show_live_trace")
+                else False
             )
+
+        from .dsp.footprint import compute_unit_footprint_from_state
+
+        return compute_unit_footprint_from_state(
+            self.state,
+            sg,
+            last_n=last_n,
+            window_ms=window_ms,
+            align_peaks=align_peaks,
+            include_latest_sweep=include_latest_sweep,
         )
-        if sr <= 0:
-            return None
-
-        # Resolve available recording channels
-        channels = self.state.get_available_channels()
-        if not channels:
-            return None
-
-        # Resolve primary reference channel for this unit
-        ref_chan = (
-            getattr(sg, "channel", "")
-            or getattr(getattr(self.state, "analog_signal", None), "name", "")
-            or channels[0]
-        )
-        if ref_chan not in channels:
-            ref_chan = channels[0]
-
-        # Extract last N valid sweep indices and sample latencies for this unit.
-        # The scan is bounded to the tail of the sweep history: during live
-        # streaming this runs per render frame, and walking thousands of
-        # historical sweeps each frame would freeze the UI at fast input rates.
-        valid_sweeps = []
-        valid_samples = []
-
-        if getattr(sg, "idx_arr", None) is not None and len(sg.idx_arr) > 0:
-            idx_arr = sg.idx_arr
-            for s_idx in range(len(idx_arr) - 1, -1, -1):
-                a = idx_arr[s_idx]
-                if a is not None and len(a) > 0 and a[0] is not None:
-                    valid_sweeps.append(s_idx)
-                    valid_samples.append(int(a[0]))
-                    if len(valid_sweeps) >= last_n:
-                        break
-            valid_sweeps.reverse()
-            valid_samples.reverse()
-        elif getattr(sg, "event", None) is not None and len(sg.event) > 0 and self.state.event_signal is not None:
-            sw_arr, sa_arr = sg.get_valid_sweep_indices_and_samples(
-                self.state.event_signal, sr, self.state.window_size
-            )
-            valid_sweeps = list(sw_arr)
-            valid_samples = list(sa_arr)
-
-        if not valid_sweeps:
-            return None
-
-        # Take only the last N events
-        if len(valid_sweeps) > last_n:
-            valid_sweeps = valid_sweeps[-last_n:]
-            valid_samples = valid_samples[-last_n:]
-        window_samples = max(8, int(round((window_ms / 1000.0) * sr)))
-        if window_samples % 2 != 0:
-            window_samples += 1
-        half_win = window_samples // 2
-        t_ms = (np.arange(window_samples) - half_win) * (1000.0 / sr)
-
-        n_ch = len(channels)
-        n_events = len(valid_sweeps)
-
-        # Fetch ERP for each channel
-        chan_erps = {}
-        for ch in channels:
-            erp = self.state.get_channel_erp(ch)
-            if erp is not None:
-                erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
-                chan_erps[ch] = erp_mag
-            else:
-                chan_erps[ch] = None
-
-        if ref_chan not in chan_erps or chan_erps[ref_chan] is None:
-            return None
-
-        ref_erp = chan_erps[ref_chan]
-        snippets = np.zeros((n_ch, n_events, window_samples), dtype=np.float32)
-
-        for ev_i, (s_idx, s_samp) in enumerate(zip(valid_sweeps, valid_samples)):
-            if s_idx >= ref_erp.shape[0]:
-                continue
-
-            ref_trace = ref_erp[s_idx]
-            n_tot_pts = len(ref_trace)
-
-            center_samp = s_samp
-            if align_peaks:
-                jitter_search_w = max(4, int(0.001 * sr))
-                search_start = max(0, s_samp - jitter_search_w)
-                search_end = min(n_tot_pts, s_samp + jitter_search_w + 1)
-                if search_end > search_start:
-                    sub_win = ref_trace[search_start:search_end]
-                    peak_idx = int(np.argmax(np.abs(sub_win)))
-                    center_samp = search_start + peak_idx
-
-            w_start = center_samp - half_win
-            w_end = center_samp + half_win
-
-            for ch_i, ch in enumerate(channels):
-                c_erp = chan_erps[ch]
-                if c_erp is not None and s_idx < c_erp.shape[0]:
-                    tr = c_erp[s_idx]
-                    pts_avail = len(tr)
-                    src_s = max(0, w_start)
-                    src_e = min(pts_avail, w_end)
-                    dst_s = max(0, -w_start)
-                    dst_e = dst_s + (src_e - src_s)
-                    if src_e > src_s and dst_e <= window_samples:
-                        snippets[ch_i, ev_i, dst_s:dst_e] = tr[src_s:src_e]
-
-        # Compute mean footprint matrix across events: (n_channels, window_samples)
-        mean_matrix = np.mean(snippets, axis=1)
-
-        # Baseline correct each channel
-        base_samples = max(3, int(0.12 * window_samples))
-        for ch_i in range(n_ch):
-            baseline = np.mean(mean_matrix[ch_i, :base_samples])
-            mean_matrix[ch_i, :] -= baseline
-            for ev_i in range(n_events):
-                snippets[ch_i, ev_i, :] -= np.mean(snippets[ch_i, ev_i, :base_samples])
-
-        ptp_amp = np.zeros(n_ch, dtype=np.float32)
-        lag_ms = np.zeros(n_ch, dtype=np.float32)
-        snr = np.zeros(n_ch, dtype=np.float32)
-
-        ref_ch_idx = channels.index(ref_chan)
-        ref_peak_idx = int(np.argmax(np.abs(mean_matrix[ref_ch_idx])))
-
-        for ch_i in range(n_ch):
-            ch_mean = mean_matrix[ch_i]
-            ptp_amp[ch_i] = float(np.max(ch_mean) - np.min(ch_mean))
-
-            ch_peak_idx = int(np.argmax(np.abs(ch_mean)))
-            lag_ms[ch_i] = float((ch_peak_idx - ref_peak_idx) * (1000.0 / sr))
-
-            mad = float(np.median(np.abs(ch_mean)))
-            bg_std = (mad / 0.6745) if mad > 1e-9 else float(np.std(ch_mean) or 1.0)
-            if bg_std < 1e-9:
-                bg_std = 1.0
-            snr[ch_i] = float(np.max(np.abs(ch_mean)) / bg_std)
-
-        max_ptp = float(np.max(ptp_amp)) if len(ptp_amp) > 0 else 0.0
-        detected_channels = [
-            channels[i]
-            for i in range(n_ch)
-            if ptp_amp[i] >= 0.25 * max_ptp and snr[i] >= 2.0
-        ]
-
-        return {
-            "channels": channels,
-            "ref_channel": ref_chan,
-            "t_ms": t_ms,
-            "snippets": snippets,
-            "mean_matrix": mean_matrix,
-            "ptp_amp": ptp_amp,
-            "peak_amps": ptp_amp,
-            "lag_ms": lag_ms,
-            "snr": snr,
-            "detected_channels": detected_channels,
-            "n_events": len(valid_sweeps),
-        }
 
     def auto_detect_unit_channels(self, sg: Optional[tracked_neuron_unit] = None):
         """
@@ -479,16 +339,11 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
         if fp is None or len(fp["channels"]) == 0:
             return
 
-        best_idx = int(np.argmax(fp["ptp_amp"]))
-        primary_chan = fp["channels"][best_idx]
-        max_amp = fp["ptp_amp"][best_idx]
+        from .dsp.footprint import auto_detect_channels_from_footprint
 
-        neighbors = []
-        for i, ch in enumerate(fp["channels"]):
-            if ch == primary_chan:
-                continue
-            if max_amp > 0 and fp["ptp_amp"][i] >= 0.30 * max_amp and fp["snr"][i] >= 2.5:
-                neighbors.append(ch)
+        primary_chan, neighbors = auto_detect_channels_from_footprint(fp)
+        if not primary_chan:
+            return
 
         sg.channel = primary_chan
         sg.neighbor_channels = neighbors
@@ -522,6 +377,7 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
         self.zero_line = None
         self.snips_curve = None
         self.mean_curve = None
+        self.live_trace_curve = None
         self.bar_plot = None
         self.lag_scatter = None
         self.trend_line = None
@@ -600,6 +456,11 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
         mean_curve = pg.PlotDataItem(connect="finite", pen=pg.mkPen("black", width=2))
         heat_plot.addItem(mean_curve)
 
+        live_trace_curve = pg.PlotDataItem(
+            connect="finite", pen=pg.mkPen(color="#ff9100", width=1.8, style=Qt.DashLine)
+        )
+        heat_plot.addItem(live_trace_curve)
+
         lag_scatter = pg.ScatterPlotItem(
             symbol="d", size=12, brush=pg.mkBrush("#00e5ff"), pen=pg.mkPen("black", width=1.2)
         )
@@ -623,6 +484,7 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
         self.zero_line = zero_line
         self.snips_curve = snips_curve
         self.mean_curve = mean_curve
+        self.live_trace_curve = live_trace_curve
         self.lag_scatter = lag_scatter
         self.trend_line = trend_line
         self.bar_plot = bar_plot
@@ -744,6 +606,25 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
             self.lag_scatter.hide()
             self.trend_line.hide()
             self._ensure_lag_labels(0)
+
+        live_wfs = fp.get("latest_sweep_waveforms")
+        if self.chk_show_live_trace.isChecked() and live_wfs is not None and self.live_trace_curve is not None:
+            all_live_x = []
+            all_live_y = []
+            for ch_i in range(min(n_ch, live_wfs.shape[0])):
+                l_tr = live_wfs[ch_i, :]
+                y_live = ch_i - (l_tr * scale)
+                all_live_x.extend([t_ms, [np.nan]])
+                all_live_y.extend([y_live, [np.nan]])
+            if all_live_x:
+                self.live_trace_curve.setData(np.concatenate(all_live_x), np.concatenate(all_live_y))
+                self.live_trace_curve.show()
+            else:
+                self.live_trace_curve.setData([], [])
+                self.live_trace_curve.hide()
+        elif self.live_trace_curve is not None:
+            self.live_trace_curve.setData([], [])
+            self.live_trace_curve.hide()
 
         self.heat_plot.setXRange(t_ms[0], t_ms[-1], padding=0)
         self.heat_plot.setYRange(-0.5, n_ch - 0.5, padding=0)
@@ -946,6 +827,7 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
             "window_ms": self.spin_window_ms.value(),
             "align_peaks": self.chk_align_peaks.isChecked(),
             "overlay_traces": self.chk_overlay_traces.isChecked(),
+            "show_live_trace": self.chk_show_live_trace.isChecked(),
         }
         if hasattr(self, "channel_bar"):
             res["channel_bar"] = self.channel_bar.get_settings()
@@ -967,4 +849,6 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
             self.chk_align_peaks.setChecked(bool(values["align_peaks"]))
         if "overlay_traces" in values:
             self.chk_overlay_traces.setChecked(bool(values["overlay_traces"]))
+        if "show_live_trace" in values:
+            self.chk_show_live_trace.setChecked(bool(values["show_live_trace"]))
         self.update_plot()

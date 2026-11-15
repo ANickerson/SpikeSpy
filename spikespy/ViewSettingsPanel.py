@@ -242,6 +242,35 @@ class ViewSettingsPanel(QWidget):
     # ---------------------------------------------------------
     # Active View Tracking & Population
     # ---------------------------------------------------------
+    def _is_view_alive(self, w: Optional[QWidget]) -> bool:
+        if w is None:
+            return False
+        try:
+            _ = w.objectName()
+            return True
+        except RuntimeError:
+            return False
+
+    def _is_configurable_view(self, w: Optional[QWidget]) -> bool:
+        if not self._is_view_alive(w):
+            return False
+        c_name = w.__class__.__name__
+        if any(
+            k in c_name
+            for k in (
+                "MultiTraceView",
+                "MultiTracePGView",
+                "SingleTraceView",
+                "SingleTracePGView",
+                "MultiTraceFixed",
+                "UnitView",
+                "UnitFootprint",
+                "UnitPG",
+            )
+        ):
+            return True
+        return hasattr(w, "populate_settings_panel") and callable(getattr(w, "populate_settings_panel"))
+
     def _resolve_view(self, w: Optional[QWidget]) -> Optional[QWidget]:
         if w is None:
             return None
@@ -257,7 +286,7 @@ class ViewSettingsPanel(QWidget):
         found_view = None
         while curr is not None:
             c_name = curr.__class__.__name__
-            if any(k in c_name for k in ("MultiTrace", "SingleTrace", "UnitView", "UnitFootprint", "UnitPG", "ChannelGroupContainer")):
+            if any(k in c_name for k in ("MultiTrace", "SingleTrace", "UnitView", "UnitFootprint", "UnitPG", "ChannelGroupContainer")) or hasattr(curr, "populate_settings_panel"):
                 found_view = curr
                 break
             curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
@@ -276,12 +305,18 @@ class ViewSettingsPanel(QWidget):
         return w
 
     def setActiveView(self, view: Optional[QWidget]):
-        """Sets the active view to display/edit in this settings panel."""
-        view = self._resolve_view(view)
-        if self.active_view == view:
+        """Sets the active view to display/edit in this settings panel.
+        Retains the latest valid configurable visualizer when non-configurable panels are clicked.
+        """
+        resolved = self._resolve_view(view)
+        if view is not None and not self._is_configurable_view(resolved):
+            if self._is_configurable_view(self.active_view):
+                return
+        if self.active_view == resolved and self._is_view_alive(self.active_view):
             return
 
-        self.active_view = view
+        self.active_view = resolved
+        view = resolved
         self._block_updates = True
 
         # Hide all groups first
@@ -290,6 +325,10 @@ class ViewSettingsPanel(QWidget):
         self.grp_singletrace.setVisible(False)
         self.grp_fixed.setVisible(False)
         self.grp_unit.setVisible(False)
+        if hasattr(self, "_custom_plugin_grp") and self._custom_plugin_grp is not None:
+            self._custom_plugin_grp.setVisible(False)
+            self._custom_plugin_grp.deleteLater()
+            self._custom_plugin_grp = None
 
         if view is None:
             self.lbl_view_title.setText("<b>No View Selected</b>")
@@ -321,6 +360,13 @@ class ViewSettingsPanel(QWidget):
         elif "UnitView" in c_name or "UnitFootprint" in c_name or "UnitPG" in c_name:
             self.grp_unit.setVisible(True)
             self._populate_unit(view)
+
+        elif hasattr(view, "populate_settings_panel") and callable(getattr(view, "populate_settings_panel")):
+            self._custom_plugin_grp = QGroupBox(f"{c_name} Configuration")
+            custom_form = QFormLayout(self._custom_plugin_grp)
+            view.populate_settings_panel(self, custom_form)
+            self.container_layout.insertWidget(self.container_layout.count() - 1, self._custom_plugin_grp)
+            self._custom_plugin_grp.setVisible(True)
 
         else:
             self.placeholder.setText(f"{c_name} has no view-specific visual parameters.")

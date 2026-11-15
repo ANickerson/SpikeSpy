@@ -32,6 +32,7 @@ class TaskType(Enum):
     HISTOGRAM_UPDATE = "histogram_update"
     RIGHT_AXIS_UPDATE = "right_axis_update"
     SPIKE_GROUP_UPDATE = "spike_group_update"
+    FOOTPRINT_RENDER = "footprint_render"
 
 
 class TaskPriority(Enum):
@@ -265,6 +266,7 @@ class ViewerWorker(QThread):
     """Background worker thread that processes viewer tasks."""
     
     task_completed = Signal(int, object, str)  # task_id, result, error
+    footprintRenderReady = Signal(dict)
     
     def __init__(self, task_queue: TaskQueue, parent=None):
         super().__init__(parent)
@@ -320,6 +322,8 @@ class ViewerWorker(QThread):
             return self._process_right_axis(task)
         elif task.task_type == TaskType.SPIKE_GROUP_UPDATE:
             return self._process_spike_group(task)
+        elif task.task_type == TaskType.FOOTPRINT_RENDER:
+            return self._process_footprint_render(task)
         return None
     
     def _process_multi_trace(self, task: ViewerTask) -> Dict[str, Any]:
@@ -376,22 +380,44 @@ class ViewerWorker(QThread):
         data = {}
         
         # Stim frequency
-        if p["event_signal"] is not None and len(p["event_signal"]) > 1:
+        # Check pre-extracted arrays first
+        stim_times = None
+        if "right_axis_stim_times_s" in p and p["right_axis_stim_times_s"] is not None:
+            stim_times = np.asarray(p["right_axis_stim_times_s"], dtype=np.float64)
+        elif p.get("event_signal") is not None and len(p["event_signal"]) > 1:
             try:
                 stim_times = p["event_signal"].times.rescale(pq.second).magnitude
-                if len(stim_times) > 1:
-                    diffs = np.diff(stim_times)
-                    stim_freq = np.divide(
-                        1.0, diffs, out=np.zeros_like(diffs), where=diffs != 0
-                    )
-                    data["Stim. Freq. (Hz)"] = (stim_freq, np.arange(1, len(stim_times)))
             except Exception:
-                pass
+                stim_times = None
+
+        if stim_times is not None and len(stim_times) > 1:
+            diffs = np.diff(stim_times)
+            stim_freq = np.divide(
+                1.0, diffs, out=np.zeros_like(diffs), where=diffs != 0
+            )
+            data["Stim. Freq. (Hz)"] = (stim_freq, np.arange(1, len(stim_times)))
         
         # Latency diffs
-        if p.get("viewer_ref") and p["viewer_ref"].state:
+        # Check pre-extracted arrays first
+        if "right_axis_event_samples" in p and p["right_axis_event_samples"] is not None:
+            try:
+                samples = np.asarray(p["right_axis_event_samples"], dtype=np.float64)
+                fs = float(p.get("right_axis_fs_hz", 30000.0) or 30000.0)
+                latencies = samples / fs
+                idx_na = np.isnan(latencies)
+                if np.any(~idx_na):
+                    valid_lat = latencies[~idx_na]
+                    current_spike_diffs = np.diff(valid_lat)
+                    out = np.ones(latencies.shape) * np.nan
+                    valid_idx = np.where(~idx_na)[0]
+                    if len(valid_idx) > 1:
+                        out[valid_idx[1:]] = current_spike_diffs
+                    data["Latency Diff."] = (out, np.arange(len(latencies)))
+            except Exception:
+                pass
+        elif p.get("viewer_ref") and hasattr(p["viewer_ref"], "state") and p["viewer_ref"].state:
             ug = p["viewer_ref"].state.getUnitGroup()
-            if ug is not None and p["event_signal"] is not None:
+            if ug is not None and p.get("event_signal") is not None:
                 try:
                     latencies = ug.get_latencies(p["event_signal"])
                     idx_na = np.isnan(latencies)
@@ -407,7 +433,13 @@ class ViewerWorker(QThread):
                     pass
         
         # Row stats for channels
-        if p.get("channel_names"):
+        channel_row_stats = p.get("channel_row_stats")
+        if isinstance(channel_row_stats, dict) and channel_row_stats:
+            for ch_name, row_values in channel_row_stats.items():
+                if row_values is not None and len(row_values) > 0:
+                    r_arr = np.asarray(row_values, dtype=np.float32)
+                    data[ch_name] = (r_arr, np.arange(len(r_arr)))
+        elif p.get("channel_names") and p.get("viewer_ref"):
             for ch_name in p["channel_names"]:
                 try:
                     if hasattr(p["viewer_ref"], "state") and p["viewer_ref"].state:
@@ -442,19 +474,36 @@ class ViewerWorker(QThread):
         
         # Check if this is a convolution-only task (LIFO buffer flush)
         convolution_only = p.get("convolution_only", False)
+        decimate = p.get("decimate", True)
         
-        # Decimate primary trace (skip if convolution-only)
+        # Primary trace
         if not convolution_only:
-            primary_x, primary_y = self._decimate_trace(p["primary_erp"], p["sampling_rate"])
+            raw_primary = p["primary_erp"]
+            sr = float(p["sampling_rate"])
+            if decimate:
+                primary_x, primary_y = self._decimate_trace(raw_primary, sr)
+            else:
+                if raw_primary is None or len(raw_primary) == 0:
+                    primary_x, primary_y = np.array([]), np.array([])
+                else:
+                    arr = np.asarray(getattr(raw_primary, "magnitude", raw_primary), dtype=np.float32)
+                    primary_x = np.arange(len(arr)) / sr
+                    primary_y = arr
         else:
             primary_x, primary_y = np.array([]), np.array([])
         
-        # Decimate overlay traces (skip if convolution-only)
+        # Overlay traces
         overlay_data = {}
         if not convolution_only:
+            sr = float(p["sampling_rate"])
             for ch_name, ch_erp in p["overlay_erps"].items():
                 if ch_erp is not None and len(ch_erp) > 0:
-                    ch_x, ch_y = self._decimate_trace(ch_erp, p["sampling_rate"])
+                    if decimate:
+                        ch_x, ch_y = self._decimate_trace(ch_erp, sr)
+                    else:
+                        arr = np.asarray(getattr(ch_erp, "magnitude", ch_erp), dtype=np.float32)
+                        ch_x = np.arange(len(arr)) / sr
+                        ch_y = arr
                     overlay_data[ch_name] = {"x": ch_x, "y": ch_y}
         
         # Template convolution (skip if flagged)
@@ -875,11 +924,130 @@ class ViewerWorker(QThread):
             }
         return spikegroup_points
 
+    def _process_footprint_render(self, task: ViewerTask) -> Dict[str, Any]:
+        """Process UnitFootprint render task off the GUI thread."""
+        p = task.payload
+        result = {}
+        try:
+            from .dsp.footprint import compute_unit_footprint_arrays
+            result = compute_unit_footprint_arrays(p)
+        except Exception:
+            # Fallback footprint array computation from pre-extracted arrays/callable
+            calc_fn = p.get("calc_fn")
+            if callable(calc_fn):
+                result = calc_fn()
+            else:
+                channels = p.get("channels", [])
+                ref_chan = p.get("ref_channel", "") or (channels[0] if channels else "")
+                chan_erps = p.get("chan_erps", {})
+                valid_sweeps = p.get("valid_sweeps", [])
+                valid_samples = p.get("valid_samples", [])
+                sr = float(p.get("sampling_rate", 30000.0))
+                window_ms = float(p.get("window_ms", 4.0))
+                align_peaks = bool(p.get("align_peaks", True))
+                last_n = int(p.get("last_n", 20))
 
-class ViewerTaskManager:
+                if last_n > 0 and len(valid_sweeps) > last_n:
+                    valid_sweeps = valid_sweeps[-last_n:]
+                    valid_samples = valid_samples[-last_n:]
+                window_samples = max(8, int(round((window_ms / 1000.0) * sr)))
+                if window_samples % 2 != 0:
+                    window_samples += 1
+                half_win = window_samples // 2
+                t_ms = (np.arange(window_samples) - half_win) * (1000.0 / sr)
+
+                n_ch = len(channels)
+                n_events = len(valid_sweeps)
+                ref_erp = chan_erps.get(ref_chan)
+
+                if ref_erp is not None and n_events > 0 and n_ch > 0:
+                    snippets = np.zeros((n_ch, n_events, window_samples), dtype=np.float32)
+                    for ev_i, (s_idx, s_samp) in enumerate(zip(valid_sweeps, valid_samples)):
+                        if s_idx >= ref_erp.shape[0]:
+                            continue
+                        ref_trace = ref_erp[s_idx]
+                        n_tot_pts = len(ref_trace)
+                        center_samp = s_samp
+                        if align_peaks:
+                            jitter_search_w = max(4, int(0.001 * sr))
+                            search_start = max(0, s_samp - jitter_search_w)
+                            search_end = min(n_tot_pts, s_samp + jitter_search_w + 1)
+                            if search_end > search_start:
+                                sub_win = ref_trace[search_start:search_end]
+                                peak_idx = int(np.argmax(np.abs(sub_win)))
+                                center_samp = search_start + peak_idx
+
+                        w_start = center_samp - half_win
+                        w_end = center_samp + half_win
+
+                        for ch_i, ch in enumerate(channels):
+                            c_erp = chan_erps.get(ch)
+                            if c_erp is not None and s_idx < c_erp.shape[0]:
+                                tr = c_erp[s_idx]
+                                pts_avail = len(tr)
+                                src_s = max(0, w_start)
+                                src_e = min(pts_avail, w_end)
+                                dst_s = max(0, -w_start)
+                                dst_e = dst_s + (src_e - src_s)
+                                if src_e > src_s and dst_e <= window_samples:
+                                    snippets[ch_i, ev_i, dst_s:dst_e] = tr[src_s:src_e]
+
+                    mean_matrix = np.mean(snippets, axis=1)
+                    base_samples = max(3, int(0.12 * window_samples))
+                    for ch_i in range(n_ch):
+                        baseline = np.mean(mean_matrix[ch_i, :base_samples])
+                        mean_matrix[ch_i, :] -= baseline
+                        for ev_i in range(n_events):
+                            snippets[ch_i, ev_i, :] -= np.mean(snippets[ch_i, ev_i, :base_samples])
+
+                    ptp_amp = np.zeros(n_ch, dtype=np.float32)
+                    lag_ms = np.zeros(n_ch, dtype=np.float32)
+                    snr = np.zeros(n_ch, dtype=np.float32)
+
+                    ref_ch_idx = channels.index(ref_chan) if ref_chan in channels else 0
+                    ref_peak_idx = int(np.argmax(np.abs(mean_matrix[ref_ch_idx])))
+
+                    for ch_i in range(n_ch):
+                        ch_mean = mean_matrix[ch_i]
+                        ptp_amp[ch_i] = float(np.max(ch_mean) - np.min(ch_mean))
+                        ch_peak_idx = int(np.argmax(np.abs(ch_mean)))
+                        lag_ms[ch_i] = float((ch_peak_idx - ref_peak_idx) * (1000.0 / sr))
+                        mad = float(np.median(np.abs(ch_mean)))
+                        bg_std = (mad / 0.6745) if mad > 1e-9 else float(np.std(ch_mean) or 1.0)
+                        if bg_std < 1e-9:
+                            bg_std = 1.0
+                        snr[ch_i] = float(np.max(np.abs(ch_mean)) / bg_std)
+
+                    max_ptp = float(np.max(ptp_amp)) if len(ptp_amp) > 0 else 0.0
+                    detected_channels = [
+                        channels[i]
+                        for i in range(n_ch)
+                        if ptp_amp[i] >= 0.25 * max_ptp and snr[i] >= 2.0
+                    ]
+                    result = {
+                        "channels": channels,
+                        "ref_channel": ref_chan,
+                        "t_ms": t_ms,
+                        "mean_matrix": mean_matrix,
+                        "snippets": snippets,
+                        "ptp_amp": ptp_amp,
+                        "lag_ms": lag_ms,
+                        "snr": snr,
+                        "detected_channels": detected_channels,
+                    }
+
+        if hasattr(self, "footprintRenderReady"):
+            self.footprintRenderReady.emit(result)
+        return result
+
+
+class ViewerTaskManager(QObject):
     """High-level manager for submitting and handling viewer tasks."""
-    
-    def __init__(self, max_workers: int = 2):
+
+    footprintRenderReady = Signal(dict)
+
+    def __init__(self, max_workers: int = 2, parent=None):
+        super().__init__(parent)
         self._queue = TaskQueue(LatestWinsCoalescing())
 
         self._callbacks: Dict[int, Callable[[Any, Optional[str]], None]] = {}
@@ -893,6 +1061,7 @@ class ViewerTaskManager:
         for _ in range(worker_count):
             worker = ViewerWorker(self._queue)
             worker.task_completed.connect(self._on_task_completed)
+            worker.footprintRenderReady.connect(self.footprintRenderReady.emit)
             self._workers.append(worker)
         self._worker = self._workers[0]
         for worker in self._workers:
@@ -977,6 +1146,19 @@ class ViewerTaskManager:
             viewer_id, TaskType.SPIKE_GROUP_UPDATE, payload,
             TaskPriority.NORMAL, coalesce_key="spike_groups"
         )
+
+    def request_footprint_render(self, payload: dict, priority: int = 0) -> int:
+        """Submit footprint render calculation."""
+        prio = TaskPriority.NORMAL
+        if priority > 1:
+            prio = TaskPriority.HIGH
+        elif priority < 0:
+            prio = TaskPriority.LOW
+        viewer_id = str(payload.get("viewer_id", "footprint_viewer"))
+        return self.submit_task(
+            viewer_id, TaskType.FOOTPRINT_RENDER, payload,
+            prio, coalesce_key="footprint_render"
+        )
     
     def cancel_viewer_tasks(self, viewer_id: str):
         """Cancel all pending tasks for a viewer."""
@@ -1060,6 +1242,7 @@ class ViewerTaskManager:
     
     def shutdown(self):
         """Shutdown the task manager."""
+        self._queue.shutdown()
         for worker in self._workers:
             worker.stop()
 
@@ -1068,8 +1251,29 @@ class ViewerTaskManager:
 _task_manager: Optional[ViewerTaskManager] = None
 
 
+def _shutdown_global_task_manager():
+    global _task_manager
+    if _task_manager is not None:
+        try:
+            _task_manager.shutdown()
+        except Exception:
+            pass
+        _task_manager = None
+
+
+import atexit
+atexit.register(_shutdown_global_task_manager)
+
+
 def get_task_manager() -> ViewerTaskManager:
     global _task_manager
     if _task_manager is None:
         _task_manager = ViewerTaskManager(max_workers=2)
+        try:
+            from PySide6.QtCore import QCoreApplication
+            app = QCoreApplication.instance()
+            if app is not None:
+                app.aboutToQuit.connect(_shutdown_global_task_manager)
+        except Exception:
+            pass
     return _task_manager

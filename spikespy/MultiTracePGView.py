@@ -533,7 +533,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             self.references.append(self.state.onChannelChange.connect(self._on_channel_change))
 
         if hasattr(self.state, "onNewSweep"):
-            self.on_new_sweep_throttled = qsignal_throttle(lambda: self._schedule_render(self.state.stimno if self.state else 0), 40)
+            self.on_new_sweep_throttled = qsignal_throttle(lambda: self.on_new_sweep(self.state.stimno if self.state else 0), 40)
         # Live sweeps arrive through the state's LiveOrchestrator (LIFO);
         # the GUI-side throttle keeps render scheduling rate-limited.
         self._register_live_frames(state, lambda _stimno: self.on_new_sweep_throttled())
@@ -607,6 +607,27 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
 
     # ===== Background Task Scheduling =====
 
+    def _extract_channel_row_stats(self, ch_names: List[str], show_max: bool) -> Dict[str, np.ndarray]:
+        stats: Dict[str, np.ndarray] = {}
+        if self.state is None or not getattr(self.state, "is_streaming", False):
+            return stats
+        for ch_name in ch_names:
+            buf = None
+            if hasattr(self.state, "_live_aux_erp_buffers") and ch_name in self.state._live_aux_erp_buffers:
+                buf = self.state._live_aux_erp_buffers[ch_name]
+            elif (
+                getattr(self.state, "_live_erp_buffer", None) is not None
+                and self.state.analog_signal is not None
+                and ch_name == getattr(self.state.analog_signal, "name", None)
+            ):
+                buf = self.state._live_erp_buffer
+            if buf is not None and len(buf) > 0:
+                rv = buf.row_max if show_max else buf.row_mean
+                if hasattr(rv, "magnitude"):
+                    rv = rv.magnitude
+                stats[ch_name] = np.asarray(rv, dtype=np.float32)
+        return stats
+
     def _schedule_render(self, stimno: Optional[int]):
         """Schedule a render task for the background worker."""
         if self.is_view_culled() or self.state is None:
@@ -629,6 +650,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             if candidate is not None and candidate.size > 0:
                 display = candidate.magnitude if hasattr(candidate, "magnitude") else candidate
 
+        ch_names = self._get_channel_names()
+        show_max = self.toggleMaxMeanButton.isChecked()
         payload = {
             "erp_data": display if display is not None else erp_mag,
             "erp_full_shape": full_shape,
@@ -641,10 +664,10 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             "lower_percentile": self.lowerSpinBox.value(),
             "upper_percentile": self.upperSpinBox.value(),
             "follow_live": getattr(self.state, "follow_live", True),
-            "channel_names": self._get_channel_names(),
-            "viewer_ref": self,
+            "channel_names": ch_names,
+            "channel_row_stats": self._extract_channel_row_stats(ch_names, show_max),
             "current_unit_idx": self.get_target_unit_idx(),
-            "show_max": self.toggleMaxMeanButton.isChecked(),
+            "show_max": show_max,
         }
         if display is not None:
             payload["erp_display"] = display
@@ -687,6 +710,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         self._last_right_axis_update_time = now
         
         erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
+        ch_names = self._get_channel_names()
+        show_max = self.toggleMaxMeanButton.isChecked()
         
         self._task_manager.submit_render(
             self._viewer_id,
@@ -696,9 +721,9 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
                 "event_signal": self.state.event_signal,
                 "spike_groups": self.state.spike_groups,
                 "sampling_rate": self.state.sampling_rate,
-                "viewer_ref": self,
-                "channel_names": self._get_channel_names(),
-                "show_max": self.toggleMaxMeanButton.isChecked(),
+                "channel_names": ch_names,
+                "channel_row_stats": self._extract_channel_row_stats(ch_names, show_max),
+                "show_max": show_max,
             },
             priority=TaskPriority.LOW,
         )

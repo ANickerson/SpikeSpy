@@ -82,6 +82,12 @@ from .ChannelGroupBar import ChannelGroupBar, ChannelGroupDialog
 from .SharedChannelPanel import SharedChannelPanel
 from .ChannelGroupContainer import ChannelGroupContainerView
 from .ViewSettingsPanel import ViewSettingsPanel
+from .dsp.detectors import (
+    DetectorParamSpec,
+    SpikeDetectorPlugin,
+    SpikeDetectorRegistry,
+    register_spike_detector,
+)
 import PySide6QtAds as QtAds
 from typing import Dict
 
@@ -639,7 +645,8 @@ class MdiView(QMainWindow):
         self.shortcut_copylast = QShortcut(
             QKeySequence(Qt.Key_Space), self, context=Qt.ApplicationShortcut
         )
-        self.shortcut_copylast.activated.connect(lambda: self.state.setUnit(-1))
+        self.shortcut_copylast.activated.connect(self._on_space_pressed)
+        self.shortcut_follow_live = self.shortcut_copylast
 
         self.shortcut_copynext = QShortcut(
             QKeySequence(Qt.Modifier.SHIFT | Qt.Key.Key_Space),
@@ -767,6 +774,17 @@ class MdiView(QMainWindow):
             QKeySequence(Qt.Key_C), self, context=Qt.ApplicationShortcut
         )
         self.shortcut_copy_previous.activated.connect(copy_previous)
+
+    def _toggle_follow_live(self):
+        if self.state is not None and getattr(self.state, "is_streaming", False):
+            self.state.set_follow_live(not bool(getattr(self.state, "follow_live", True)))
+            return True
+        return False
+
+    def _on_space_pressed(self):
+        if not self._toggle_follow_live():
+            if self.state is not None:
+                self.state.setUnit(-1)
 
     def export_csv(self):
         save_filename = QFileDialog.getSaveFileName(self, "Export")[0]

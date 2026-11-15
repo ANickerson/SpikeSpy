@@ -80,13 +80,19 @@ class tracked_neuron_unit:
     fibre_type: str = ""
     notes: str = ""
     _idx_arr: List[Any] = None
-    event: Event = None
+    _event: Event = field(default=None, repr=False)
     auto_track: bool = False
     tracking_window_ms: float = 5.0
     tracking_threshold_mv: float = 0.01
     tracking_max_skips: int = 1
     tracking_channel: str = ""
     tracking_algorithm: str = "basic"
+    tracking_params: dict = field(default_factory=dict)
+    _cached_window: Optional[Tuple[int, int]] = None
+    _cached_window_len: int = -1
+    _consecutive_misses: int = 0
+    _tracked_count: int = 0
+    _template_matcher: Any = None
 
     def __init__(
         self,
@@ -102,7 +108,14 @@ class tracked_neuron_unit:
         tracking_max_skips: int = 1,
         tracking_channel: str = "",
         tracking_algorithm: str = "basic",
+        tracking_params: dict = None,
     ):
+        self._cached_window = None
+        self._cached_window_len = -1
+        self._consecutive_misses = 0
+        self._tracked_count = 0
+        self._template_matcher = None
+        self.tracking_params = dict(tracking_params) if tracking_params is not None else {}
         self.event = event if event is not None else Event()
         self.channel = channel
         self.neighbor_channels = list(neighbor_channels) if neighbor_channels is not None else []
@@ -117,6 +130,8 @@ class tracked_neuron_unit:
         self.tracking_max_skips = int(ann.get("tracking_max_skips", tracking_max_skips))
         self.tracking_channel = str(ann.get("tracking_channel", tracking_channel))
         self.tracking_algorithm = str(ann.get("tracking_algorithm", tracking_algorithm))
+        if "tracking_params" in ann and isinstance(ann["tracking_params"], dict):
+            self.tracking_params.update(ann["tracking_params"])
 
         # Ensure annotations dictionary has these synced
         if hasattr(self.event, "annotations"):
@@ -126,6 +141,23 @@ class tracked_neuron_unit:
             self.event.annotations["tracking_max_skips"] = self.tracking_max_skips
             self.event.annotations["tracking_channel"] = self.tracking_channel
             self.event.annotations["tracking_algorithm"] = self.tracking_algorithm
+            self.event.annotations["tracking_params"] = self.tracking_params
+
+    @property
+    def event(self):
+        return self._event
+
+    @event.setter
+    def event(self, value):
+        self._event = value
+        self._cached_window = None
+        self._cached_window_len = -1
+
+    @event.deleter
+    def event(self):
+        self._event = None
+        self._cached_window = None
+        self._cached_window_len = -1
 
     @property
     def idx_arr(self):
@@ -134,10 +166,46 @@ class tracked_neuron_unit:
     @idx_arr.setter
     def idx_arr(self, value):
         self._idx_arr = value
+        self._cached_window = None
+        self._cached_window_len = -1
 
     @idx_arr.deleter
     def idx_arr(self):
         self._idx_arr = None
+        self._cached_window = None
+        self._cached_window_len = -1
+
+    @property
+    def window_size(self):
+        return self.tracking_window_ms
+
+    @window_size.setter
+    def window_size(self, val):
+        self.tracking_window_ms = float(val)
+
+    @property
+    def threshold(self):
+        return self.tracking_threshold_mv
+
+    @threshold.setter
+    def threshold(self, val):
+        self.tracking_threshold_mv = float(val)
+
+    @property
+    def max_skip(self):
+        return self.tracking_max_skips
+
+    @max_skip.setter
+    def max_skip(self, val):
+        self.tracking_max_skips = int(val)
+
+    @property
+    def track_limit(self):
+        return getattr(self, "tracking_track_limit", 0)
+
+    @track_limit.setter
+    def track_limit(self, val):
+        self.tracking_track_limit = int(val)
 
     def get_number_of_events(self, event_signal=None, window_size=None):
         if self.event is not None and len(self.event) > 0:
@@ -161,6 +229,14 @@ class tracked_neuron_unit:
 
     def get_window(self, event_signal=None, sampling_rate=None, window_size=None):
         if (
+            self._cached_window is not None
+            and self.event is not None
+            and len(self.event) == self._cached_window_len
+        ):
+            return self._cached_window
+
+        win = None
+        if (
             event_signal is not None
             and sampling_rate is not None
             and self.event is not None
@@ -170,17 +246,22 @@ class tracked_neuron_unit:
                 event_signal, sampling_rate, window_size
             )
             if len(samples) > 0:
-                return (int(np.min(samples)), int(np.max(samples)))
+                win = (int(np.min(samples)), int(np.max(samples)))
 
-        if self._idx_arr is not None:
+        if win is None and self._idx_arr is not None:
             idx_arr_filt = [
                 (x[0] if isinstance(x, (tuple, list)) else x)
                 for x in self._idx_arr
                 if x is not None
             ]
             if len(idx_arr_filt) > 0:
-                return (int(min(idx_arr_filt)), int(max(idx_arr_filt)))
-        return None
+                win = (int(min(idx_arr_filt)), int(max(idx_arr_filt)))
+
+        if win is not None and self.event is not None:
+            self._cached_window = win
+            self._cached_window_len = len(self.event)
+
+        return win
 
     def get_sweep_sample_latencies(
         self,
@@ -428,7 +509,7 @@ class ViewerState(QObject):
 
     @Slot(int, int, int)
     def _on_async_spike_tracked(self, unit_idx: int, detected_sample: int, stimno: int):
-        self.setUnit(detected_sample, stimno=stimno, unit_idx=unit_idx)
+        self.setUnit(detected_sample, stimno=stimno, unit_idx=unit_idx, save_undo=False)
 
     def set_ui_refresh_rate_ms(self, interval_ms: int):
         self.ui_refresh_rate_ms = max(5, int(interval_ms))
@@ -747,7 +828,7 @@ class ViewerState(QObject):
     @Slot(int, int)
     @Slot(int)
     @Slot()
-    def setUnit(self, latency, stimno=None, unit_idx: Optional[int] = None, unitid: Optional[int] = None):
+    def setUnit(self, latency, stimno=None, unit_idx: Optional[int] = None, unitid: Optional[int] = None, save_undo: bool = True):
         if unitid is not None:
             unit_idx = unitid
         if unit_idx is None:
@@ -767,19 +848,20 @@ class ViewerState(QObject):
         sg = self.spike_groups[unit_idx]
         evt = sg.event
 
-        def undo(
-            x=unit_idx,
-            evt=sg.event.copy(),
-            stimno=stimno,
-            self=self,
-        ):
-            evt.sort()
-            self.spike_groups[x].event = evt
-            self.update_idx_arrs()
-            self.onUnitChange.emit(stimno)
-            self.onNewSpikeEvents.emit(x)
+        if save_undo:
+            def undo(
+                x=unit_idx,
+                evt=sg.event.copy(),
+                stimno=stimno,
+                self=self,
+            ):
+                evt.sort()
+                self.spike_groups[x].event = evt
+                self.update_idx_arrs()
+                self.onUnitChange.emit(stimno)
+                self.onNewSpikeEvents.emit(x)
 
-        self.save_undo(undo)
+            self.save_undo(undo)
 
         if len(evt) > 0:
             to_keep = (evt < self.event_signal[stimno]) | (
@@ -956,13 +1038,19 @@ class ViewerState(QObject):
             if ch_erp is None or stimno >= len(ch_erp):
                 continue
 
+            # Check track_limit
+            track_limit = int(getattr(sg, "track_limit", getattr(sg, "tracking_track_limit", 0)))
+            tracked_count = getattr(sg, "_tracked_count", 0)
+            if track_limit > 0 and tracked_count >= track_limit:
+                continue
+
             # Check if unit already has an annotated spike on this sweep
             existing_sample = sg.get_sweep_sample(stimno, self.event_signal, sr, self.window_size)
             if existing_sample is not None:
                 continue
 
             # Find most recent spike latency in prior sweeps within tracking_max_skips
-            max_skips = getattr(sg, "tracking_max_skips", 1)
+            max_skips = int(getattr(sg, "max_skip", getattr(sg, "tracking_max_skips", 1)))
             prev_latency = None
             min_stim = max(0, stimno - 1 - max_skips)
             for prev_s in range(stimno - 1, min_stim - 1, -1):
@@ -979,19 +1067,78 @@ class ViewerState(QObject):
                 continue
 
             sweep_wf = np.asarray(ch_erp[stimno].magnitude if hasattr(ch_erp[stimno], "magnitude") else ch_erp[stimno], dtype=np.float32)
-            thresh_mv = getattr(sg, "tracking_threshold_mv", 0.01)
-            win_ms = getattr(sg, "tracking_window_ms", 5.0)
+            thresh_mv = float(getattr(sg, "threshold", getattr(sg, "tracking_threshold_mv", 0.01)))
+            win_ms = float(getattr(sg, "window_size", getattr(sg, "tracking_window_ms", 5.0)))
+            algorithm = getattr(sg, "tracking_algorithm", "basic") or "basic"
 
-            detected_sample = basic_tracking.track_sweep_waveform(
-                sweep_wf,
-                sr,
-                prev_latency,
-                threshold=thresh_mv,
-                window_ms=win_ms,
-            )
+            detected_sample = None
 
+            # 1. Template matching path
+            if algorithm == "template":
+                matcher = getattr(sg, "_template_matcher", None)
+                if matcher is None:
+                    matcher = MultiChannelTemplateMatcher()
+                    u_chans = self.get_unit_channels(unit_idx)
+                    if not u_chans:
+                        u_chans = [ch]
+                    if matcher.build_template(self, sg, channels=u_chans):
+                        sg._template_matcher = matcher
+                    else:
+                        matcher = None
+
+                if matcher is not None and matcher.templates:
+                    u_chans = self.get_unit_channels(unit_idx) or [ch]
+                    scores = matcher.score_sweep(self, stimno, channels=u_chans)
+                    if scores is not None and len(scores) > 0:
+                        prev_s_val = float(prev_latency.rescale(pq.s).magnitude if hasattr(prev_latency, "rescale") else prev_latency)
+                        prev_samp = int(round(prev_s_val * sr))
+                        half_w = max(1, int(round((win_ms / 1000.0 / 2.0) * sr)))
+                        s_start = max(0, prev_samp - half_w)
+                        s_end = min(len(scores), prev_samp + half_w + 1)
+                        if s_end > s_start:
+                            snip_scores = scores[s_start:s_end]
+                            if len(snip_scores) > 0 and np.max(snip_scores) >= thresh_mv:
+                                detected_sample = s_start + int(np.argmax(snip_scores))
+
+            # 2. Check SpikeDetectorRegistry for registered algorithms
+            if detected_sample is None and algorithm != "template":
+                try:
+                    from .dsp.detectors import SpikeDetectorRegistry
+                    detector = SpikeDetectorRegistry.get(algorithm)
+                except Exception:
+                    detector = None
+
+                if detector is not None:
+                    params = {
+                        **detector.default_params(),
+                        "window_ms": float(win_ms),
+                        "threshold": float(thresh_mv),
+                        "max_skip": int(max_skips),
+                        "track_limit": int(track_limit),
+                        **getattr(sg, "tracking_params", {}),
+                    }
+                    detected_sample = detector.detect_sweep(
+                        sweep_wf=sweep_wf,
+                        sampling_rate=sr,
+                        prev_latency=prev_latency,
+                        params=params,
+                    )
+
+            # 3. Fallback to basic tracking
+            if detected_sample is None and algorithm not in ("template",):
+                detected_sample = basic_tracking.track_sweep_waveform(
+                    sweep_wf,
+                    sr,
+                    prev_latency,
+                    threshold=thresh_mv,
+                    window_ms=win_ms,
+                )
+
+            consecutive_misses = getattr(sg, "_consecutive_misses", 0)
             if detected_sample is not None:
-                self.setUnit(detected_sample, stimno=stimno, unit_idx=unit_idx)
+                sg._consecutive_misses = 0
+                sg._tracked_count = getattr(sg, "_tracked_count", 0) + 1
+                self.setUnit(detected_sample, stimno=stimno, unit_idx=unit_idx, save_undo=False)
                 results.append({
                     "unit_idx": unit_idx,
                     "unit": sg.event.name,
@@ -1000,6 +1147,11 @@ class ViewerState(QObject):
                     "sample": detected_sample,
                     "latency_ms": (detected_sample / sr) * 1000.0,
                 })
+            else:
+                sg._consecutive_misses = consecutive_misses + 1
+                if sg._consecutive_misses > max_skips:
+                    # Exceeded max skip consecutive misses
+                    pass
 
         return results
 
@@ -1518,6 +1670,16 @@ class ViewerState(QObject):
         if self.follow_live:
             self.onStimNoChange.emit(self.stimno)
         self.onEventsUpdated.emit()
+        if (
+            self.live_frame_interval_ms <= 0
+            and not getattr(self, "_in_live_frame_process_events", False)
+            and QApplication.instance() is not None
+        ):
+            self._in_live_frame_process_events = True
+            try:
+                QApplication.processEvents()
+            finally:
+                self._in_live_frame_process_events = False
 
     def flush_live_frame(self):
         """Emit any pending coalesced live update immediately."""
@@ -1816,8 +1978,19 @@ class ViewerState(QObject):
             self.stimno = new_stim_idx
 
         # Live multi-unit auto-tracking (asynchronous on background thread pool)
-        if getattr(self, "auto_track_enabled", False) or any(getattr(sg, "auto_track", False) for sg in self.spike_groups):
-            self.tracking_manager.track_stimulus_async(self, new_stim_idx)
+        # Avoid race if live_orchestrator already has a tracking function registered
+        orch = getattr(self, "_live_orchestrator", None)
+        has_orch_tracker = False
+        if orch is not None:
+            if getattr(orch, "_tracking_fn", None) is not None:
+                has_orch_tracker = True
+            elif hasattr(orch, "_registrations"):
+                with orch._cond:
+                    has_orch_tracker = any(reg.name == "auto_track" for reg in orch._registrations.values())
+
+        if not has_orch_tracker:
+            if getattr(self, "auto_track_enabled", False) or any(getattr(sg, "auto_track", False) for sg in self.spike_groups):
+                self.tracking_manager.track_stimulus_async(self, new_stim_idx)
 
         # Feed the raw sweep to view-registered orchestrator processors.
         self._submit_live_item(
