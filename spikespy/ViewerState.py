@@ -6,7 +6,6 @@ from functools import lru_cache
 from pathlib import Path
 import time
 from tempfile import tempdir
-from turtle import update
 from typing import Any, List, Optional, Tuple, Union
 
 import neo
@@ -456,6 +455,8 @@ class ViewerState(QObject):
     onChannelGroupsChanged = Signal()
     onSharedChannelSetChanged = Signal(str)
     onHideViewTopBarsChanged = Signal(bool)
+    onFollowLiveChanged = Signal(bool)
+    onFollowLiveEventsChanged = Signal(bool)
 
     def __init__(self, parent=None, segment=None, spike_groups=None):
         super().__init__(parent)
@@ -1324,8 +1325,46 @@ class ViewerState(QObject):
         t = self.event_signal[stimno] + (offset / self.analog_signal.sampling_rate)
         return Event(t)
 
+    def get_latest_event_idx(self) -> Optional[int]:
+        """Returns the index of the latest stimulus sweep / event."""
+        if self.event_signal is not None and len(self.event_signal) > 0:
+            return len(self.event_signal) - 1
+        if self._live_erp_buffer is not None and self._live_erp_buffer.n_sweeps > 0:
+            return self._live_erp_buffer.n_sweeps - 1
+        return 0 if self.event_signal is not None else None
+
+    def is_following_live_events(self) -> bool:
+        """
+        Determines if following live new events (i.e. is the idx being kept in sync with latest).
+        """
+        if not getattr(self, "follow_live", True):
+            return False
+        latest = self.get_latest_event_idx()
+        if latest is None:
+            return bool(self.follow_live)
+        return self.stimno == latest
+
+    def set_follow_live(self, follow: bool):
+        """Enables or disables following live new events. When enabled, syncs to latest index."""
+        self.follow_live = bool(follow)
+        if self.follow_live:
+            latest = self.get_latest_event_idx()
+            if latest is not None and self.stimno != latest:
+                self.setStimNo(latest, user_set=False)
+        self.onFollowLiveChanged.emit(self.follow_live)
+        self.onFollowLiveEventsChanged.emit(self.follow_live)
+
+    def set_follow_live_events(self, enable: bool):
+        self.set_follow_live(enable)
+
     @Slot(int)
-    def setStimNo(self, stimno: int):
+    def setStimNo(self, stimno: int, user_set: bool = True):
+        # If the user manually sets (e.g. with arrow keys), stop tracing the event
+        if user_set and getattr(self, "follow_live", False):
+            self.follow_live = False
+            self.onFollowLiveChanged.emit(False)
+            self.onFollowLiveEventsChanged.emit(False)
+
         if self.event_signal is None or len(self.event_signal) == 0:
             if self.stimno != 0:
                 self.stimno = 0

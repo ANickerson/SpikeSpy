@@ -2,8 +2,8 @@ import logging
 from typing import Any, Dict, List, Optional, Union
 
 import PySide6
-from PySide6.QtCore import Qt, Signal, Slot
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtCore import QSignalBlocker, Qt, Signal, Slot
+from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -100,6 +100,7 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
     ):
         super().__init__(parent)
         self.state = state
+        self.view_state = None
         self.container_name = name
         self.sub_views: List[QWidget] = []
         self._cards: List[Any] = []
@@ -149,6 +150,14 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
         )
         self.chk_follow_live.toggled.connect(self._on_follow_live_toggled)
         self.control_bar.addWidget(self.chk_follow_live)
+
+        # Follow Live Events checkbox
+        self.chk_follow_events = QCheckBox("Follow Events", self)
+        self.chk_follow_events.setToolTip(
+            "Follow live new events (keep event index in sync with latest). Shortcut: Ctrl+L"
+        )
+        self.chk_follow_events.toggled.connect(self._on_follow_events_toggled)
+        self.control_bar.addWidget(self.chk_follow_events)
 
         self.addToolBar(Qt.TopToolBarArea, self.control_bar)
 
@@ -266,6 +275,38 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
         """Enables or disables following live inputs."""
         self.chk_follow_live.setChecked(enable)
 
+    def is_following_live_events(self) -> bool:
+        """Determines if this channel group is following live new events (i.e. idx kept in sync with latest)."""
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            return self.channel_bar.is_following_live_events()
+        local_state = getattr(self, "view_state", None) or self.state
+        if local_state is not None and hasattr(local_state, "is_following_live_events"):
+            return local_state.is_following_live_events()
+        return self.chk_follow_events.isChecked()
+
+    def set_follow_live_events(self, enable: bool = True):
+        """Enables or disables following live new events."""
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            self.channel_bar.set_follow_live_events(enable)
+        else:
+            local_state = getattr(self, "view_state", None) or self.state
+            if local_state is not None and hasattr(local_state, "set_follow_live"):
+                local_state.set_follow_live(enable)
+        self._sync_follow_events_checkbox()
+
+    def toggle_follow_live_events(self):
+        """Toggles following live new events."""
+        self.set_follow_live_events(not self.is_following_live_events())
+
+    def _on_follow_events_toggled(self, checked: bool):
+        self.set_follow_live_events(checked)
+
+    def _sync_follow_events_checkbox(self, *args):
+        following = self.is_following_live_events()
+        if self.chk_follow_events.isChecked() != following:
+            with QSignalBlocker(self.chk_follow_events):
+                self.chk_follow_events.setChecked(following)
+
     def _on_follow_live_toggled(self, checked: bool):
         if checked:
             self.channel_bar.set_channel_mode_live()
@@ -298,18 +339,28 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
             self._on_new_sweep_core(stimno)
 
     def set_state(self, state: ViewerState):
+        from .container_view_state import ContainerViewerState
+
         self.state = state
-        self.channel_bar.setState(state)
+        if state is None:
+            self.view_state = None
+        elif getattr(self, "view_state", None) is None:
+            self.view_state = ContainerViewerState(state, parent=self)
+        else:
+            self.view_state.rebase(state)
+        child_state = self.view_state if self.view_state is not None else state
+
+        self.channel_bar.setState(child_state)
         for v in self.sub_views:
             if hasattr(v, "set_state"):
-                v.set_state(state)
+                v.set_state(child_state)
             elif hasattr(v, "setState"):
-                v.setState(state)
+                v.setState(child_state)
 
-        for c in self._connections:
+        for sig, slot in self._connections:
             try:
-                self.state.disconnect(c)
-            except Exception:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
                 pass
         self._connections.clear()
 
@@ -317,6 +368,14 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
         # the GUI-side throttle keeps child syncing rate-limited.
         self._unregister_live_frames()
         self._register_live_frames(state, lambda stimno: self._on_new_sweep(stimno))
+
+        if child_state is not None and hasattr(child_state, "onFollowLiveChanged"):
+            child_state.onFollowLiveChanged.connect(self._sync_follow_events_checkbox)
+            self._connections.append((child_state.onFollowLiveChanged, self._sync_follow_events_checkbox))
+        if child_state is not None and hasattr(child_state, "onStimNoChange"):
+            child_state.onStimNoChange.connect(self._sync_follow_events_checkbox)
+            self._connections.append((child_state.onStimNoChange, self._sync_follow_events_checkbox))
+        self._sync_follow_events_checkbox()
 
     def add_view_by_key(self, key: str) -> Optional[QWidget]:
         """Creates a child view by string key and adds it into this container."""
@@ -356,7 +415,7 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
             logging.error(f"Unknown sub-view type: {key}")
             return None
 
-        child = cls(parent=self, state=self.state)
+        child = cls(parent=self, state=self.view_state or self.state)
         self.add_view(child, title=key)
         return child
 
@@ -368,6 +427,14 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
         """
         if title is None:
             title = child.__class__.__name__
+
+        # Views embedded here browse stimuli through this container's local
+        # overlay state so each channel group can follow (or not) independently.
+        if self.view_state is not None and getattr(child, "state", None) is not self.view_state:
+            if hasattr(child, "set_state"):
+                child.set_state(self.view_state)
+            elif hasattr(child, "setState"):
+                child.setState(self.view_state)
 
         # Defer channel selector: hide child's own channel bar if present
         if hasattr(child, "channel_bar") and child.channel_bar is not None:
@@ -542,6 +609,7 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
             "orientation": self._current_orientation,
             "layout": self._current_layout,
             "follow_live": self.is_following_live(),
+            "follow_live_events": self.is_following_live_events(),
             "children": children_settings,
         }
 
@@ -555,6 +623,8 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
             self.arrange_layout(values["layout"])
         if "follow_live" in values:
             self.set_follow_live(bool(values["follow_live"]))
+        if "follow_live_events" in values:
+            self.set_follow_live_events(bool(values["follow_live_events"]))
         if "children" in values:
             for c_info in values["children"]:
                 child = self.add_view_by_key(c_info.get("class", ""))

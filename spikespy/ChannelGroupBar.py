@@ -300,6 +300,14 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
         self._build_group_menu()
         self.addWidget(self.btn_group_menu)
 
+        # Follow Live Events Checkbox
+        self.chk_follow_events = QCheckBox("Follow Events", self)
+        self.chk_follow_events.setToolTip(
+            "Follow live new events (keep event index in sync with latest). Shortcut: Ctrl+L"
+        )
+        self.chk_follow_events.toggled.connect(self._on_follow_events_toggled)
+        self.addWidget(self.chk_follow_events)
+
         if state is not None:
             self.setState(state)
 
@@ -364,6 +372,12 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
             if hasattr(self.state, "onSharedChannelSetChanged"):
                 self._state_connections.append((self.state.onSharedChannelSetChanged, self._on_shared_set_changed))
                 self.state.onSharedChannelSetChanged.connect(self._on_shared_set_changed)
+            if hasattr(self.state, "onFollowLiveChanged"):
+                self._state_connections.append((self.state.onFollowLiveChanged, self._sync_follow_events_checkbox))
+                self.state.onFollowLiveChanged.connect(self._sync_follow_events_checkbox)
+            if hasattr(self.state, "onStimNoChange"):
+                self._state_connections.append((self.state.onStimNoChange, self._sync_follow_events_checkbox))
+                self.state.onStimNoChange.connect(self._sync_follow_events_checkbox)
             if hasattr(self.state, "onNewSweep"):
                 self._register_live_frames(
                     self.state,
@@ -408,6 +422,7 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
         self._block_updates = True
         self.refresh_units()
         self.refresh_channels()
+        self._sync_follow_events_checkbox()
         self._block_updates = False
         self.bindingChanged.emit()
 
@@ -508,6 +523,36 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
             if curr_channels != new_channels:
                 self._last_live_channels = new_channels
                 self.bindingChanged.emit()
+        self._sync_follow_events_checkbox()
+
+    def is_following_live_events(self) -> bool:
+        """Determines if following live new events (i.e. is the idx being kept in sync with latest)."""
+        if self.state is not None and hasattr(self.state, "is_following_live_events"):
+            return self.state.is_following_live_events()
+        return self.chk_follow_events.isChecked()
+
+    def set_follow_live_events(self, enable: bool = True):
+        """Enables or disables following live new events."""
+        if self.state is not None and hasattr(self.state, "set_follow_live"):
+            self.state.set_follow_live(enable)
+        else:
+            with QSignalBlocker(self.chk_follow_events):
+                self.chk_follow_events.setChecked(enable)
+
+    def toggle_follow_live_events(self):
+        """Toggles following live new events."""
+        self.set_follow_live_events(not self.is_following_live_events())
+
+    def _on_follow_events_toggled(self, checked: bool):
+        if self._block_updates:
+            return
+        self.set_follow_live_events(checked)
+
+    def _sync_follow_events_checkbox(self, *args):
+        following = self.is_following_live_events()
+        if self.chk_follow_events.isChecked() != following:
+            with QSignalBlocker(self.chk_follow_events):
+                self.chk_follow_events.setChecked(following)
 
     # Public Getters & Binding API
 
@@ -867,6 +912,7 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
             "unit_binding": self.combo_unit.currentData(),
             "channel_mode": self.combo_channel.currentData(),
             "multichannel": self.chk_multichannel.isChecked(),
+            "follow_live_events": self.is_following_live_events(),
         }
 
     def set_settings(self, settings: dict):
@@ -885,5 +931,7 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
                     self.combo_channel.setCurrentIndex(idx)
         if "multichannel" in settings:
             self.chk_multichannel.setChecked(bool(settings["multichannel"]))
+        if "follow_live_events" in settings:
+            self.set_follow_live_events(bool(settings["follow_live_events"]))
         self._block_updates = False
         self.bindingChanged.emit()

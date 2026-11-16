@@ -278,6 +278,62 @@ def test_live_stimno_change_does_not_run_plot_updates_on_gui_thread(
     )
 
 
+def test_live_frame_respects_follow_events_mode(qtbot, monkeypatch, long_live_state):
+    """A live frame must not advance the sweep when follow mode is off."""
+    view = SingleTracePGView(state=long_live_state)
+    _show(view, qtbot)
+
+    rendered = []
+    monkeypatch.setattr(view, "on_new_sweep", lambda stimno=None: rendered.append(stimno))
+
+    long_live_state.set_follow_live(True)
+    rendered.clear()
+    latest = long_live_state.get_latest_event_idx()
+    view._live_frame_result(latest, None)
+    assert rendered == [latest]
+
+    # Manual navigation pauses following; new live frames must not move the view.
+    long_live_state.setStimNo(latest - 5, user_set=True)
+    assert long_live_state.is_following_live_events() is False
+    rendered.clear()
+    view._live_frame_result(latest, None)
+    assert rendered == []
+    assert long_live_state.stimno == latest - 5
+
+    # Re-enabling follow mode snaps back to the latest sweep and resumes.
+    rendered.clear()
+    long_live_state.set_follow_live(True)
+    rendered.clear()
+    view._live_frame_result(latest, None)
+    assert rendered == [latest]
+
+
+def test_live_render_results_apply_when_navigating_backwards(qtbot, long_live_state):
+    """Backward navigation must not be filtered out as a stale live result."""
+    view = SingleTracePGView(state=long_live_state)
+    _show(view, qtbot)
+
+    def _result(stimno):
+        return {
+            "stimno": stimno,
+            "primary_trace": {"x": np.array([0.0]), "y": np.array([0.0])},
+            "overlay_traces": {},
+        }
+
+    latest = long_live_state.get_latest_event_idx()
+    long_live_state.setStimNo(latest, user_set=False)
+    view._on_single_trace_result(_result(latest), "")
+    assert view._last_result_stimno == latest
+
+    long_live_state.setStimNo(latest - 5, user_set=True)
+    view._on_single_trace_result(_result(latest - 5), "")
+    assert view._last_result_stimno == latest - 5
+
+    # A stale result for the previously displayed sweep must be ignored.
+    view._on_single_trace_result(_result(latest), "")
+    assert view._last_result_stimno == latest - 5
+
+
 def test_live_refresh_reuses_graphics_items(qtbot, long_live_state):
     """Live refreshes must not create/remove scene items every frame."""
     view = SingleTracePGView(state=long_live_state)

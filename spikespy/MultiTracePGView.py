@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QInputDialog,
     QComboBox,
+    QDialog,
     QApplication,
 )
 import pyqtgraph as pg
@@ -35,6 +36,7 @@ import matplotlib.pyplot as plt
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
 from .MultiTraceView import DialogSignalSelect, DialogPolySelect, DialogDeleteRegion
+from .MultiTracePlotManager import MultiTracePlotManager
 from .helpers import qsignal_throttle, quiet_fail, notify_view_selected
 from .live_orchestrator import LiveFrameConsumerMixin
 from .viewer_worker import get_task_manager, TaskType, TaskPriority
@@ -154,6 +156,9 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     and interactive click-to-draw polygon corridor spike tracking.
     """
 
+    #: Emitted whenever the set of plots or their per-plot options change.
+    plotsChanged = Signal()
+
     right_ax_data: Dict = {}
 
     def __init__(
@@ -181,6 +186,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.rightPlots: Dict[str, bool] = {}
         self.right_plots: Dict[str, pg.PlotItem] = {}
         self.summary_panels: Dict[str, SummaryLinePanel] = {}
+        self._last_summary_keys: Optional[Tuple[str, ...]] = None
         self.connections: List[Tuple] = []
         self.references = self.connections
         self.legend_items: List[pg.TextItem] = []
@@ -467,6 +473,13 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.settingsButton.clicked.connect(self.open_settings_dialog)
         toolbar.addWidget(self.settingsButton)
 
+        self.plotsButton = QPushButton("Plots...")
+        self.plotsButton.setToolTip(
+            "Add, remove, reorder and configure each channel or summary plot"
+        )
+        self.plotsButton.clicked.connect(lambda *_: self.open_plot_manager())
+        toolbar.addWidget(self.plotsButton)
+
         self.toggleMaxMeanButton = QPushButton("Show max", self)
         self.toggleMaxMeanButton.setCheckable(True)
         self.toggleMaxMeanButton.clicked.connect(self.toggleMaxMean)
@@ -656,6 +669,12 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         header.setEnabled(False)
         menu.addSeparator()
 
+        act_edit = menu.addAction("Configure This Plot...")
+        act_edit.triggered.connect(
+            lambda: self.open_plot_manager(f"channel:{panel.slot_idx}")
+        )
+        menu.addSeparator()
+
         if ch_name:
             primary_ch = self.channel_bar.get_primary_channel() if hasattr(self, "channel_bar") and self.channel_bar else ""
             if ch_name != primary_ch:
@@ -778,15 +797,20 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         act_cfg = menu.addAction("Configure All Summary Signals...")
         act_cfg.triggered.connect(self.open_settings_dialog)
 
+        act_manage = menu.addAction("Manage Plots...")
+        act_manage.triggered.connect(lambda *_: self.open_plot_manager())
+
     def toggle_channel_summaries(self, visible: bool):
         """Toggle all channel summary graphs on or off."""
         self.rightPlots["__channel_summaries__"] = visible
         self.plot_right_axis()
+        self.plotsChanged.emit()
 
     def toggle_summary_graph(self, key: str, visible: bool):
         """Toggle visibility of a specific summary line graph."""
         self.rightPlots[key] = visible
         self.plot_right_axis()
+        self.plotsChanged.emit()
 
     def open_settings_dialog(self):
         """Open settings dialog to configure which summary line graphs are displayed."""
@@ -822,8 +846,55 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.settingsDialog.changeSelection.connect(updateView)
         self.settingsDialog.show()
 
+    def open_plot_manager(self, plot_key: Optional[str] = None):
+        """Open the per-plot add/remove/configure dialog for this view."""
+        dialog = getattr(self, "plot_manager_dialog", None)
+        try:
+            if dialog is not None and dialog.isVisible():
+                if plot_key is not None:
+                    manager = getattr(self, "plot_manager", None)
+                    if manager is not None:
+                        manager.select_plot(plot_key)
+                dialog.raise_()
+                dialog.activateWindow()
+                return
+        except RuntimeError:
+            dialog = None
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("MultiTrace Plots")
+        dialog.resize(420, 520)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(6, 6, 6, 6)
+        manager = MultiTracePlotManager(dialog, view=self)
+        layout.addWidget(manager, 1)
+        close_btn = QPushButton("Close", dialog)
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn)
+
+        self.plot_manager_dialog = dialog
+        self.plot_manager = manager
+        dialog.finished.connect(self._on_plot_manager_closed)
+        dialog.show()
+        if plot_key is not None:
+            manager.select_plot(plot_key)
+
+    def _on_plot_manager_closed(self, *args):
+        manager = getattr(self, "plot_manager", None)
+        if manager is not None:
+            manager.set_view(None)
+        self.plot_manager = None
+        dialog = getattr(self, "plot_manager_dialog", None)
+        self.plot_manager_dialog = None
+        if dialog is not None:
+            dialog.deleteLater()
+
     def _show_summary_context_menu(self, screen_pos, key: str, panel: SummaryLinePanel):
         menu = QMenu(self)
+
+        act_edit = menu.addAction("Configure This Plot...")
+        act_edit.triggered.connect(lambda: self.open_plot_manager(key))
+        menu.addSeparator()
 
         if panel.is_channel_stat:
             stat_act = menu.addAction(
@@ -891,6 +962,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self._update_axis_linking()
             self._apply_pinned_unit_windows()
             self._update_channel_titles()
+            self.plotsChanged.emit()
 
     def _set_channel_window_group(self, slot_idx: int, group_name: Optional[str]):
         if 0 <= slot_idx < len(self.channel_panels):
@@ -898,6 +970,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             p.window_group = group_name
             self._update_axis_linking()
             self._update_channel_titles()
+            self.plotsChanged.emit()
 
     def _update_channel_titles(self):
         primary_ch = self.channel_bar.get_primary_channel() if hasattr(self, "channel_bar") and self.channel_bar else ""
@@ -1044,6 +1117,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 p.plot.setTitle(title, color="#333", size="9pt")
             self._update_axis_linking()
             self.plot_right_axis()
+            self.plotsChanged.emit()
             return
 
         # Count changed - remove right plots and channel panels from glw
@@ -1184,6 +1258,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             except Exception:
                 pass
         self.main_plot.vb.sigRangeChanged.connect(self._on_view_range_changed)
+        self.plotsChanged.emit()
 
     def add_channel_to_display(self, channel_name: str):
         """Add a channel to display, filling an empty slot if available or expanding N."""
@@ -1205,6 +1280,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self._sync_linked_channel_group()
         self.setup_figure()
         self.reset_right_axes_data()
+        self.plotsChanged.emit()
 
     def remove_channel_from_display(self, channel_name: str, keep_empty_slot: bool = False):
         """Remove a channel from display and update the linked channel group."""
@@ -1225,6 +1301,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self._sync_linked_channel_group()
         self.setup_figure()
         self.reset_right_axes_data()
+        self.plotsChanged.emit()
 
     def clear_slot_to_empty(self, slot_idx: int):
         """Clear a specific slot to an empty screen without changing N."""
@@ -1233,6 +1310,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self._sync_linked_channel_group()
             self.setup_figure()
             self.reset_right_axes_data()
+            self.plotsChanged.emit()
 
     def add_empty_slot(self):
         """Add an empty channel screen slot to the group."""
@@ -1242,6 +1320,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             with QSignalBlocker(self.groupSizeSpinBox):
                 self.groupSizeSpinBox.setValue(self.group_size_n)
         self.setup_figure()
+        self.plotsChanged.emit()
 
     def set_group_size_n(self, n: int):
         """Set the target group size N, preserving existing channels and padding or trimming."""
@@ -1256,6 +1335,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self._sync_linked_channel_group()
         self.setup_figure()
         self.reset_right_axes_data()
+        self.plotsChanged.emit()
 
     def _set_channel_as_primary(self, slot_idx: int):
         """Move the channel at slot_idx to position 0 (primary)."""
@@ -1265,14 +1345,11 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self._sync_linked_channel_group()
             self.setup_figure()
             self.reset_right_axes_data()
+            self.plotsChanged.emit()
 
     def _replace_slot_channel(self, slot_idx: int, new_ch: str):
         """Replace channel at slot_idx with new_ch."""
-        if 0 <= slot_idx < len(self.displayed_channels):
-            self.displayed_channels[slot_idx] = new_ch
-            self._sync_linked_channel_group()
-            self.setup_figure()
-            self.reset_right_axes_data()
+        self.set_plot_slot_channel(slot_idx, new_ch)
 
     def _remove_empty_screens(self):
         """Remove empty None slots down to minimum 1."""
@@ -1285,6 +1362,214 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             with QSignalBlocker(self.groupSizeSpinBox):
                 self.groupSizeSpinBox.setValue(self.group_size_n)
         self.setup_figure()
+        self.plotsChanged.emit()
+
+    # ------------------------------------------------------------------
+    # Per-plot management API (used by MultiTracePlotManager)
+    # ------------------------------------------------------------------
+    def _summary_stat_name(self) -> str:
+        return "Max" if self.toggleMaxMeanButton.isChecked() else "Mean"
+
+    def get_summary_plot_availability(self) -> Dict[str, bool]:
+        """Return globally available summary plots mapped to their enabled state."""
+        availability: Dict[str, bool] = {
+            "__channel_summaries__": bool(
+                self.rightPlots.get("__channel_summaries__", True)
+            ),
+        }
+        if (
+            self.state is not None
+            and self.state.event_signal is not None
+            and len(self.state.event_signal) > 1
+        ):
+            availability["Stim. Freq. (Hz)"] = bool(
+                self.rightPlots.get("Stim. Freq. (Hz)", True)
+            )
+        if (
+            self.state is not None
+            and self.state.spike_groups
+            and self.state.event_signal is not None
+        ):
+            availability["Latency Diff."] = bool(
+                self.rightPlots.get("Latency Diff.", True)
+            )
+        return availability
+
+    def get_plot_specs(self) -> List[Dict[str, Any]]:
+        """Describe every plot in the view for a per-plot settings UI.
+
+        Returns channel plots first (in display order), followed by the summary
+        line graphs that can be added below/next to them.
+        """
+        specs: List[Dict[str, Any]] = []
+        primary_ch = (
+            self.channel_bar.get_primary_channel()
+            if hasattr(self, "channel_bar") and self.channel_bar is not None
+            else ""
+        )
+        n_slots = len(self.channel_panels)
+        for i, panel in enumerate(self.channel_panels):
+            specs.append(
+                {
+                    "kind": "channel",
+                    "key": f"channel:{i}",
+                    "slot_idx": i,
+                    "channel_name": panel.channel_name,
+                    "label": self._format_channel_title(
+                        i, n_slots, panel.channel_name, primary_ch, panel=panel
+                    ),
+                    "has_data": panel.has_data,
+                    "visible": True,
+                    "pinned_unit_idx": getattr(panel, "pinned_unit_idx", None),
+                    "window_group": getattr(panel, "window_group", None),
+                    "window_width_ms": float(
+                        getattr(panel, "window_width_ms", 20.0)
+                    ),
+                    "x_linked": bool(getattr(panel, "x_linked", True)),
+                }
+            )
+
+        show_channel_summaries = bool(
+            self.rightPlots.get("__channel_summaries__", True)
+        )
+        if show_channel_summaries:
+            stat_name = self._summary_stat_name()
+            for i in range(self.group_size_n):
+                ch_name = (
+                    self.displayed_channels[i]
+                    if i < len(self.displayed_channels)
+                    else None
+                )
+                key = ch_name if ch_name is not None else f"__empty_slot_{i}__"
+                specs.append(
+                    {
+                        "kind": "summary",
+                        "key": key,
+                        "slot_idx": i,
+                        "channel_name": ch_name,
+                        "label": self._format_summary_title(
+                            i, self.group_size_n, ch_name, primary_ch, stat_name
+                        ),
+                        "has_data": bool(
+                            ch_name
+                            and ch_name in self.right_ax_data
+                            and len(self.right_ax_data[ch_name][0]) > 0
+                        ),
+                        "visible": bool(self.rightPlots.get(key, True)),
+                        "is_channel_stat": True,
+                    }
+                )
+
+        global_labels = {
+            "Stim. Freq. (Hz)": "Stimulus Frequency",
+            "Latency Diff.": "Latency Difference",
+        }
+        for key, is_enabled in self.get_summary_plot_availability().items():
+            if key == "__channel_summaries__":
+                continue
+            specs.append(
+                {
+                    "kind": "summary",
+                    "key": key,
+                    "slot_idx": None,
+                    "channel_name": None,
+                    "label": global_labels.get(key, key),
+                    "has_data": key in self.right_ax_data,
+                    "visible": bool(is_enabled),
+                    "is_channel_stat": False,
+                }
+            )
+        return specs
+
+    def get_available_plot_channels(self) -> List[str]:
+        """Available recording channels that are not displayed yet."""
+        if self.state is None:
+            return []
+        displayed = {c for c in self.displayed_channels if c}
+        return [c for c in self.state.get_available_channels() if c not in displayed]
+
+    def remove_plot_slot(self, slot_idx: int):
+        """Remove the channel plot at ``slot_idx`` and shrink the group."""
+        if not (0 <= slot_idx < len(self.displayed_channels)):
+            return
+        self.displayed_channels.pop(slot_idx)
+        if not self.displayed_channels:
+            self.displayed_channels = [None]
+        self.group_size_n = max(len(self.displayed_channels), 1)
+        if hasattr(self, "groupSizeSpinBox"):
+            with QSignalBlocker(self.groupSizeSpinBox):
+                self.groupSizeSpinBox.setValue(self.group_size_n)
+        self._sync_linked_channel_group()
+        self.setup_figure()
+        self.reset_right_axes_data()
+        self.plotsChanged.emit()
+
+    def move_plot_slot(self, slot_idx: int, delta: int):
+        """Move a channel plot left/right by ``delta`` positions."""
+        target = int(slot_idx) + int(delta)
+        if not (0 <= slot_idx < len(self.displayed_channels)):
+            return
+        if not (0 <= target < len(self.displayed_channels)) or target == slot_idx:
+            return
+        self.displayed_channels.insert(
+            target, self.displayed_channels.pop(slot_idx)
+        )
+        self._sync_linked_channel_group()
+        self.setup_figure()
+        self.reset_right_axes_data()
+        self.plotsChanged.emit()
+
+    def set_plot_slot_channel(self, slot_idx: int, channel_name: Optional[str]):
+        """Set or clear the channel shown in a plot slot."""
+        if not (0 <= slot_idx < len(self.displayed_channels)):
+            return
+        if self.displayed_channels[slot_idx] == channel_name:
+            return
+        self.displayed_channels[slot_idx] = channel_name or None
+        self._sync_linked_channel_group()
+        self.setup_figure()
+        self.reset_right_axes_data()
+        self.plotsChanged.emit()
+
+    def set_plot_slot_options(self, slot_idx: int, **options):
+        """Update per-plot options for a channel plot.
+
+        Supported keys: ``channel_name``, ``pinned_unit_idx``, ``window_group``,
+        ``window_width_ms`` and ``x_linked``.
+        """
+        if not (0 <= slot_idx < len(self.channel_panels)):
+            return
+        panel = self.channel_panels[slot_idx]
+
+        if "channel_name" in options:
+            self.set_plot_slot_channel(slot_idx, options["channel_name"])
+
+        if "pinned_unit_idx" in options:
+            panel.pinned_unit_idx = options["pinned_unit_idx"]
+            panel.x_linked = panel.pinned_unit_idx is None
+        if "x_linked" in options:
+            panel.x_linked = bool(options["x_linked"])
+        if "window_group" in options:
+            panel.window_group = options["window_group"]
+        if "window_width_ms" in options:
+            panel.window_width_ms = float(options["window_width_ms"])
+
+        self._update_axis_linking()
+        self._apply_pinned_unit_windows()
+        self._update_channel_titles()
+        self.plotsChanged.emit()
+
+    def set_plot_visible(self, key: str, visible: bool):
+        """Show or hide a summary plot."""
+        if key == "__channel_summaries__":
+            self.toggle_channel_summaries(visible)
+        elif (
+            key in ("Stim. Freq. (Hz)", "Latency Diff.")
+            or key in self.rightPlots
+            or key.startswith("__empty_slot_")
+        ):
+            self.toggle_summary_graph(key, visible)
+        self.plotsChanged.emit()
 
     def _prompt_custom_channel(self):
         if QApplication.instance() and QApplication.instance().platformName() != "offscreen":
@@ -1382,6 +1667,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
 
         self.setup_figure()
         self.reset_right_axes_data()
+        self.plotsChanged.emit()
 
     def update_window_title(self):
         if hasattr(self, "channel_bar"):
@@ -2796,6 +3082,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self.summary_panels.clear()
             for c in range(start_col):
                 self.glw.ci.layout.setColumnStretchFactor(c, 3)
+            self._last_summary_keys = ()
+            self.plotsChanged.emit()
             return
 
         active_keys = [spec["key"] for spec in active_summary_specs]
@@ -2890,6 +3178,9 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             )
             self.summary_panels[spec["key"]] = panel
             self.right_plots[spec["key"]] = p
+
+        self._last_summary_keys = tuple(self.summary_panels.keys())
+        self.plotsChanged.emit()
 
     # --- PolyLine Selection and Peak Tracking ---
 
@@ -3014,6 +3305,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         else:
             self.toggleMaxMeanButton.setText("Show Max")
         self.reset_right_axes_data()
+        self.plotsChanged.emit()
 
     def toggleShowMessages(self):
         if self.state is None or self.state.segment is None:
@@ -3178,6 +3470,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self._update_axis_linking()
         self._update_toolbar_visibility()
         self.setup_figure()
+        self.plotsChanged.emit()
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_P:
@@ -3199,6 +3492,11 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self.dialogPolySelect.close()
         if hasattr(self, "settingsDialog") and self.settingsDialog is not None:
             self.settingsDialog.close()
+        if getattr(self, "plot_manager_dialog", None) is not None:
+            try:
+                self.plot_manager_dialog.close()
+            except RuntimeError:
+                pass
         if hasattr(self, "dialogDeleteRegion") and self.dialogDeleteRegion is not None:
             self.dialogDeleteRegion.close()
         super().closeEvent(event)

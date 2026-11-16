@@ -389,6 +389,12 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         if hasattr(self.state, "onChannelChange"):
             self._connect_state(self.state.onChannelChange, self._on_channel_change_event)
         def _on_live_frame_cb(stimno):
+            # Only advance when following live events. When the user pauses
+            # following (manual navigation or unchecked "Follow Events"), the
+            # displayed sweep must stay on state.stimno instead of jumping to
+            # each newest incoming sweep.
+            if not getattr(self.state, "follow_live", True):
+                return
             target = self.state.stimno if stimno is None else int(stimno)
             self._last_live_rendered_stim = target
             self.on_new_sweep(target)
@@ -692,8 +698,15 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
 
         stimno = result.get("stimno")
         if stimno is not None:
-            if getattr(self.state, "is_streaming", False):
-                if stimno < self._last_result_stimno:
+            # Only apply results the user should see. While following, older
+            # frames are stale (drop them, but allow the display to keep
+            # advancing). While paused, accept only the selected sweep so
+            # backward navigation works and stale renders cannot overwrite it.
+            if self.state is not None and self.state.stimno is not None:
+                if getattr(self.state, "follow_live", True):
+                    if int(stimno) < self._last_result_stimno:
+                        return
+                elif int(stimno) != int(self.state.stimno):
                     return
             self._last_result_stimno = stimno
 

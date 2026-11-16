@@ -15,7 +15,7 @@ from typing import Any, Deque, Dict, List, Optional
 import numpy as np
 import quantities as pq
 from neo import AnalogSignal, Event, Segment
-from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtCore import Qt, QSignalBlocker, QTimer, Slot
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -69,6 +70,30 @@ class OpenEphysLiveView(QWidget):
         self._perf_timer.timeout.connect(self._update_perf_diagnostics)
         self._perf_timer.start()
         self._last_synced_annotation_key = None
+        self._syncing_follow_live = False
+
+        # Replay of an already-loaded recording through the live pipeline.
+        self._is_replaying = False
+        self._replay_timer = QTimer(self)
+        self._replay_timer.setSingleShot(True)
+        self._replay_timer.timeout.connect(self._replay_next_sweep)
+        self._replay_events_s = np.empty(0, dtype=np.float64)
+        self._replay_channels: List[tuple] = []
+        self._replay_primary_name = ""
+        self._replay_units = pq.uV
+        self._replay_sr = 0.0
+        self._replay_pre_s = 0.0
+        self._replay_window_ms = 500.0
+        self._replay_window_samples = 0
+        self._replay_spike_latencies: List[Dict[str, float]] = []
+        self._replay_index = 0
+        self._replay_n = 0
+        self._replay_t0 = 0.0
+        self._syncing_timeline = False
+        self._timeline_seek_timer = QTimer(self)
+        self._timeline_seek_timer.setSingleShot(True)
+        self._timeline_seek_timer.setInterval(150)
+        self._timeline_seek_timer.timeout.connect(self._on_timeline_seek_timeout)
 
         self._init_ui()
         self._init_controller()
@@ -172,6 +197,7 @@ class OpenEphysLiveView(QWidget):
 
         self.chk_follow_live = QCheckBox("Follow Live Sweep (Auto-advance view)")
         self.chk_follow_live.setChecked(True)
+        self.chk_follow_live.toggled.connect(self._on_follow_live_toggled)
 
         chan_layout.addRow("Recording Channel:", self.spin_rec_chan)
         chan_layout.addRow("Multi-Channel Active Set:", self.edit_active_channels)
@@ -183,6 +209,88 @@ class OpenEphysLiveView(QWidget):
         chan_layout.addRow("", self.chk_follow_live)
 
         main_layout.addWidget(chan_group)
+
+        # -------------------------------------------------------------
+        # 2b. Replay of the currently loaded recording
+        # -------------------------------------------------------------
+        replay_group = QGroupBox("Replay Loaded Signal")
+        replay_layout = QFormLayout(replay_group)
+
+        self.spin_replay_speed = QDoubleSpinBox()
+        self.spin_replay_speed.setRange(0.1, 1000.0)
+        self.spin_replay_speed.setValue(1.0)
+        self.spin_replay_speed.setSingleStep(0.5)
+        self.spin_replay_speed.setDecimals(2)
+        self.spin_replay_speed.setSuffix(" x real time")
+        self.spin_replay_speed.setToolTip(
+            "Playback speed relative to the original inter-stimulus intervals."
+        )
+
+        self.chk_replay_spikes = QCheckBox("Replay recorded unit spikes")
+        self.chk_replay_spikes.setChecked(True)
+        self.chk_replay_spikes.setToolTip(
+            "Re-create unit spike annotations from the loaded recording for each sweep."
+        )
+
+        self.btn_replay_loaded = QPushButton("Replay Loaded Signal as Live")
+        self.btn_replay_loaded.setStyleSheet("font-weight: bold; padding: 6px;")
+        self.btn_replay_loaded.setToolTip(
+            "Slice the signal currently loaded in SpikeSpy at its stimulus events and "
+            "feed those sweeps through the live pipeline, using the sweep window and "
+            "pre-stimulus time configured above."
+        )
+        self.btn_replay_loaded.clicked.connect(self.toggle_replay)
+
+        self.lbl_replay_info = QLabel(
+            "Load a recording with stimulus events to replay it."
+        )
+        self.lbl_replay_info.setWordWrap(True)
+        self.lbl_replay_info.setStyleSheet("color: gray;")
+
+        self.btn_replay_prev = QPushButton("Prev Event")
+        self.btn_replay_prev.setToolTip(
+            "Jump backward to the previous stimulus event, skipping the interval "
+            "without events in between."
+        )
+        self.btn_replay_prev.clicked.connect(lambda: self._skip_replay_event(-1))
+        self.btn_replay_prev.setEnabled(False)
+
+        self.btn_replay_next = QPushButton("Next Event")
+        self.btn_replay_next.setToolTip(
+            "Jump forward to the next stimulus event, skipping the interval "
+            "without events in between."
+        )
+        self.btn_replay_next.clicked.connect(lambda: self._skip_replay_event(1))
+        self.btn_replay_next.setEnabled(False)
+
+        self.slider_replay_timeline = QSlider(Qt.Horizontal)
+        self.slider_replay_timeline.setRange(0, 1)
+        self.slider_replay_timeline.setValue(0)
+        self.slider_replay_timeline.setEnabled(False)
+        self.slider_replay_timeline.setToolTip(
+            "Replay timeline. Drag to jump through the recording; gaps between "
+            "stimulus events are crossed by jumping to the nearest event."
+        )
+        self.slider_replay_timeline.valueChanged.connect(
+            self._on_timeline_value_changed
+        )
+
+        timeline_layout = QHBoxLayout()
+        timeline_layout.addWidget(self.btn_replay_prev)
+        timeline_layout.addWidget(self.slider_replay_timeline, 1)
+        timeline_layout.addWidget(self.btn_replay_next)
+
+        self.lbl_replay_time = QLabel("No replay loaded")
+        self.lbl_replay_time.setStyleSheet("color: gray;")
+
+        replay_layout.addRow("Playback Speed:", self.spin_replay_speed)
+        replay_layout.addRow("", self.chk_replay_spikes)
+        replay_layout.addRow("Timeline:", timeline_layout)
+        replay_layout.addRow("Position:", self.lbl_replay_time)
+        replay_layout.addRow(self.btn_replay_loaded)
+        replay_layout.addRow(self.lbl_replay_info)
+
+        main_layout.addWidget(replay_group)
 
         # -------------------------------------------------------------
         # 3. Bidirectional Closed-Loop Control Group
@@ -291,6 +399,31 @@ class OpenEphysLiveView(QWidget):
             self.state.onUnitAnnotated.connect(self._on_unit_annotated)
         if hasattr(self.state, "onUnitChange"):
             self.state.onUnitChange.connect(self._on_unit_changed_in_state)
+        # The follow mode lives in ViewerState so every pane (this one, View
+        # Settings, channel groups) edits the same value instead of fighting.
+        if hasattr(self.state, "onFollowLiveChanged"):
+            self.state.onFollowLiveChanged.connect(self._sync_follow_live_checkbox)
+        self._sync_follow_live_checkbox()
+
+    @Slot(bool)
+    def _on_follow_live_toggled(self, checked: bool):
+        if self._syncing_follow_live:
+            return
+        if hasattr(self.state, "set_follow_live"):
+            self.state.set_follow_live(checked)
+        else:
+            self.state.follow_live = bool(checked)
+
+    def _sync_follow_live_checkbox(self, *args):
+        following = bool(getattr(self.state, "follow_live", True))
+        if self.chk_follow_live.isChecked() == following:
+            return
+        self._syncing_follow_live = True
+        try:
+            with QSignalBlocker(self.chk_follow_live):
+                self.chk_follow_live.setChecked(following)
+        finally:
+            self._syncing_follow_live = False
 
     def get_settings(self) -> Dict[str, Any]:
         """Return dict of current settings for perspective persistence."""
@@ -308,6 +441,8 @@ class OpenEphysLiveView(QWidget):
             "sync_annotations": self.chk_sync_annotations.isChecked(),
             "demo_stim_freq": self.spin_demo_stim_freq.value(),
             "demo_units": self.combo_demo_units.currentIndex(),
+            "replay_speed": self.spin_replay_speed.value(),
+            "replay_spikes": self.chk_replay_spikes.isChecked(),
         }
 
     def set_settings(self, settings: Dict[str, Any]):
@@ -340,6 +475,10 @@ class OpenEphysLiveView(QWidget):
             self.spin_demo_stim_freq.setValue(float(settings["demo_stim_freq"]))
         if "demo_units" in settings:
             self.combo_demo_units.setCurrentIndex(int(settings["demo_units"]))
+        if "replay_speed" in settings:
+            self.spin_replay_speed.setValue(float(settings["replay_speed"]))
+        if "replay_spikes" in settings:
+            self.chk_replay_spikes.setChecked(bool(settings["replay_spikes"]))
 
     @Slot(float)
     def _on_demo_stim_freq_changed(self, val: float):
@@ -352,6 +491,9 @@ class OpenEphysLiveView(QWidget):
 
     @Slot()
     def toggle_stream(self):
+        if self._is_replaying:
+            self.stop_replay()
+            return
         if self._is_streaming:
             self.stop_stream()
         else:
@@ -393,6 +535,8 @@ class OpenEphysLiveView(QWidget):
             )
 
     def start_stream(self):
+        if self._is_replaying:
+            self._cancel_replay()
         host = self.edit_host.text().strip()
         data_port = self.spin_data_port.value()
         event_port = self.spin_event_port.value()
@@ -457,6 +601,7 @@ class OpenEphysLiveView(QWidget):
         )
 
     def stop_stream(self):
+        self._cancel_replay()
         if self.worker is not None:
             self.worker.stop()
             self.worker = None
@@ -521,6 +666,564 @@ class OpenEphysLiveView(QWidget):
         self.btn_toggle_stream.setText("Start Live Stream")
         self.lbl_status.setText("Ready (New Session)")
         self.lbl_status.setStyleSheet("color: gray; font-weight: bold;")
+
+    # -------------------------------------------------------------
+    # Replay of the currently loaded recording
+    # -------------------------------------------------------------
+    @property
+    def is_replaying(self) -> bool:
+        return self._is_replaying
+
+    @Slot()
+    def toggle_replay(self):
+        if self._is_replaying:
+            self.stop_replay()
+        else:
+            self.start_replay()
+
+    @Slot()
+    def start_replay(self):
+        """Replay the currently loaded recording through the live pipeline.
+
+        The continuous signal is sliced at each stimulus event using the sweep
+        window / pre-stimulus controls, then fed to ``ViewerState.append_sweep``
+        exactly like incoming Open Ephys sweeps.
+        """
+        if self._is_replaying:
+            return
+        if self._is_streaming:
+            self.stop_stream()
+
+        if not self._prepare_replay():
+            return
+
+        if not hasattr(self.state, "start_live_session"):
+            QMessageBox.warning(
+                self,
+                "Replay Loaded Signal",
+                "The current viewer state does not support live sessions.",
+            )
+            return
+
+        self.state.start_live_session(
+            sampling_rate=self._replay_sr,
+            window_size_ms=self._replay_window_ms,
+            channel_name=self._replay_primary_name,
+            units=self._replay_units,
+            aux_channels=[name for name, _ in self._replay_channels[1:]],
+            resume=False,
+        )
+
+        self._replay_index = 0
+        self._is_replaying = True
+        self._timeline_seek_timer.stop()
+        self._set_replay_controls(True)
+        self.btn_replay_loaded.setText("Stop Replay")
+        self.btn_replay_loaded.setStyleSheet(
+            "background-color: #d9534f; color: white; font-weight: bold; padding: 6px;"
+        )
+        self.lbl_sweeps_count.setText("0")
+        self.lbl_spikes_count.setText("0")
+        self.lbl_stim_freq.setText("0.0 Hz")
+        self.lbl_status.setText(f"Replaying loaded signal (0/{self._replay_n})")
+        self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
+
+        self._replay_next_sweep()
+
+    @Slot()
+    def stop_replay(self):
+        if not self._is_replaying:
+            return
+        played = self._replay_index
+        total = self._replay_n
+        self._cancel_replay()
+        if getattr(self.state, "is_streaming", False) and hasattr(
+            self.state, "stop_live_session"
+        ):
+            self.state.stop_live_session()
+        self.lbl_status.setText(f"Replay stopped ({played}/{total} sweeps)")
+        self.lbl_status.setStyleSheet("color: gray; font-weight: bold;")
+
+    def _cancel_replay(self):
+        """Stop the replay timer and restore controls without touching the session."""
+        self._replay_timer.stop()
+        self._timeline_seek_timer.stop()
+        self._is_replaying = False
+        self._set_replay_controls(False)
+        self.btn_replay_loaded.setText("Replay Loaded Signal as Live")
+        self.btn_replay_loaded.setStyleSheet("font-weight: bold; padding: 6px;")
+
+    def _finish_replay(self):
+        self._replay_timer.stop()
+        self._timeline_seek_timer.stop()
+        self._is_replaying = False
+        if getattr(self.state, "is_streaming", False) and hasattr(
+            self.state, "stop_live_session"
+        ):
+            self.state.stop_live_session()
+        self._set_replay_controls(False)
+        self.btn_replay_loaded.setText("Replay Loaded Signal as Live")
+        self.btn_replay_loaded.setStyleSheet("font-weight: bold; padding: 6px;")
+        self.lbl_sweeps_count.setText(str(self._replay_n))
+        self.lbl_status.setText(f"Replay complete ({self._replay_n} sweeps)")
+        self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
+
+    def _set_replay_controls(self, active: bool):
+        self.btn_toggle_stream.setEnabled(not active)
+        self.btn_start_demo.setEnabled(not active)
+        self.btn_reset_session.setEnabled(not active)
+        self.slider_replay_timeline.setEnabled(active)
+        self.btn_replay_prev.setEnabled(active)
+        self.btn_replay_next.setEnabled(active)
+
+    @Slot(int)
+    def _on_timeline_value_changed(self, value: int):
+        if self._syncing_timeline or self._replay_n <= 0:
+            return
+        self._update_replay_time_label(value)
+        if self._is_replaying:
+            self._timeline_seek_timer.start()
+
+    @Slot()
+    def _on_timeline_seek_timeout(self):
+        if not self._is_replaying or self._replay_n <= 0:
+            return
+        target = self._event_index_for_timeline_value(
+            self.slider_replay_timeline.value()
+        )
+        self._seek_replay_to_index(target)
+
+    def _skip_replay_event(self, direction: int):
+        """Jump to the previous/next stimulus event, skipping silent gaps."""
+        if not self._is_replaying or self._replay_n <= 0:
+            return
+        current = self._replay_index - 1 if self._replay_index > 0 else 0
+        target = max(0, min(current + int(direction), self._replay_n - 1))
+        if target != current:
+            self._seek_replay_to_index(target)
+
+    def _seek_replay_to_index(self, target_index: int):
+        """Restart the replay session at a stimulus event and continue from there."""
+        if not self._is_replaying or self._replay_n <= 0:
+            return
+        target_index = max(0, min(int(target_index), self._replay_n - 1))
+        current = self._replay_index - 1 if self._replay_index > 0 else -1
+        if target_index == current:
+            self._update_timeline_position(current)
+            return
+
+        self._timeline_seek_timer.stop()
+        self._replay_timer.stop()
+        self._restart_replay_session()
+        self._replay_index = target_index
+        self._update_timeline_position(target_index)
+        self._replay_next_sweep()
+
+    def _restart_replay_session(self):
+        if not hasattr(self.state, "start_live_session"):
+            return
+        self.state.start_live_session(
+            sampling_rate=self._replay_sr,
+            window_size_ms=self._replay_window_ms,
+            channel_name=self._replay_primary_name,
+            units=self._replay_units,
+            aux_channels=[name for name, _ in self._replay_channels[1:]],
+            resume=False,
+        )
+        self.lbl_spikes_count.setText("0")
+        self.lbl_stim_freq.setText("0.0 Hz")
+
+    def _configure_replay_timeline(self):
+        self._replay_t0 = float(self._replay_events_s[0]) if self._replay_n > 0 else 0.0
+        duration_ms = 0
+        if self._replay_n > 1:
+            duration_ms = int(
+                round((float(self._replay_events_s[-1]) - self._replay_t0) * 1000.0)
+            )
+        self._syncing_timeline = True
+        try:
+            with QSignalBlocker(self.slider_replay_timeline):
+                self.slider_replay_timeline.setRange(0, max(1, duration_ms))
+                self.slider_replay_timeline.setValue(0)
+        finally:
+            self._syncing_timeline = False
+        self._update_replay_time_label(0, event_index=0 if self._replay_n > 0 else None)
+
+    def _update_timeline_position(self, event_index: int):
+        if self._replay_n <= 0 or event_index < 0:
+            return
+        event_index = min(int(event_index), self._replay_n - 1)
+        value = int(
+            round(
+                (float(self._replay_events_s[event_index]) - self._replay_t0) * 1000.0
+            )
+        )
+        self._syncing_timeline = True
+        try:
+            with QSignalBlocker(self.slider_replay_timeline):
+                self.slider_replay_timeline.setValue(value)
+        finally:
+            self._syncing_timeline = False
+        self._update_replay_time_label(value, event_index=event_index)
+
+    def _event_index_for_timeline_value(self, value: int) -> int:
+        if self._replay_n <= 0:
+            return 0
+        target_s = self._replay_t0 + float(value) / 1000.0
+        index = int(np.searchsorted(self._replay_events_s, target_s, side="left"))
+        index = max(0, min(index, self._replay_n - 1))
+        if index > 0:
+            before = float(self._replay_events_s[index - 1])
+            after = float(self._replay_events_s[index])
+            if abs(before - target_s) <= abs(after - target_s):
+                index -= 1
+        return index
+
+    def _update_replay_time_label(self, value: int, event_index: Optional[int] = None):
+        if self._replay_n <= 0:
+            self.lbl_replay_time.setText("No replay loaded")
+            return
+        if event_index is None:
+            event_index = self._event_index_for_timeline_value(value)
+        event_index = max(0, min(event_index, self._replay_n - 1))
+        relative_s = float(self._replay_events_s[event_index]) - self._replay_t0
+        total_s = max(0.0, float(self._replay_events_s[-1]) - self._replay_t0)
+        self.lbl_replay_time.setText(
+            f"{relative_s:.3f} s / {total_s:.3f} s  |  "
+            f"event {event_index + 1}/{self._replay_n}"
+        )
+
+    @Slot()
+    def _replay_next_sweep(self):
+        if not self._is_replaying:
+            return
+        if self._replay_index >= self._replay_n:
+            self._finish_replay()
+            return
+
+        index = self._replay_index
+        stim_ts = float(self._replay_events_s[index])
+        try:
+            waveform = self._build_replay_sweep(stim_ts)
+            latencies = (
+                self._replay_spike_latencies[index]
+                if index < len(self._replay_spike_latencies)
+                else {}
+            )
+            self.state.append_sweep(
+                stim_timestamp=stim_ts,
+                sweep_waveform=waveform,
+                pre_offset_s=self._replay_pre_s,
+                spike_latencies_s=latencies,
+                emit_signals=True,
+            )
+        except Exception:
+            logger.exception("Failed to replay sweep %d", index)
+
+        self._replay_index = index + 1
+        self.lbl_sweeps_count.setText(str(self._replay_index))
+        self._update_timeline_position(index)
+        if index > 0:
+            prev_ts = float(self._replay_events_s[index - 1])
+            if stim_ts > prev_ts:
+                self.lbl_stim_freq.setText(f"{1.0 / (stim_ts - prev_ts):.2f} Hz")
+        self.lbl_status.setText(
+            f"Replaying loaded signal ({self._replay_index}/{self._replay_n})"
+        )
+
+        if self._replay_index >= self._replay_n:
+            self._finish_replay()
+            return
+
+        next_ts = float(self._replay_events_s[self._replay_index])
+        speed = max(0.01, float(self.spin_replay_speed.value()))
+        delay_ms = (next_ts - stim_ts) / speed * 1000.0
+        self._replay_timer.start(max(1, int(round(delay_ms))))
+
+    def _prepare_replay(self) -> bool:
+        """Capture the loaded signal/events into replay buffers."""
+        state = self.state
+        segment = getattr(state, "segment", None)
+        analog_signal = getattr(state, "analog_signal", None)
+
+        candidates = []
+        for sig in list(getattr(segment, "analogsignals", []) or []):
+            annotations = getattr(sig, "annotations", {}) or {}
+            if annotations.get("class_") == "multianalogsignal":
+                continue
+            if str(getattr(sig, "name", "")).startswith("ERP"):
+                continue
+            if self._signal_sample_count(sig) <= 0:
+                continue
+            candidates.append(sig)
+        if not candidates and analog_signal is not None:
+            candidates = [analog_signal]
+
+        if not candidates:
+            QMessageBox.warning(
+                self,
+                "Replay Loaded Signal",
+                "No loaded signal is available to replay. Open a recording first.",
+            )
+            return False
+
+        sr = self._signal_sampling_rate(candidates[0])
+        if sr is None or sr <= 0:
+            QMessageBox.warning(
+                self,
+                "Replay Loaded Signal",
+                "The loaded signal has no usable sampling rate.",
+            )
+            return False
+        candidates = [
+            sig
+            for sig in candidates
+            if self._signal_sampling_rate(sig) is not None
+            and abs(self._signal_sampling_rate(sig) - sr) < 1e-6
+        ]
+
+        channels: List[tuple] = []
+        seen_names = set()
+        for i, sig in enumerate(candidates):
+            name = str(getattr(sig, "name", "") or f"CH{i}")
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            channels.append((name, sig))
+        if not channels:
+            QMessageBox.warning(
+                self,
+                "Replay Loaded Signal",
+                "The loaded signal has no usable channels.",
+            )
+            return False
+
+        event_signal = getattr(state, "event_signal", None)
+        if event_signal is None or len(event_signal) == 0:
+            QMessageBox.warning(
+                self,
+                "Replay Loaded Signal",
+                "The loaded recording has no stimulus events to lock sweeps to.",
+            )
+            return False
+        events_s = (
+            np.asarray(event_signal.rescale(pq.s).magnitude, dtype=np.float64)
+            if hasattr(event_signal, "rescale")
+            else np.asarray(event_signal, dtype=np.float64)
+        ).ravel()
+        events_s = events_s[np.isfinite(events_s)]
+        if events_s.size == 0:
+            QMessageBox.warning(
+                self,
+                "Replay Loaded Signal",
+                "The loaded stimulus events are empty or invalid.",
+            )
+            return False
+        events_s = np.sort(events_s)
+
+        window_ms = float(self.spin_window_ms.value())
+        pre_s = max(0.0, float(self.spin_pre_ms.value()) / 1000.0)
+        if pre_s >= window_ms / 1000.0:
+            QMessageBox.warning(
+                self,
+                "Replay Loaded Signal",
+                "Pre-stimulus time must be smaller than the sweep window.",
+            )
+            return False
+
+        parsed_channels = self._parse_active_channels()
+        wanted_names = {f"CH{idx}" for idx in parsed_channels}
+        name_matches = [(name, sig) for name, sig in channels if name in wanted_names]
+        if name_matches:
+            selected = name_matches
+        else:
+            selected = [
+                channels[idx] for idx in parsed_channels if 0 <= idx < len(channels)
+            ]
+        if not selected:
+            selected = list(channels)
+
+        rec_name = f"CH{self.spin_rec_chan.value()}"
+        primary_index = next(
+            (i for i, (name, _) in enumerate(selected) if name == rec_name), None
+        )
+        if primary_index is None:
+            current_name = str(getattr(analog_signal, "name", "") or "")
+            primary_index = next(
+                (i for i, (name, _) in enumerate(selected) if name == current_name),
+                None,
+            )
+        if primary_index is None:
+            primary_index = 0
+        selected = (
+            [selected[primary_index]]
+            + selected[:primary_index]
+            + selected[primary_index + 1 :]
+        )
+        primary_name, primary_signal = selected[0]
+
+        window_samples = max(1, int(sr * window_ms / 1000.0))
+
+        sorted_event = Event(
+            events_s * pq.s,
+            name=str(getattr(event_signal, "name", "stim") or "stim"),
+            units=pq.s,
+        )
+        latencies_per_sweep: List[Dict[str, float]] = []
+        if self.chk_replay_spikes.isChecked():
+            unit_names = [
+                str(getattr(sg.event, "name", f"unit_{i}"))
+                for i, sg in enumerate(getattr(state, "spike_groups", []) or [])
+            ]
+            unit_latencies = []
+            window_size = (window_ms / 1000.0) * pq.s
+            for sg in getattr(state, "spike_groups", []) or []:
+                try:
+                    lat_samples = sg.get_sweep_sample_latencies(
+                        sorted_event, sr, window_size
+                    )
+                except Exception:
+                    lat_samples = np.full(events_s.size, np.nan, dtype=np.float64)
+                if len(lat_samples) != events_s.size:
+                    lat_samples = np.full(events_s.size, np.nan, dtype=np.float64)
+                unit_latencies.append(np.asarray(lat_samples, dtype=np.float64))
+
+            for sweep_idx in range(events_s.size):
+                latencies = {}
+                for unit_name, lat_arr in zip(unit_names, unit_latencies):
+                    lat_samples = float(lat_arr[sweep_idx])
+                    if np.isfinite(lat_samples) and lat_samples >= 0:
+                        latencies[unit_name] = lat_samples / sr
+                latencies_per_sweep.append(latencies)
+        else:
+            latencies_per_sweep = [{} for _ in range(events_s.size)]
+
+        self._replay_events_s = events_s
+        self._replay_channels = selected
+        self._replay_primary_name = primary_name
+        self._replay_units = getattr(primary_signal, "units", pq.uV)
+        self._replay_sr = float(sr)
+        self._replay_pre_s = pre_s
+        self._replay_window_ms = window_ms
+        self._replay_window_samples = window_samples
+        self._replay_spike_latencies = latencies_per_sweep
+        self._replay_n = int(events_s.size)
+        self._configure_replay_timeline()
+        self.lbl_replay_info.setText(
+            f"{self._replay_n} sweeps across {len(selected)} channel(s) at {sr:g} Hz."
+        )
+        return True
+
+    @staticmethod
+    def _signal_sampling_rate(signal) -> Optional[float]:
+        sampling_rate = getattr(signal, "sampling_rate", None)
+        if sampling_rate is None:
+            return None
+        try:
+            return float(
+                sampling_rate.rescale(pq.Hz).magnitude
+                if hasattr(sampling_rate, "rescale")
+                else sampling_rate
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _signal_sample_count(signal) -> int:
+        magnitude = getattr(signal, "magnitude", None)
+        if magnitude is not None:
+            array = np.asarray(magnitude)
+            return int(array.shape[0]) if array.ndim > 0 else 0
+        shape = getattr(signal, "shape", None)
+        if shape:
+            try:
+                return int(shape[0])
+            except Exception:
+                return 0
+        return 0
+
+    def _build_replay_sweep(self, stim_timestamp_s: float) -> np.ndarray:
+        start_s = stim_timestamp_s - self._replay_pre_s
+        rows = [
+            self._slice_loaded_signal(signal, start_s, self._replay_window_samples)
+            for _, signal in self._replay_channels
+        ]
+        if len(rows) == 1:
+            return rows[0]
+        return np.vstack(rows)
+
+    def _slice_loaded_signal(
+        self, signal, start_s: float, n_samples: int
+    ) -> np.ndarray:
+        """Extract a fixed-length window, zero-padding outside the recording."""
+        out = np.zeros(max(0, n_samples), dtype=np.float32)
+        if n_samples <= 0:
+            return out
+        sr = self._replay_sr
+
+        if hasattr(signal, "magnitude"):
+            raw = np.asarray(signal.magnitude)
+            t_start = getattr(signal, "t_start", 0.0)
+            try:
+                t_start_s = float(
+                    t_start.rescale(pq.s).magnitude
+                    if hasattr(t_start, "rescale")
+                    else t_start
+                )
+            except Exception:
+                t_start_s = 0.0
+            index_offset = int(round((start_s - t_start_s) * sr))
+        else:
+            try:
+                sliced = signal.time_slice(
+                    start_s * pq.s, (start_s + n_samples / sr) * pq.s
+                )
+            except Exception:
+                return out
+            if hasattr(sliced, "magnitude"):
+                raw = np.asarray(sliced.magnitude)
+            elif hasattr(sliced, "signals"):
+                parts = [
+                    np.asarray(getattr(s, "magnitude", s)).reshape(-1)
+                    for s in sliced.signals
+                ]
+                raw = np.concatenate(parts) if parts else np.empty(0)
+            else:
+                raw = np.asarray(sliced)
+            sliced_start = getattr(sliced, "t_start", start_s * pq.s)
+            try:
+                sliced_start_s = float(
+                    sliced_start.rescale(pq.s).magnitude
+                    if hasattr(sliced_start, "rescale")
+                    else sliced_start
+                )
+            except Exception:
+                sliced_start_s = start_s
+            index_offset = int(round((sliced_start_s - start_s) * sr))
+
+        if raw.ndim > 1:
+            raw = raw[:, 0]
+        raw = raw.reshape(-1)
+
+        signal_units = getattr(signal, "units", None)
+        if raw.size and signal_units is not None and signal_units != self._replay_units:
+            try:
+                scale = float(
+                    (1.0 * signal_units).rescale(self._replay_units).magnitude
+                )
+                if scale != 1.0:
+                    raw = raw * scale
+            except Exception:
+                pass
+
+        src_start = max(0, index_offset)
+        src_end = min(raw.size, index_offset + n_samples)
+        if src_end > src_start:
+            dst_start = src_start - index_offset
+            out[dst_start : dst_start + (src_end - src_start)] = raw[
+                src_start:src_end
+            ].astype(np.float32, copy=False)
+        return out
 
     @Slot()
     def start_demo_stream(self):
@@ -689,7 +1392,6 @@ class OpenEphysLiveView(QWidget):
                     units=pq.uV,
                     aux_channels=[f"CH{c}" for c in active_chans],
                 )
-            self.state.follow_live = self.chk_follow_live.isChecked()
             try:
                 self.state.append_sweep(
                     stim_timestamp=stim_ts,
@@ -729,12 +1431,12 @@ class OpenEphysLiveView(QWidget):
 
             if (
                 emit_signals
-                and self.chk_follow_live.isChecked()
+                and getattr(self.state, "follow_live", True)
                 and self.state.event_signal is not None
             ):
                 total_sweeps = len(self.state.event_signal)
                 if total_sweeps > 0 and self.state.stimno != total_sweeps - 1:
-                    self.state.setStimNo(total_sweeps - 1)
+                    self.state.setStimNo(total_sweeps - 1, user_set=False)
 
     def _fallback_append_sweep(
         self, waveform: np.ndarray, stim_ts: float, sample_rate: float

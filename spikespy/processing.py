@@ -566,6 +566,10 @@ class LiveERPBuffer:
         return self._running_std if self._count > 0 else 1.0
 
     @property
+    def n_sweeps(self) -> int:
+        return self._count
+
+    @property
     def heatmap_decimated_data(self) -> np.ndarray:
         """Compact 2D clipped and max-pooled matrix (n_sweeps, <=2000) for fast GPU heatmap uploads."""
         return self._heatmap_decimated[: self._count, : max(1, self._decim_width)]

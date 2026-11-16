@@ -729,35 +729,27 @@ class MdiView(QMainWindow):
         self.shortcut_next = QShortcut(
             QKeySequence(Qt.Key_Down), self, context=Qt.ApplicationShortcut
         )
-        self.shortcut_next.activated.connect(
-            lambda: self.state.setStimNo(self.state.stimno + 1)
-        )
+        self.shortcut_next.activated.connect(lambda: self._navigate_stim(1))
 
         self.shortcut_skip_next = QShortcut(
             QKeySequence(Qt.Key_PageDown), self, context=Qt.ApplicationShortcut
         )
-        self.shortcut_skip_next.activated.connect(
-            lambda: self.state.setStimNo(self.state.stimno + 5)
-        )
+        self.shortcut_skip_next.activated.connect(lambda: self._navigate_stim(5))
 
         self.shortcut_prev = QShortcut(
             QKeySequence(Qt.Key_Up), self, context=Qt.ApplicationShortcut
         )
-        self.shortcut_prev.activated.connect(
-            lambda: self.state.setStimNo(self.state.stimno - 1)
-        )
+        self.shortcut_prev.activated.connect(lambda: self._navigate_stim(-1))
 
         self.shortcut_skip_prev = QShortcut(
             QKeySequence(Qt.Key_PageUp), self, context=Qt.ApplicationShortcut
         )
-        self.shortcut_skip_prev.activated.connect(
-            lambda: self.state.setStimNo(self.state.stimno - 5)
-        )
+        self.shortcut_skip_prev.activated.connect(lambda: self._navigate_stim(-5))
 
         self.shortcut_del = QShortcut(
             QKeySequence(Qt.Key_Backspace), self, context=Qt.ApplicationShortcut
         )
-        self.shortcut_del.activated.connect(lambda: self.state.setUnit(None))
+        self.shortcut_del.activated.connect(lambda: self._active_viewer_state().setUnit(None))
 
         self.shortcut_copylast = QShortcut(
             QKeySequence(Qt.Key_Space), self, context=Qt.ApplicationShortcut
@@ -770,27 +762,28 @@ class MdiView(QMainWindow):
             self,
             context=Qt.ApplicationShortcut,
         )
-        self.shortcut_copynext.activated.connect(lambda: self.state.setUnit(-2))
+        self.shortcut_copynext.activated.connect(lambda: self._active_viewer_state().setUnit(-2))
 
         self.move_mode = "snap"
 
         def move(dist=1, mode=None):
             print(f"move {dist}")
-            sg = self.state.spike_groups[self.state.cur_spike_group]
+            s = self._active_viewer_state()
+            sg = s.spike_groups[s.cur_spike_group]
             sr = 10000.0
-            if hasattr(self.state, "sampling_rate") and self.state.sampling_rate is not None:
-                sr = float(self.state.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(self.state.sampling_rate, "magnitude") else float(self.state.sampling_rate)
-            elif self.state.analog_signal is not None and hasattr(self.state.analog_signal, "sampling_rate"):
-                sr = float(self.state.analog_signal.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(self.state.analog_signal.sampling_rate, "magnitude") else float(self.state.analog_signal.sampling_rate)
+            if hasattr(s, "sampling_rate") and s.sampling_rate is not None:
+                sr = float(s.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(s.sampling_rate, "magnitude") else float(s.sampling_rate)
+            elif s.analog_signal is not None and hasattr(s.analog_signal, "sampling_rate"):
+                sr = float(s.analog_signal.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(s.analog_signal.sampling_rate, "magnitude") else float(s.analog_signal.sampling_rate)
 
             cur_point = None
-            if self.state.event_signal is not None and self.state.stimno < len(self.state.event_signal) and hasattr(sg, "get_latencies"):
-                cur_ev = self.state.event_signal[self.state.stimno]
+            if s.event_signal is not None and s.stimno < len(s.event_signal) and hasattr(sg, "get_latencies"):
+                cur_ev = s.event_signal[s.stimno]
                 lat = sg.get_latencies(np.array([cur_ev.magnitude]) * cur_ev.units)[0]
                 if not np.isnan(lat):
                     cur_point = int(round(float((lat.rescale(pq.s) * sr).magnitude)))
-            elif getattr(sg, "idx_arr", None) is not None and self.state.stimno < len(sg.idx_arr):
-                item = sg.idx_arr[self.state.stimno]
+            elif getattr(sg, "idx_arr", None) is not None and s.stimno < len(sg.idx_arr):
+                item = sg.idx_arr[s.stimno]
                 if item is not None:
                     cur_point = item[0]
 
@@ -800,7 +793,7 @@ class MdiView(QMainWindow):
             if mode is None:
                 mode = self.move_mode
             if mode == "snap":
-                pts = self.state.get_peaks()[self.state.stimno]
+                pts = s.get_peaks()[s.stimno]
                 i = pts.searchsorted(cur_point)
 
                 if dist > 0 and pts[i] != cur_point:
@@ -808,7 +801,7 @@ class MdiView(QMainWindow):
 
                 dist = pts[i + dist] - cur_point
 
-            self.state.setUnit(cur_point + dist)  # TODO: make method
+            s.setUnit(cur_point + dist)  # TODO: make method
 
         self.shortcut_left = QShortcut(
             QKeySequence(Qt.Key_Left), self, context=Qt.ApplicationShortcut
@@ -853,16 +846,17 @@ class MdiView(QMainWindow):
         self.shortcut_snap.activated.connect(toggle_snap)
 
         def copy_previous():
-            sg = self.state.spike_groups[self.state.cur_spike_group]
+            s = self._active_viewer_state()
+            sg = s.spike_groups[s.cur_spike_group]
             sr = 10000.0
-            if hasattr(self.state, "sampling_rate") and self.state.sampling_rate is not None:
-                sr = float(self.state.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(self.state.sampling_rate, "magnitude") else float(self.state.sampling_rate)
-            elif self.state.analog_signal is not None and hasattr(self.state.analog_signal, "sampling_rate"):
-                sr = float(self.state.analog_signal.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(self.state.analog_signal.sampling_rate, "magnitude") else float(self.state.analog_signal.sampling_rate)
+            if hasattr(s, "sampling_rate") and s.sampling_rate is not None:
+                sr = float(s.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(s.sampling_rate, "magnitude") else float(s.sampling_rate)
+            elif s.analog_signal is not None and hasattr(s.analog_signal, "sampling_rate"):
+                sr = float(s.analog_signal.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(s.analog_signal.sampling_rate, "magnitude") else float(s.analog_signal.sampling_rate)
 
             new_x = None
-            if self.state.event_signal is not None and self.state.stimno > 0 and hasattr(sg, "get_latencies"):
-                search_evts = self.state.event_signal[0 : self.state.stimno]
+            if s.event_signal is not None and s.stimno > 0 and hasattr(sg, "get_latencies"):
+                search_evts = s.event_signal[0 : s.stimno]
                 lats = sg.get_latencies(search_evts)
                 for k in range(len(lats) - 1, -1, -1):
                     if not np.isnan(lats[k]):
@@ -872,7 +866,7 @@ class MdiView(QMainWindow):
                 try:
                     new_x = next(
                         sg.idx_arr[x][0]
-                        for x in range(self.state.stimno - 1, -1, -1)
+                        for x in range(s.stimno - 1, -1, -1)
                         if sg.idx_arr[x] is not None
                     )
                 except StopIteration:
@@ -880,28 +874,50 @@ class MdiView(QMainWindow):
 
             if new_x is not None:
                 # localise to nearest peak
-                cur_erp = self.state.get_erp()[self.state.stimno]
+                cur_erp = s.get_erp()[s.stimno]
                 start_w = max(0, new_x - 300)
                 end_w = min(len(cur_erp), new_x + 300)
                 if end_w > start_w:
                     offset = np.argmax(cur_erp[start_w:end_w]) - (new_x - start_w)
-                    self.state.setUnit(new_x + offset)
+                    s.setUnit(new_x + offset)
 
         self.shortcut_copy_previous = QShortcut(
             QKeySequence(Qt.Key_C), self, context=Qt.ApplicationShortcut
         )
         self.shortcut_copy_previous.activated.connect(copy_previous)
 
+        self.shortcut_toggle_live_events = QShortcut(
+            QKeySequence("Ctrl+L"), self, context=Qt.ApplicationShortcut
+        )
+        self.shortcut_toggle_live_events.activated.connect(self._toggle_follow_live)
+
+    def _active_viewer_state(self):
+        """State backing the focused view (a container's local overlay if any)."""
+        panel = getattr(self, "settings_panel", None)
+        view = getattr(panel, "active_view", None) if panel is not None else None
+        if view is not None:
+            state = getattr(view, "view_state", None) or getattr(view, "state", None)
+            if state is not None:
+                return state
+        return self.state
+
+    def _navigate_stim(self, delta: int):
+        state = self._active_viewer_state()
+        if state is not None:
+            state.setStimNo(state.stimno + delta)
+
     def _toggle_follow_live(self):
-        if self.state is not None and getattr(self.state, "is_streaming", False):
-            self.state.set_follow_live(not bool(getattr(self.state, "follow_live", True)))
+        state = self._active_viewer_state()
+        if state is not None:
+            state.set_follow_live(not bool(getattr(state, "follow_live", True)))
             return True
         return False
 
     def _on_space_pressed(self):
         if not self._toggle_follow_live():
-            if self.state is not None:
-                self.state.setUnit(-1)
+            state = self._active_viewer_state()
+            if state is not None:
+                state.setUnit(-1)
 
     def export_csv(self):
         save_filename = QFileDialog.getSaveFileName(self, "Export")[0]

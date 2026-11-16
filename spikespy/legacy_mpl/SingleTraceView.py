@@ -317,6 +317,10 @@ class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
     def on_new_sweep(self, stimno: int):
         if self.state is None:
             return
+        # When following is paused, the displayed sweep is driven by
+        # onStimNoChange instead of each incoming live frame.
+        if not getattr(self.state, "follow_live", True):
+            return
         erp = self.state.get_erp()
         if erp is None or erp.shape[0] == 0:
             return

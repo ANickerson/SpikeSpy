@@ -3,25 +3,32 @@ from typing import Any, Dict, Optional, Union
 
 import PySide6
 from PySide6.QtCore import QSignalBlocker, Qt, Signal, Slot
+from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QPushButton,
     QRadioButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
+
+from .ChannelGroupBar import ChannelGroupBar
+from .MultiTracePlotManager import MultiTracePlotManager
 
 
 class ViewSettingsPanel(QWidget):
@@ -36,6 +43,7 @@ class ViewSettingsPanel(QWidget):
         super().__init__(parent)
         self.state = state
         self.active_view: Optional[QWidget] = None
+        self._active_state_connections = []
         self._block_updates = False
 
         self.setWindowTitle("View Settings")
@@ -75,23 +83,90 @@ class ViewSettingsPanel(QWidget):
 
         main_layout.addWidget(header_frame)
 
-        # 1b. Unit Group Selector for Selected Window
-        self.grp_unit_selector = QGroupBox("Target Unit Group", self)
-        u_layout = QHBoxLayout(self.grp_unit_selector)
-        u_layout.setContentsMargins(6, 4, 6, 4)
-        u_layout.addWidget(QLabel("Unit:"))
+        # 1b. Channel & Unit Selector for Selected Window
+        self.grp_unit_selector = QGroupBox("Channel & Unit Selection", self)
+        self.grp_channel_selector = self.grp_unit_selector
+        grp_layout = QVBoxLayout(self.grp_unit_selector)
+        grp_layout.setContentsMargins(6, 4, 6, 4)
+        grp_layout.setSpacing(4)
+
+        # Unit selection row
+        row_unit = QHBoxLayout()
+        row_unit.addWidget(QLabel("Unit:"))
         self.combo_unit = QComboBox(self.grp_unit_selector)
         self.combo_unit.setToolTip(
             "Select target unit group for the active window.\n"
             "When inside a channel group, changing this affects all views in the group."
         )
         self.combo_unit.currentIndexChanged.connect(self._on_unit_selection_changed)
-        u_layout.addWidget(self.combo_unit, 1)
+        row_unit.addWidget(self.combo_unit, 1)
+        grp_layout.addLayout(row_unit)
+
+        # Channel / Group selection row
+        row_chan = QHBoxLayout()
+        row_chan.addWidget(QLabel("Channel:"))
+        self.combo_channel = QComboBox(self.grp_unit_selector)
+        self.combo_channel.setToolTip(
+            "Select channel or channel group:\n"
+            "- (Follow Global Channel): follow global active recording channel\n"
+            "- (📡 Follow Live Input): track incoming live streaming channels\n"
+            "- (Bound Unit Channels): display all channels where the bound unit is identified\n"
+            "- [Group] ...: use a saved channel group\n"
+            "- Individual Channel: pick a specific channel"
+        )
+        self.combo_channel.currentIndexChanged.connect(self._on_channel_selection_changed)
+        row_chan.addWidget(self.combo_channel, 1)
+        grp_layout.addLayout(row_chan)
+
+        # Multi-Ch, Quick Shifts, and Group Menu buttons row
+        row_opts = QHBoxLayout()
+        self.chk_multichannel = QCheckBox("Multi-Ch", self.grp_unit_selector)
+        self.chk_multichannel.setToolTip("Display or integrate all channels in the selected group/unit")
+        self.chk_multichannel.toggled.connect(self._on_multichannel_toggled)
+        row_opts.addWidget(self.chk_multichannel)
+
+        self.btn_shift_prev = QPushButton("<", self.grp_unit_selector)
+        self.btn_shift_prev.setFixedWidth(24)
+        self.btn_shift_prev.setToolTip("Shift channel group by -1 channel")
+        self.btn_shift_prev.clicked.connect(lambda: self._shift_channel_group(-1))
+        row_opts.addWidget(self.btn_shift_prev)
+
+        self.btn_shift_next = QPushButton(">", self.grp_unit_selector)
+        self.btn_shift_next.setFixedWidth(24)
+        self.btn_shift_next.setToolTip("Shift channel group by +1 channel")
+        self.btn_shift_next.clicked.connect(lambda: self._shift_channel_group(1))
+        row_opts.addWidget(self.btn_shift_next)
+
+        self.btn_group_menu = QToolButton(self.grp_unit_selector)
+        self.btn_group_menu.setText("Group ▾")
+        self.btn_group_menu.setPopupMode(QToolButton.InstantPopup)
+        self._build_panel_group_menu()
+        row_opts.addWidget(self.btn_group_menu)
+        grp_layout.addLayout(row_opts)
+
+        # Follow Live Events checkbox row
+        row_live = QHBoxLayout()
+        self.chk_follow_events = QCheckBox("📡 Follow Live Events", self.grp_unit_selector)
+        self.chk_follow_events.setToolTip(
+            "Follow live new events (keep event index in sync with latest). Shortcut: Ctrl+L"
+        )
+        self.chk_follow_events.toggled.connect(self._on_follow_events_toggled)
+        row_live.addWidget(self.chk_follow_events)
+        grp_layout.addLayout(row_live)
+
         main_layout.addWidget(self.grp_unit_selector)
+
+        # Keyboard shortcut for toggling following live events
+        self.shortcut_toggle_live_events = QShortcut(
+            QKeySequence("Ctrl+L"), self, context=Qt.WidgetWithChildrenShortcut
+        )
+        self.shortcut_toggle_live_events.activated.connect(self.toggle_follow_live_events)
 
         if self.state is not None:
             self._connect_state_signals()
             self._refresh_unit_combo()
+            self._refresh_channel_combo()
+            self._sync_follow_events_checkbox()
 
         # 2. Scroll area containing dynamic settings editors
         self.scroll = QScrollArea(self)
@@ -199,6 +274,16 @@ class ViewSettingsPanel(QWidget):
         self.btn_mt_del.clicked.connect(self._on_mt_del_clicked)
         btn_layout.addWidget(self.btn_mt_del)
         layout.addLayout(btn_layout)
+
+        # Per-plot management (channel plots and summary line graphs)
+        plots_header = QLabel("<b>Plots</b>")
+        plots_header.setToolTip(
+            "Add, remove, reorder and configure each channel or summary plot"
+        )
+        layout.addWidget(plots_header)
+        self.mt_plot_manager = MultiTracePlotManager(grp)
+        self.mt_plot_manager.setVisible(False)
+        layout.addWidget(self.mt_plot_manager)
 
         return grp
 
@@ -344,11 +429,20 @@ class ViewSettingsPanel(QWidget):
         self.btn_nav_zoom.clicked.connect(lambda: self._on_nav_mode_btn_clicked("zoom"))
         self.btn_nav_reset.clicked.connect(self._on_nav_reset_clicked)
 
+        # Range Mode: Absolute vs Diff (Center + Width/Height)
+        range_mode_layout = QHBoxLayout()
+        range_mode_layout.addWidget(QLabel("Range Mode:"))
+        self.combo_range_mode = QComboBox()
+        self.combo_range_mode.addItems(["Absolute (min/max)", "Diff (center + width/height)"])
+        self.combo_range_mode.currentIndexChanged.connect(self._on_range_mode_changed)
+        range_mode_layout.addWidget(self.combo_range_mode)
+        layout.addLayout(range_mode_layout)
+
         # Manual Limits Form
         form = QFormLayout()
 
-        # X Range
-        x_layout = QHBoxLayout()
+        # X Range - Absolute mode
+        self.x_abs_layout = QHBoxLayout()
         self.spin_xlim_min = QDoubleSpinBox()
         self.spin_xlim_min.setRange(-1e9, 1e9)
         self.spin_xlim_min.setDecimals(4)
@@ -361,13 +455,35 @@ class ViewSettingsPanel(QWidget):
         self.spin_xlim_max.setSingleStep(1.0)
         self.spin_xlim_max.setKeyboardTracking(False)
 
-        x_layout.addWidget(self.spin_xlim_min)
-        x_layout.addWidget(QLabel("to"))
-        x_layout.addWidget(self.spin_xlim_max)
-        form.addRow("X Limits:", x_layout)
+        self.x_abs_layout.addWidget(self.spin_xlim_min)
+        self.x_abs_layout.addWidget(QLabel("to"))
+        self.x_abs_layout.addWidget(self.spin_xlim_max)
 
-        # Y Range
-        y_layout = QHBoxLayout()
+        # X Range - Diff mode
+        self.x_diff_layout = QHBoxLayout()
+        self.spin_x_center = QDoubleSpinBox()
+        self.spin_x_center.setRange(-1e9, 1e9)
+        self.spin_x_center.setDecimals(4)
+        self.spin_x_center.setSingleStep(1.0)
+        self.spin_x_center.setKeyboardTracking(False)
+        self.spin_x_center.setToolTip("Center of X range")
+
+        self.spin_x_width = QDoubleSpinBox()
+        self.spin_x_width.setRange(0.0, 2e9)
+        self.spin_x_width.setDecimals(4)
+        self.spin_x_width.setSingleStep(1.0)
+        self.spin_x_width.setKeyboardTracking(False)
+        self.spin_x_width.setToolTip("Width of X range")
+
+        self.x_diff_layout.addWidget(QLabel("Center:"))
+        self.x_diff_layout.addWidget(self.spin_x_center)
+        self.x_diff_layout.addWidget(QLabel("Width:"))
+        self.x_diff_layout.addWidget(self.spin_x_width)
+
+        form.addRow("X Range:", self.x_abs_layout)
+
+        # Y Range - Absolute mode
+        self.y_abs_layout = QHBoxLayout()
         self.spin_ylim_min = QDoubleSpinBox()
         self.spin_ylim_min.setRange(-1e9, 1e9)
         self.spin_ylim_min.setDecimals(4)
@@ -380,10 +496,32 @@ class ViewSettingsPanel(QWidget):
         self.spin_ylim_max.setSingleStep(1.0)
         self.spin_ylim_max.setKeyboardTracking(False)
 
-        y_layout.addWidget(self.spin_ylim_min)
-        y_layout.addWidget(QLabel("to"))
-        y_layout.addWidget(self.spin_ylim_max)
-        form.addRow("Y Limits:", y_layout)
+        self.y_abs_layout.addWidget(self.spin_ylim_min)
+        self.y_abs_layout.addWidget(QLabel("to"))
+        self.y_abs_layout.addWidget(self.spin_ylim_max)
+
+        # Y Range - Diff mode
+        self.y_diff_layout = QHBoxLayout()
+        self.spin_y_center = QDoubleSpinBox()
+        self.spin_y_center.setRange(-1e9, 1e9)
+        self.spin_y_center.setDecimals(4)
+        self.spin_y_center.setSingleStep(1.0)
+        self.spin_y_center.setKeyboardTracking(False)
+        self.spin_y_center.setToolTip("Center of Y range")
+
+        self.spin_y_height = QDoubleSpinBox()
+        self.spin_y_height.setRange(0.0, 2e9)
+        self.spin_y_height.setDecimals(4)
+        self.spin_y_height.setSingleStep(1.0)
+        self.spin_y_height.setKeyboardTracking(False)
+        self.spin_y_height.setToolTip("Height of Y range")
+
+        self.y_diff_layout.addWidget(QLabel("Center:"))
+        self.y_diff_layout.addWidget(self.spin_y_center)
+        self.y_diff_layout.addWidget(QLabel("Height:"))
+        self.y_diff_layout.addWidget(self.spin_y_height)
+
+        form.addRow("Y Range:", self.y_abs_layout)
 
         layout.addLayout(form)
 
@@ -402,6 +540,10 @@ class ViewSettingsPanel(QWidget):
         self.spin_xlim_max.editingFinished.connect(self._on_apply_limits_clicked)
         self.spin_ylim_min.editingFinished.connect(self._on_apply_limits_clicked)
         self.spin_ylim_max.editingFinished.connect(self._on_apply_limits_clicked)
+        self.spin_x_center.editingFinished.connect(self._on_apply_limits_clicked)
+        self.spin_x_width.editingFinished.connect(self._on_apply_limits_clicked)
+        self.spin_y_center.editingFinished.connect(self._on_apply_limits_clicked)
+        self.spin_y_height.editingFinished.connect(self._on_apply_limits_clicked)
 
         return grp
 
@@ -432,6 +574,7 @@ class ViewSettingsPanel(QWidget):
                 "UnitView",
                 "UnitFootprint",
                 "UnitPG",
+                "ChannelGroupContainer",
             )
         ):
             return True
@@ -442,7 +585,38 @@ class ViewSettingsPanel(QWidget):
     def _disconnect_current_view(self):
         """Cleanly disconnect any signals from the previously active view."""
         self._disconnect_navigation_signals()
+        self._disconnect_active_state_signals()
+        if hasattr(self, "mt_plot_manager"):
+            self.mt_plot_manager.set_view(None)
         self.active_view = None
+
+    def _disconnect_active_state_signals(self):
+        for sig, slot in self._active_state_connections:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._active_state_connections.clear()
+
+    def _connect_active_state_signals(self, view: Optional[QWidget]):
+        """Listen to the active view's own (per-container) follow/index signals."""
+        self._disconnect_active_state_signals()
+        if view is None:
+            return
+        state = getattr(view, "view_state", None) or getattr(view, "state", None)
+        if state is None:
+            return
+        for name in ("onFollowLiveChanged", "onStimNoChange", "onNewSweep"):
+            sig = getattr(state, name, None)
+            if sig is None:
+                continue
+            try:
+                sig.connect(self._sync_follow_events_checkbox)
+                self._active_state_connections.append(
+                    (sig, self._sync_follow_events_checkbox)
+                )
+            except (TypeError, RuntimeError):
+                pass
 
     def _on_focus_changed(self, old: Optional[QWidget], new: Optional[QWidget]):
         if new is not None:
@@ -486,9 +660,29 @@ class ViewSettingsPanel(QWidget):
         if hasattr(self.state, "onHideViewTopBarsChanged"):
             self._state_connections.append((self.state.onHideViewTopBarsChanged, self._on_hide_top_bars_state_changed))
             self.state.onHideViewTopBarsChanged.connect(self._on_hide_top_bars_state_changed)
+        if hasattr(self.state, "onChannelGroupsChanged"):
+            self._state_connections.append((self.state.onChannelGroupsChanged, self._refresh_channel_combo))
+            self.state.onChannelGroupsChanged.connect(self._refresh_channel_combo)
+        if hasattr(self.state, "onChannelChange"):
+            self._state_connections.append((self.state.onChannelChange, self._refresh_channel_combo))
+            self.state.onChannelChange.connect(self._refresh_channel_combo)
+        if hasattr(self.state, "onSharedChannelSetChanged"):
+            self._state_connections.append((self.state.onSharedChannelSetChanged, self._refresh_channel_combo))
+            self.state.onSharedChannelSetChanged.connect(self._refresh_channel_combo)
+        if hasattr(self.state, "onFollowLiveChanged"):
+            self._state_connections.append((self.state.onFollowLiveChanged, self._sync_follow_events_checkbox))
+            self.state.onFollowLiveChanged.connect(self._sync_follow_events_checkbox)
+        if hasattr(self.state, "onStimNoChange"):
+            self._state_connections.append((self.state.onStimNoChange, self._sync_follow_events_checkbox))
+            self.state.onStimNoChange.connect(self._sync_follow_events_checkbox)
+        if hasattr(self.state, "onNewSweep"):
+            self._state_connections.append((self.state.onNewSweep, self._sync_follow_events_checkbox))
+            self.state.onNewSweep.connect(self._sync_follow_events_checkbox)
 
     def _find_parent_container(self, view: Optional[QWidget]) -> Optional[Any]:
         if view is None:
+            return None
+        if not self._is_view_alive(view):
             return None
         if view.__class__.__name__ == "ChannelGroupContainerView":
             return view
@@ -572,6 +766,249 @@ class ViewSettingsPanel(QWidget):
             elif hasattr(self.active_view, "bind_to_unit"):
                 self.active_view.bind_to_unit(selected_unit)
         self.settingsChanged.emit()
+
+    def _get_active_channel_bar(self) -> Optional[ChannelGroupBar]:
+        if self.active_view is None:
+            return None
+        if not self._is_view_alive(self.active_view):
+            return None
+        container = self._find_parent_container(self.active_view)
+        if container is not None and hasattr(container, "channel_bar") and container.channel_bar is not None:
+            return container.channel_bar
+        if hasattr(self.active_view, "channel_bar") and self.active_view.channel_bar is not None:
+            return self.active_view.channel_bar
+        return None
+
+    def _refresh_channel_combo(self):
+        curr_data = self.combo_channel.currentData()
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None and curr_data is None:
+            curr_data = target_bar.get_channel_mode()
+
+        with QSignalBlocker(self.combo_channel):
+            self.combo_channel.clear()
+            self.combo_channel.addItem("(Follow Global Channel)", userData=(ChannelGroupBar.MODE_FOLLOW_GLOBAL, None))
+            self.combo_channel.addItem("(📡 Follow Live Input)", userData=(ChannelGroupBar.MODE_FOLLOW_LIVE, None))
+            self.combo_channel.addItem("(Bound Unit Channels)", userData=(ChannelGroupBar.MODE_FOLLOW_UNIT, None))
+            self.combo_channel.addItem("(🔗 Shared Group A)", userData=(ChannelGroupBar.MODE_SHARED_SET, "Shared Group A"))
+            self.combo_channel.addItem("(🔗 Shared Group B)", userData=(ChannelGroupBar.MODE_SHARED_SET, "Shared Group B"))
+
+            if self.state:
+                all_groups = self.state.get_all_channel_groups() if hasattr(self.state, "get_all_channel_groups") else {}
+                if all_groups:
+                    self.combo_channel.insertSeparator(self.combo_channel.count())
+                    for g_name, g_chans in all_groups.items():
+                        preview = f" ({len(g_chans)} ch: {', '.join(g_chans[:3])}{'...' if len(g_chans)>3 else ''})"
+                        self.combo_channel.addItem(f"[Group] {g_name}{preview}", userData=(ChannelGroupBar.MODE_GROUP, g_name))
+
+                avail = self.state.get_available_channels() if hasattr(self.state, "get_available_channels") else []
+                if avail:
+                    self.combo_channel.insertSeparator(self.combo_channel.count())
+                    for ch in avail:
+                        self.combo_channel.addItem(ch, userData=(ChannelGroupBar.MODE_SINGLE, ch))
+
+            restored = False
+            if curr_data is not None and isinstance(curr_data, (tuple, list)) and len(curr_data) == 2:
+                for idx in range(self.combo_channel.count()):
+                    d = self.combo_channel.itemData(idx)
+                    if isinstance(d, (tuple, list)) and len(d) == 2 and d[0] == curr_data[0] and (curr_data[1] is None or d[1] == curr_data[1]):
+                        self.combo_channel.setCurrentIndex(idx)
+                        restored = True
+                        break
+            if not restored:
+                self.combo_channel.setCurrentIndex(0)
+
+    def _build_panel_group_menu(self):
+        menu = QMenu(self.btn_group_menu)
+        menu.addAction("Edit Channels in Group...", self._open_channel_group_dialog)
+        menu.addAction("Quick 4-Ch Tetrode Group", self._quick_select_tetrode)
+        menu.addSeparator()
+        menu.addAction("Shift Group -4 Channels", lambda: self._shift_channel_group(-4))
+        menu.addAction("Shift Group +4 Channels", lambda: self._shift_channel_group(4))
+        menu.addAction("Shift by Group Span (-N)", lambda: self._shift_group_by_span(-1))
+        menu.addAction("Shift by Group Span (+N)", lambda: self._shift_group_by_span(1))
+        menu.addSeparator()
+        menu.addAction("Assign Group to Bound Unit", self._assign_group_to_unit)
+        menu.addAction("Save Current Group as Named Preset...", self._save_group_preset)
+        menu.addAction("Auto-Detect Unit Channels (Footprint)", self._auto_detect_unit_channels)
+        self.btn_group_menu.setMenu(menu)
+
+    def _on_channel_selection_changed(self, idx: int):
+        if self._block_updates:
+            return
+        curr_data = self.combo_channel.itemData(idx)
+        if curr_data is None or not isinstance(curr_data, (tuple, list)) or len(curr_data) != 2:
+            return
+        mode, val = curr_data
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None:
+            c_idx = target_bar.find_channel_data_index(mode, val)
+            if c_idx >= 0 and target_bar.combo_channel.currentIndex() != c_idx:
+                target_bar.combo_channel.setCurrentIndex(c_idx)
+            elif c_idx < 0:
+                if mode == ChannelGroupBar.MODE_SINGLE:
+                    target_bar.bind_to_channel(str(val))
+                elif mode == ChannelGroupBar.MODE_GROUP:
+                    target_bar.bind_to_group(str(val))
+                elif mode == ChannelGroupBar.MODE_FOLLOW_GLOBAL:
+                    target_bar.set_channel_mode_global()
+                elif mode == ChannelGroupBar.MODE_FOLLOW_LIVE:
+                    target_bar.set_channel_mode_live()
+                elif mode == ChannelGroupBar.MODE_FOLLOW_UNIT:
+                    target_bar.set_channel_mode_unit()
+                elif mode == ChannelGroupBar.MODE_SHARED_SET:
+                    target_bar.bind_to_shared_set(str(val))
+
+            container = self._find_parent_container(self.active_view)
+            if container is not None and hasattr(container, "_sync_all_children"):
+                container._sync_all_children()
+            with QSignalBlocker(self.chk_multichannel):
+                self.chk_multichannel.setChecked(target_bar.is_multichannel())
+        elif self.state is not None:
+            if mode == ChannelGroupBar.MODE_SINGLE and hasattr(self.state, "set_channel"):
+                self.state.set_channel(str(val))
+        self.settingsChanged.emit()
+
+    def _on_multichannel_toggled(self, checked: bool):
+        if self._block_updates:
+            return
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None:
+            if target_bar.chk_multichannel.isChecked() != checked:
+                target_bar.chk_multichannel.setChecked(checked)
+            container = self._find_parent_container(self.active_view)
+            if container is not None and hasattr(container, "_sync_all_children"):
+                container._sync_all_children()
+        self.settingsChanged.emit()
+
+    def _shift_channel_group(self, step: int):
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None:
+            target_bar.shift_group(step)
+            container = self._find_parent_container(self.active_view)
+            if container is not None and hasattr(container, "_sync_all_children"):
+                container._sync_all_children()
+            self._sync_channel_selection_from_bar()
+        elif self.state is not None:
+            avail = self.state.get_available_channels() if hasattr(self.state, "get_available_channels") else []
+            if avail:
+                cur = getattr(self.state.analog_signal, "name", avail[0])
+                shifted = self.state.shift_channels([cur], step=step)
+                if shifted and hasattr(self.state, "set_channel"):
+                    self.state.set_channel(shifted[0])
+            self._refresh_channel_combo()
+        self.settingsChanged.emit()
+
+    def _shift_group_by_span(self, direction: int = 1):
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None:
+            target_bar.shift_group_by_span(direction)
+            container = self._find_parent_container(self.active_view)
+            if container is not None and hasattr(container, "_sync_all_children"):
+                container._sync_all_children()
+            self._sync_channel_selection_from_bar()
+
+    def _open_channel_group_dialog(self):
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None:
+            target_bar.open_channel_group_dialog()
+            container = self._find_parent_container(self.active_view)
+            if container is not None and hasattr(container, "_sync_all_children"):
+                container._sync_all_children()
+            self._sync_channel_selection_from_bar()
+        else:
+            from .ChannelGroupBar import ChannelGroupDialog
+            dlg = ChannelGroupDialog(parent=self, state=self.state)
+            if dlg.exec() == QDialog.Accepted:
+                self._refresh_channel_combo()
+
+    def _quick_select_tetrode(self):
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None:
+            target_bar.quick_select_tetrode()
+            container = self._find_parent_container(self.active_view)
+            if container is not None and hasattr(container, "_sync_all_children"):
+                container._sync_all_children()
+            self._sync_channel_selection_from_bar()
+
+    def _assign_group_to_unit(self):
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None:
+            target_bar.assign_group_to_unit()
+            container = self._find_parent_container(self.active_view)
+            if container is not None and hasattr(container, "_sync_all_children"):
+                container._sync_all_children()
+            self._sync_channel_selection_from_bar()
+
+    def _save_group_preset(self):
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None:
+            target_bar.save_group_preset()
+            self._refresh_channel_combo()
+
+    def _auto_detect_unit_channels(self):
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None:
+            target_bar.auto_detect_unit_channels()
+            container = self._find_parent_container(self.active_view)
+            if container is not None and hasattr(container, "_sync_all_children"):
+                container._sync_all_children()
+            self._sync_channel_selection_from_bar()
+
+    def _sync_channel_selection_from_bar(self):
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None:
+            mode, val = target_bar.get_channel_mode()
+            with QSignalBlocker(self.combo_channel):
+                for idx in range(self.combo_channel.count()):
+                    d = self.combo_channel.itemData(idx)
+                    if isinstance(d, (tuple, list)) and len(d) == 2 and d[0] == mode and (val is None or d[1] == val):
+                        self.combo_channel.setCurrentIndex(idx)
+                        break
+            with QSignalBlocker(self.chk_multichannel):
+                self.chk_multichannel.setChecked(target_bar.is_multichannel())
+        self._sync_follow_events_checkbox()
+
+    def is_following_live_events(self) -> bool:
+        """Determines if the active view / container / state is following live new events."""
+        if self.active_view is not None and not self._is_view_alive(self.active_view):
+            self.active_view = None
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None and hasattr(target_bar, "is_following_live_events"):
+            return target_bar.is_following_live_events()
+        container = self._find_parent_container(self.active_view)
+        if container is not None and hasattr(container, "is_following_live_events"):
+            return container.is_following_live_events()
+        if self.state is not None and hasattr(self.state, "is_following_live_events"):
+            return self.state.is_following_live_events()
+        return self.chk_follow_events.isChecked()
+
+    def set_follow_live_events(self, enable: bool = True):
+        """Enables or disables following live new events."""
+        target_bar = self._get_active_channel_bar()
+        container = self._find_parent_container(self.active_view)
+        if target_bar is not None and hasattr(target_bar, "set_follow_live_events"):
+            target_bar.set_follow_live_events(enable)
+        elif container is not None and hasattr(container, "set_follow_live_events"):
+            container.set_follow_live_events(enable)
+        elif self.state is not None and hasattr(self.state, "set_follow_live"):
+            self.state.set_follow_live(enable)
+        self._sync_follow_events_checkbox()
+
+    def toggle_follow_live_events(self):
+        """Toggles following live new events."""
+        self.set_follow_live_events(not self.is_following_live_events())
+
+    def _on_follow_events_toggled(self, checked: bool):
+        if self._block_updates:
+            return
+        self.set_follow_live_events(checked)
+
+    def _sync_follow_events_checkbox(self, *args):
+        following = self.is_following_live_events()
+        if self.chk_follow_events.isChecked() != following:
+            with QSignalBlocker(self.chk_follow_events):
+                self.chk_follow_events.setChecked(following)
 
     def _on_hide_top_bars_toggled(self, checked: bool):
         if self.state is not None:
@@ -791,12 +1228,15 @@ class ViewSettingsPanel(QWidget):
             return
 
         self.active_view = resolved
+        self._connect_active_state_signals(resolved)
         view = resolved
         self._block_updates = True
         try:
             # Hide all groups first
             self.placeholder.setVisible(False)
             self.grp_multitrace.setVisible(False)
+            if hasattr(self, "mt_plot_manager"):
+                self.mt_plot_manager.set_view(None)
             self.grp_singletrace.setVisible(False)
             self.grp_fixed.setVisible(False)
             self.grp_unit.setVisible(False)
@@ -832,6 +1272,18 @@ class ViewSettingsPanel(QWidget):
                         target_idx = idx
                         break
                 self.combo_unit.setCurrentIndex(target_idx)
+
+            target_bar = self._get_active_channel_bar()
+            if target_bar is not None:
+                self._sync_channel_selection_from_bar()
+                try:
+                    target_bar.bindingChanged.connect(self._sync_channel_selection_from_bar)
+                    self._current_view_connections.append((target_bar.bindingChanged, self._sync_channel_selection_from_bar))
+                except Exception:
+                    pass
+            else:
+                self._refresh_channel_combo()
+                self._sync_follow_events_checkbox()
 
             c_name = view.__class__.__name__
             self.lbl_view_title.setText(f"<b>{c_name}</b>")
@@ -885,6 +1337,13 @@ class ViewSettingsPanel(QWidget):
             self._block_updates = False
 
     def _populate_multitrace(self, view):
+        supports_plots = hasattr(view, "get_plot_specs") and callable(
+            getattr(view, "get_plot_specs")
+        )
+        if hasattr(self, "mt_plot_manager"):
+            self.mt_plot_manager.setVisible(supports_plots)
+            self.mt_plot_manager.set_view(view if supports_plots else None)
+
         # Scale mode
         cur_scale_mode = getattr(view, "scale_mode", "std")
         if hasattr(view, "get_settings") and callable(getattr(view, "get_settings")):
@@ -1264,10 +1723,18 @@ class ViewSettingsPanel(QWidget):
                 getattr(view, "get_view_range")
             ):
                 (xmin, xmax), (ymin, ymax) = view.get_view_range()
-                self.spin_xlim_min.setValue(xmin)
-                self.spin_xlim_max.setValue(xmax)
-                self.spin_ylim_min.setValue(ymin)
-                self.spin_ylim_max.setValue(ymax)
+                
+                # Populate based on current range mode
+                if self.combo_range_mode.currentIndex() == 0:  # Absolute mode
+                    self.spin_xlim_min.setValue(xmin)
+                    self.spin_xlim_max.setValue(xmax)
+                    self.spin_ylim_min.setValue(ymin)
+                    self.spin_ylim_max.setValue(ymax)
+                else:  # Diff mode
+                    self.spin_x_center.setValue((xmin + xmax) / 2)
+                    self.spin_x_width.setValue(xmax - xmin)
+                    self.spin_y_center.setValue((ymin + ymax) / 2)
+                    self.spin_y_height.setValue(ymax - ymin)
 
                 plot = (
                     view.get_primary_nav_plot()
@@ -1285,10 +1752,19 @@ class ViewSettingsPanel(QWidget):
             elif hasattr(view, "ax"):
                 xlim = view.ax.get_xlim()
                 ylim = view.ax.get_ylim()
-                self.spin_xlim_min.setValue(float(min(xlim)))
-                self.spin_xlim_max.setValue(float(max(xlim)))
-                self.spin_ylim_min.setValue(float(min(ylim)))
-                self.spin_ylim_max.setValue(float(max(ylim)))
+                xmin, xmax = float(min(xlim)), float(max(xlim))
+                ymin, ymax = float(min(ylim)), float(max(ylim))
+                
+                if self.combo_range_mode.currentIndex() == 0:  # Absolute mode
+                    self.spin_xlim_min.setValue(xmin)
+                    self.spin_xlim_max.setValue(xmax)
+                    self.spin_ylim_min.setValue(ymin)
+                    self.spin_ylim_max.setValue(ymax)
+                else:  # Diff mode
+                    self.spin_x_center.setValue((xmin + xmax) / 2)
+                    self.spin_x_width.setValue(xmax - xmin)
+                    self.spin_y_center.setValue((ymin + ymax) / 2)
+                    self.spin_y_height.setValue(ymax - ymin)
         finally:
             self._block_updates = False
 
@@ -1322,6 +1798,10 @@ class ViewSettingsPanel(QWidget):
             or self.spin_xlim_max.hasFocus()
             or self.spin_ylim_min.hasFocus()
             or self.spin_ylim_max.hasFocus()
+            or self.spin_x_center.hasFocus()
+            or self.spin_x_width.hasFocus()
+            or self.spin_y_center.hasFocus()
+            or self.spin_y_height.hasFocus()
         ):
             return
         if hasattr(self.active_view, "get_view_range") and callable(
@@ -1330,12 +1810,93 @@ class ViewSettingsPanel(QWidget):
             (xmin, xmax), (ymin, ymax) = self.active_view.get_view_range()
             self._block_updates = True
             try:
+                if self.combo_range_mode.currentIndex() == 0:  # Absolute mode
+                    self.spin_xlim_min.setValue(xmin)
+                    self.spin_xlim_max.setValue(xmax)
+                    self.spin_ylim_min.setValue(ymin)
+                    self.spin_ylim_max.setValue(ymax)
+                else:  # Diff mode
+                    self.spin_x_center.setValue((xmin + xmax) / 2)
+                    self.spin_x_width.setValue(xmax - xmin)
+                    self.spin_y_center.setValue((ymin + ymax) / 2)
+                    self.spin_y_height.setValue(ymax - ymin)
+            finally:
+                self._block_updates = False
+
+    def _on_range_mode_changed(self, idx: int):
+        if self._block_updates or not self._is_view_alive(self.active_view):
+            return
+        # Switch between absolute and diff layouts
+        is_absolute = (idx == 0)
+        
+        # Update form layout - replace the widget in the row
+        if is_absolute:
+            # Show absolute, hide diff
+            self._replace_form_row("X Range:", self.x_abs_layout)
+            self._replace_form_row("Y Range:", self.y_abs_layout)
+        else:
+            # Show diff, hide absolute
+            self._replace_form_row("X Range:", self.x_diff_layout)
+            self._replace_form_row("Y Range:", self.y_diff_layout)
+        
+        # Re-populate from current view range
+        if hasattr(self.active_view, "get_view_range") and callable(
+            getattr(self.active_view, "get_view_range")
+        ):
+            (xmin, xmax), (ymin, ymax) = self.active_view.get_view_range()
+            if is_absolute:
                 self.spin_xlim_min.setValue(xmin)
                 self.spin_xlim_max.setValue(xmax)
                 self.spin_ylim_min.setValue(ymin)
                 self.spin_ylim_max.setValue(ymax)
-            finally:
-                self._block_updates = False
+            else:
+                self.spin_x_center.setValue((xmin + xmax) / 2)
+                self.spin_x_width.setValue(xmax - xmin)
+                self.spin_y_center.setValue((ymin + ymax) / 2)
+                self.spin_y_height.setValue(ymax - ymin)
+        elif hasattr(self.active_view, "ax"):
+            xlim = self.active_view.ax.get_xlim()
+            ylim = self.active_view.ax.get_ylim()
+            xmin, xmax = float(min(xlim)), float(max(xlim))
+            ymin, ymax = float(min(ylim)), float(max(ylim))
+            if is_absolute:
+                self.spin_xlim_min.setValue(xmin)
+                self.spin_xlim_max.setValue(xmax)
+                self.spin_ylim_min.setValue(ymin)
+                self.spin_ylim_max.setValue(ymax)
+            else:
+                self.spin_x_center.setValue((xmin + xmax) / 2)
+                self.spin_x_width.setValue(xmax - xmin)
+                self.spin_y_center.setValue((ymin + ymax) / 2)
+                self.spin_y_height.setValue(ymax - ymin)
+
+    def _replace_form_row(self, label: str, new_layout: QHBoxLayout):
+        """Replace a form row's layout while keeping the label."""
+        # Find the form layout in grp_navigation
+        form_layout = None
+        for i in range(self.grp_navigation.layout().count()):
+            item = self.grp_navigation.layout().itemAt(i)
+            if item and item.layout() and isinstance(item.layout(), QFormLayout):
+                form_layout = item.layout()
+                break
+        if form_layout:
+            # Find the row index
+            for row in range(form_layout.rowCount()):
+                if form_layout.itemAt(row, QFormLayout.LabelRole):
+                    lbl = form_layout.itemAt(row, QFormLayout.LabelRole).widget()
+                    if lbl and lbl.text().startswith(label.replace(":", "")):
+                        # Remove old field layout
+                        old_field = form_layout.itemAt(row, QFormLayout.FieldRole)
+                        if old_field:
+                            # Remove all widgets from old layout
+                            while old_field.layout().count():
+                                child = old_field.layout().takeAt(0)
+                                if child.widget():
+                                    child.widget().setParent(None)
+                            form_layout.removeRow(row)
+                        # Insert new layout
+                        form_layout.insertRow(row, label, new_layout)
+                        break
 
     def _on_view_nav_mode_changed(self, mode: str):
         if self._block_updates:
@@ -1378,16 +1939,36 @@ class ViewSettingsPanel(QWidget):
     def _on_apply_limits_clicked(self):
         if self._block_updates or not self._is_view_alive(self.active_view):
             return
-        xmin = float(self.spin_xlim_min.value())
-        xmax = float(self.spin_xlim_max.value())
-        ymin = float(self.spin_ylim_min.value())
-        ymax = float(self.spin_ylim_max.value())
+        
+        is_absolute = (self.combo_range_mode.currentIndex() == 0)
+        
+        if is_absolute:
+            xmin = float(self.spin_xlim_min.value())
+            xmax = float(self.spin_xlim_max.value())
+            ymin = float(self.spin_ylim_min.value())
+            ymax = float(self.spin_ylim_max.value())
+        else:
+            x_center = float(self.spin_x_center.value())
+            x_width = float(self.spin_x_width.value())
+            y_center = float(self.spin_y_center.value())
+            y_height = float(self.spin_y_height.value())
+            xmin = x_center - x_width / 2
+            xmax = x_center + x_width / 2
+            ymin = y_center - y_height / 2
+            ymax = y_center + y_height / 2
+        
         if xmin >= xmax:
             xmax = xmin + 1.0
-            self.spin_xlim_max.setValue(xmax)
+            if is_absolute:
+                self.spin_xlim_max.setValue(xmax)
+            else:
+                self.spin_x_width.setValue(1.0)
         if ymin >= ymax:
             ymax = ymin + 1.0
-            self.spin_ylim_max.setValue(ymax)
+            if is_absolute:
+                self.spin_ylim_max.setValue(ymax)
+            else:
+                self.spin_y_height.setValue(1.0)
 
         self._block_updates = True
         try:
@@ -1431,21 +2012,37 @@ class ViewSettingsPanel(QWidget):
             (xmin, xmax), (ymin, ymax) = self.active_view.get_view_range()
             self._block_updates = True
             try:
-                self.spin_xlim_min.setValue(xmin)
-                self.spin_xlim_max.setValue(xmax)
-                self.spin_ylim_min.setValue(ymin)
-                self.spin_ylim_max.setValue(ymax)
+                is_absolute = (self.combo_range_mode.currentIndex() == 0)
+                if is_absolute:
+                    self.spin_xlim_min.setValue(xmin)
+                    self.spin_xlim_max.setValue(xmax)
+                    self.spin_ylim_min.setValue(ymin)
+                    self.spin_ylim_max.setValue(ymax)
+                else:
+                    self.spin_x_center.setValue((xmin + xmax) / 2)
+                    self.spin_x_width.setValue(xmax - xmin)
+                    self.spin_y_center.setValue((ymin + ymax) / 2)
+                    self.spin_y_height.setValue(ymax - ymin)
             finally:
                 self._block_updates = False
         elif hasattr(self.active_view, "ax"):
             xlim = self.active_view.ax.get_xlim()
             ylim = self.active_view.ax.get_ylim()
+            xmin, xmax = float(min(xlim)), float(max(xlim))
+            ymin, ymax = float(min(ylim)), float(max(ylim))
             self._block_updates = True
             try:
-                self.spin_xlim_min.setValue(float(min(xlim)))
-                self.spin_xlim_max.setValue(float(max(xlim)))
-                self.spin_ylim_min.setValue(float(min(ylim)))
-                self.spin_ylim_max.setValue(float(max(ylim)))
+                is_absolute = (self.combo_range_mode.currentIndex() == 0)
+                if is_absolute:
+                    self.spin_xlim_min.setValue(xmin)
+                    self.spin_xlim_max.setValue(xmax)
+                    self.spin_ylim_min.setValue(ymin)
+                    self.spin_ylim_max.setValue(ymax)
+                else:
+                    self.spin_x_center.setValue((xmin + xmax) / 2)
+                    self.spin_x_width.setValue(xmax - xmin)
+                    self.spin_y_center.setValue((ymin + ymax) / 2)
+                    self.spin_y_height.setValue(ymax - ymin)
             finally:
                 self._block_updates = False
         self.settingsChanged.emit()
