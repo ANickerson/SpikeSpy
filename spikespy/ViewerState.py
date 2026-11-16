@@ -1,12 +1,13 @@
+import json
 import logging
 import sys
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 import time
 from tempfile import tempdir
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import neo
 import numpy as np
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QLabel,
     QLineEdit,
+    QProgressDialog,
     QSpinBox,
     QDialogButtonBox,
     QMessageBox,
@@ -40,6 +42,7 @@ from .APTrack_experiment_import import (
 from .NeoOpenEphyisIO import open_ephys_to_neo
 from .io_manager import (
     APTrackDialog,
+    FileLoadWorker,
     expand_multichannel_segment,
     export_units_csv,
     export_units_npz,
@@ -61,10 +64,18 @@ from .processing import (
     create_erp_signals,
 )
 from . import basic_tracking
-from .live_orchestrator import LiveSweepItem
+from . import unit_tracking
+from .candidate_detection import (
+    CandidateEvidence,
+    CandidateProposal,
+    CandidateScanConfig,
+)
+from .live_orchestrator import BatchingMode, LiveSweepItem
 from .tracking_worker import LiveTrackingManager
 
 lru_numpy_memmap = BoundedERPCache
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -433,8 +444,68 @@ class tracked_neuron_unit:
         return sweeps
 
 
+@dataclass
+class CandidateUnit:
+    """A provisional candidate offered by the search phase.
+
+    ``unit`` is a normal :class:`tracked_neuron_unit` payload (event, idx_arr,
+    channel, tracking parameters) that is never part of ``spike_groups`` until
+    the user accepts the candidate.
+    """
+
+    candidate_id: int
+    unit: tracked_neuron_unit
+    algorithm: str = "zscore"
+    detector_params: Dict[str, Any] = field(default_factory=dict)
+    template_refined: bool = False
+    name: str = "candidate_0"
+    name_edited: bool = False
+    channel: str = ""
+    neighbor_channels: List[str] = field(default_factory=list)
+    score: float = 0.0
+    evidence: Any = field(default_factory=CandidateEvidence)
+    latency_center_samples: float = 0.0
+    latency_tolerance_samples: float = 0.0
+    status: str = "pending"
+    score_at_discard: Optional[float] = None
+    channel_at_discard: Optional[str] = None
+    first_seen_stim: int = 0
+    last_seen_stim: int = 0
+    created_at_s: float = 0.0
+    notes: str = ""
+    notes_edited: bool = False
+    tracking_window_ms: float = 5.0
+    tracking_threshold_mv: float = 0.01
+    tracking_max_skips: int = 3
+    threshold_signal: float = 0.0
+    signal_units: str = ""
+
+    def __post_init__(self):
+        if not self.name:
+            self.name = f"candidate_{self.candidate_id}"
+        if not self.channel:
+            self.channel = getattr(self.unit, "channel", "") or ""
+        if not self.neighbor_channels:
+            self.neighbor_channels = list(
+                getattr(self.unit, "neighbor_channels", []) or []
+            )
+        if self.evidence is None:
+            self.evidence = CandidateEvidence()
+        if not self.created_at_s:
+            self.created_at_s = time.time()
+
+    @property
+    def hit_count(self) -> int:
+        return int(getattr(self.evidence, "hit_count", 0) or 0)
+
+    @property
+    def recent_hit_count(self) -> int:
+        return int(getattr(self.evidence, "recent_hit_count", 0) or 0)
+
+
 class ViewerState(QObject):
     onLoadNewFile = Signal()
+    onFileLoaded = Signal(str, str)
     onUnitChange = Signal(int)
     onUnitGroupChange = Signal()
     onActiveUnitChanged = Signal(int)
@@ -457,9 +528,16 @@ class ViewerState(QObject):
     onHideViewTopBarsChanged = Signal(bool)
     onFollowLiveChanged = Signal(bool)
     onFollowLiveEventsChanged = Signal(bool)
+    onCandidatesChanged = Signal()
+    onCandidateSelectionChanged = Signal(int)
+    onCandidateScanStateChanged = Signal(bool)
 
     def __init__(self, parent=None, segment=None, spike_groups=None):
         super().__init__(parent)
+
+        self._file_load_worker = None
+        self._file_load_progress = None
+        self._file_load_cancelled = False
 
         self.segment: neo.Segment = segment
         self.spike_groups: List[tracked_neuron_unit] = spike_groups or []
@@ -523,6 +601,21 @@ class ViewerState(QObject):
         # Orchestrator running view-registered processors on new live sweeps.
         # Created lazily by `live_orchestrator` when a view first registers.
         self._live_orchestrator = None
+
+        # Candidate-unit search store (separate from spike_groups until accepted).
+        self.candidate_units: Dict[int, CandidateUnit] = {}
+        self.active_candidate_id: Optional[int] = None
+        self.candidate_config: CandidateScanConfig = CandidateScanConfig()
+        self.auto_scan_live: bool = False
+        self._candidate_scan_manager = None
+        self._candidate_scan_generation = 0
+        self._candidate_last_scan_stim = -1
+        self._candidate_last_interaction = 0.0
+        self._candidate_id_counter = 0
+        self._candidate_rescan_discarded = False
+        self._candidate_scan_truncated = False
+        self._candidate_preferred_center: Dict[int, float] = {}
+        self.onStreamStateChanged.connect(self._update_candidate_auto_scan)
 
         from spikespy.ui_diagnostics import AdaptiveFrameScheduler, UIWatchdog
 
@@ -1091,6 +1184,378 @@ class ViewerState(QObject):
         self.onNewSpikeEvents.emit(unit_idx)
         self.onUnitSpikeChanged.emit(unit_idx, stimno)
 
+    def _ensure_template_matcher(self, unit_idx: int, rebuild: bool = False):
+        """Build (or return) the multi-channel template matcher for a unit."""
+        if unit_idx < 0 or unit_idx >= len(self.spike_groups):
+            return None
+        sg = self.spike_groups[unit_idx]
+        matcher = getattr(sg, "_template_matcher", None)
+        if not rebuild and matcher is not None and getattr(matcher, "templates", None):
+            return matcher
+
+        matcher = MultiChannelTemplateMatcher()
+        ch = (
+            getattr(sg, "tracking_channel", "")
+            or getattr(sg, "channel", "")
+            or (self.analog_signal.name if self.analog_signal is not None else "")
+        )
+        channels = self.get_unit_channels(unit_idx) or ([ch] if ch else [])
+        if channels and matcher.build_template(self, sg, channels=channels):
+            sg._template_matcher = matcher
+            return matcher
+        sg._template_matcher = None
+        return None
+
+    def rebuild_unit_template(self, unit_idx: int) -> bool:
+        """Force a fresh convolution template for a unit (used by UI actions)."""
+        matcher = self._ensure_template_matcher(unit_idx, rebuild=True)
+        if hasattr(self, "onUnitParamsChanged"):
+            self.onUnitParamsChanged.emit(int(unit_idx))
+        return matcher is not None
+
+    def apply_tracked_samples(
+        self,
+        unit_idx: int,
+        samples: Dict[int, int],
+        save_undo: bool = True,
+    ) -> int:
+        """Apply a batch of ``{stim_index: sample}`` detections to one unit.
+
+        This is the single write path for live batches and ad-hoc gap filling:
+        it updates ``idx_arr`` and the event list together, emits the scoped
+        unit signals once, and keeps the per-spike undo stack to one entry.
+        Returns the number of samples applied.
+        """
+        if (
+            not samples
+            or self.event_signal is None
+            or len(self.event_signal) == 0
+            or unit_idx < 0
+            or unit_idx >= len(self.spike_groups)
+        ):
+            return 0
+
+        n_sweeps = len(self.event_signal)
+        keys = sorted(
+            int(k) for k, v in samples.items() if v is not None and 0 <= int(k) < n_sweeps
+        )
+        if not keys:
+            return 0
+
+        sg = self.spike_groups[unit_idx]
+        sr = float(
+            self.sampling_rate
+            if self.sampling_rate is not None
+            else (
+                self.analog_signal.sampling_rate.rescale(pq.Hz).magnitude
+                if self.analog_signal is not None
+                else 30000.0
+            )
+        )
+
+        if save_undo:
+            old_evt = sg.event.copy() if sg.event is not None else Event()
+            old_idx = list(sg.idx_arr) if sg.idx_arr is not None else None
+
+            def undo(x=unit_idx, evt=old_evt, idx_arr=old_idx, stimno=self.stimno):
+                self.spike_groups[x].event = evt
+                self.spike_groups[x].idx_arr = idx_arr
+                self.onUnitChange.emit(stimno)
+                self.onNewSpikeEvents.emit(x)
+
+            self.save_undo(undo)
+
+        if sg.idx_arr is None:
+            sg.idx_arr = []
+        while len(sg.idx_arr) <= keys[-1]:
+            sg.idx_arr.append(None)
+        for stim in keys:
+            sg.idx_arr[stim] = (int(samples[stim]), 1)
+
+        stim_s = np.asarray(
+            self.event_signal.rescale(pq.s).magnitude
+            if hasattr(self.event_signal, "rescale")
+            else self.event_signal,
+            dtype=np.float64,
+        ).ravel()
+
+        ev = sg.event if sg.event is not None else Event()
+        ev_s = np.asarray(
+            ev.rescale(pq.s).magnitude if hasattr(ev, "rescale") else ev,
+            dtype=np.float64,
+        ).ravel()
+
+        if ev_s.size > 0:
+            ev_stim_idx = np.searchsorted(stim_s, ev_s, side="right") - 1
+            remove = np.zeros(len(stim_s), dtype=bool)
+            remove[keys] = True
+            keep = np.ones(ev_s.size, dtype=bool)
+            valid = (ev_stim_idx >= 0) & (ev_stim_idx < len(stim_s))
+            keep[valid] = ~remove[ev_stim_idx[valid]]
+            keep_times = ev_s[keep]
+        else:
+            keep_times = np.empty(0, dtype=np.float64)
+
+        new_times = stim_s[keys] + (
+            np.asarray([samples[k] for k in keys], dtype=np.float64) / sr
+        )
+        all_times = np.sort(np.concatenate([keep_times, new_times]))
+        new_event = Event(
+            all_times * pq.s,
+            name=getattr(ev, "name", f"unit_{unit_idx}"),
+            units=pq.s,
+            **getattr(ev, "annotations", {}),
+        )
+        sg.event = new_event
+        sg._tracked_count = getattr(sg, "_tracked_count", 0) + len(keys)
+
+        if self.segment is not None:
+            for i, seg_ev in enumerate(self.segment.events):
+                if getattr(seg_ev, "name", None) == getattr(new_event, "name", None):
+                    self.segment.events[i] = new_event
+                    break
+
+        if (
+            getattr(sg, "channel", "") == ""
+            and self.analog_signal is not None
+            and getattr(self.analog_signal, "name", "")
+        ):
+            sg.channel = self.analog_signal.name
+            sg.event.annotations["channel"] = self.analog_signal.name
+
+        self.onUnitChange.emit(self.stimno)
+        self.onNewSpikeEvents.emit(unit_idx)
+        self.onUnitSpikeChanged.emit(unit_idx, self.stimno)
+        return len(keys)
+
+    def track_unit_range(
+        self,
+        unit_idx: int,
+        start_stim: Optional[int] = None,
+        end_stim: Optional[int] = None,
+        only_missing: bool = True,
+        apply: bool = True,
+        save_undo: bool = True,
+        seed_stim: Optional[int] = None,
+        seed_sample: Optional[int] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[int, int]:
+        """Run ad-hoc tracking for one unit and fill missing sweep samples.
+
+        Existing spikes anchor the search; tracking advances causally from each
+        anchor until it misses too many sweeps or exhausts ``track_limit``.  The
+        next existing spike then restarts tracking, so gaps between sparse
+        annotations are filled without re-deriving present spikes.
+        """
+        if (
+            self.event_signal is None
+            or len(self.event_signal) == 0
+            or unit_idx < 0
+            or unit_idx >= len(self.spike_groups)
+        ):
+            return {}
+
+        n_sweeps = len(self.event_signal)
+        start = 0 if start_stim is None else max(0, min(int(start_stim), n_sweeps - 1))
+        end = (
+            n_sweeps - 1
+            if end_stim is None
+            else max(0, min(int(end_stim), n_sweeps - 1))
+        )
+        if end < start:
+            return {}
+
+        sg = self.spike_groups[unit_idx]
+        ch = (
+            getattr(sg, "tracking_channel", "")
+            or getattr(sg, "channel", "")
+            or (self.analog_signal.name if self.analog_signal is not None else "")
+        )
+        ch_erp = self.get_channel_erp(ch) if ch else self.get_erp()
+        if ch_erp is None:
+            ch_erp = self.get_erp()
+        if ch_erp is None or len(ch_erp) == 0:
+            return {}
+
+        sr = float(
+            self.sampling_rate
+            if self.sampling_rate is not None
+            else (
+                self.analog_signal.sampling_rate.rescale(pq.Hz).magnitude
+                if self.analog_signal is not None
+                else 30000.0
+            )
+        )
+        existing = unit_tracking.sample_map_from_sg(sg, n_sweeps)
+
+        # If filling only part of the recording, seed from the nearest earlier
+        # annotated spike so tracking can continue into the requested range.
+        if seed_stim is None and start > 0:
+            for prev in range(start - 1, -1, -1):
+                if existing.get(prev) is not None:
+                    seed_stim = prev
+                    seed_sample = existing[prev]
+                    break
+
+        algo = str(getattr(sg, "tracking_algorithm", "basic") or "basic")
+        matcher = sg._template_matcher
+        if algo == "template":
+            matcher = self._ensure_template_matcher(unit_idx)
+
+        units = getattr(ch_erp, "units", None)
+        if units is None and self.analog_signal is not None:
+            units = getattr(self.analog_signal, "units", None)
+
+        detections = unit_tracking.track_range(
+            ch_erp,
+            sr,
+            sg,
+            start_stim=start,
+            end_stim=end,
+            existing=existing,
+            only_missing=only_missing,
+            seed_stim=seed_stim,
+            seed_sample=seed_sample,
+            params=params,
+            template_matcher=matcher,
+            waveform_units=units,
+        )
+        if apply and detections:
+            self.apply_tracked_samples(unit_idx, detections, save_undo=save_undo)
+        return detections
+
+    def ensure_live_tracking_processor(self):
+        """Register the state-owned live tracking processor exactly once.
+
+        Keeping this on ``ViewerState`` means live tracking works even when no
+        TrackingView is open, and avoids the previous duplicate paths where a
+        view registration and the tracking manager could both run.
+        """
+        orch = self.live_orchestrator
+        owner = "viewerstate_live_tracking"
+        if not orch.has_registration(owner, "auto_track"):
+            orch.register(
+                owner,
+                "auto_track",
+                self._process_live_tracking_batch,
+                self._on_live_tracking_result,
+                batching=BatchingMode.BATCH,
+            )
+        return orch
+
+    def _process_live_tracking_batch(self, batch):
+        """Runs on an orchestrator worker for newly arrived sweeps."""
+        detections = []
+        if self.event_signal is None or not batch.items:
+            return detections
+
+        units = [
+            (i, sg)
+            for i, sg in enumerate(self.spike_groups)
+            if getattr(sg, "auto_track", False)
+        ]
+        if not units:
+            return detections
+
+        sr = float(
+            self.sampling_rate
+            if self.sampling_rate is not None
+            else (
+                self.analog_signal.sampling_rate.rescale(pq.Hz).magnitude
+                if self.analog_signal is not None
+                else 30000.0
+            )
+        )
+        win_s = (
+            float(self.window_size.rescale(pq.s).magnitude)
+            if hasattr(self.window_size, "rescale")
+            else float(self.window_size)
+        )
+        window_samples = max(1, int(round(win_s * sr)))
+        units_obj = getattr(self.analog_signal, "units", None)
+
+        existing_maps = {
+            ui: unit_tracking.sample_map_from_sg(sg, len(self.event_signal))
+            for ui, sg in units
+        }
+        local_samples: Dict[int, Dict[int, int]] = {ui: {} for ui, _ in units}
+        tracked_counts: Dict[int, int] = {ui: 0 for ui, _ in units}
+
+        for item in batch.items:
+            stimno = int(item.stim_index)
+            if stimno < 0 or stimno >= len(self.event_signal):
+                continue
+            for unit_idx, sg in units:
+                if local_samples[unit_idx].get(stimno) is not None:
+                    continue
+                track_limit = int(getattr(sg, "track_limit", 0))
+                if track_limit > 0 and tracked_counts[unit_idx] >= track_limit:
+                    continue
+
+                existing = existing_maps[unit_idx].get(stimno)
+                if existing is not None:
+                    local_samples[unit_idx][stimno] = int(existing)
+                    continue
+
+                max_skip = int(getattr(sg, "tracking_max_skips", 1))
+                prev_sample = unit_tracking.nearest_previous_sample(
+                    stimno, local_samples[unit_idx], max_skip
+                )
+                if prev_sample is None:
+                    prev_sample = unit_tracking.nearest_previous_sample(
+                        stimno, existing_maps[unit_idx], max_skip
+                    )
+                if prev_sample is None:
+                    continue
+
+                ch = (
+                    getattr(sg, "tracking_channel", "")
+                    or getattr(sg, "channel", "")
+                    or (self.analog_signal.name if self.analog_signal is not None else "")
+                )
+                row = item.erp_row(ch, window_samples) if ch else None
+                if row is None:
+                    channels = list(item.channel_sweeps.keys())
+                    if channels:
+                        row = item.erp_row(channels[0], window_samples)
+                if row is None or row.size == 0:
+                    continue
+
+                algo, params = unit_tracking.tracking_params(
+                    sg, waveform_units=units_obj
+                )
+                matcher = getattr(sg, "_template_matcher", None)
+                getter = None
+                if algo == "template" and matcher is not None:
+                    getter = lambda c, it=item: it.erp_row(c, window_samples)
+
+                hit = unit_tracking.detect_sample(
+                    sg,
+                    row,
+                    sr,
+                    prev_sample,
+                    params=params,
+                    algorithm=algo,
+                    template_matcher=matcher,
+                    multi_channel_getter=getter,
+                )
+                if hit is not None:
+                    detections.append((unit_idx, int(hit), stimno))
+                    local_samples[unit_idx][stimno] = int(hit)
+                    tracked_counts[unit_idx] += 1
+
+        return detections
+
+    def _on_live_tracking_result(self, detections, error):
+        """Apply orchestrator detections on the GUI thread."""
+        if error or not detections:
+            return
+        by_unit: Dict[int, Dict[int, int]] = {}
+        for unit_idx, sample, stimno in detections:
+            by_unit.setdefault(int(unit_idx), {})[int(stimno)] = int(sample)
+        for unit_idx, samples in by_unit.items():
+            self.apply_tracked_samples(unit_idx, samples, save_undo=False)
+
     @Slot(Event)
     def updateUnit(self, event, merge=False, unitid=None):
         if unitid is None:
@@ -1377,30 +1842,139 @@ class ViewerState(QObject):
         self.onStimNoChange.emit(self.stimno)
 
     @Slot(str, str)
-    def loadFile(self, fname, type="h5", **kwargs):
-        try:
-            data, analog_signal, event_signal, spike_groups = load_file(fname, type)
-        except:
-            import traceback
+    def loadFile(self, fname, type="h5", blocking=True, aptrack_config=None, **kwargs):
+        """Load a recording file.
 
-            traceback.print_exc()
-            if (
-                QApplication.instance()
-                and QApplication.instance().platformName() != "offscreen"
-            ):
-                qmb = QMessageBox(
-                    QMessageBox.Critical,
-                    "Sorry :(",
-                    f'Unable to load "{fname}" using {type}',
-                )
-                qmb.setModal(True)
-                qmb.exec()
-
+        With the default ``blocking=True`` the file is read synchronously (used
+        by tests and headless scripts). The GUI passes ``blocking=False`` so the
+        file is read on a background thread while a cancelable progress dialog
+        keeps the UI responsive; the data is applied on the GUI thread when the
+        read completes.
+        """
+        if not fname:
             return
+        if type is None:
+            type = "h5"
+
+        app = QApplication.instance()
+        if type == "APTrack" and aptrack_config is None and app is not None:
+            dialog = APTrackDialog()
+            accepted = dialog.exec_() if hasattr(dialog, "exec_") else dialog.exec()
+            if not accepted:
+                return
+            aptrack_config = dialog.get_config()
+
+        if blocking or app is None:
+            try:
+                result = load_file(fname, type, aptrack_config=aptrack_config)
+            except Exception:
+                import traceback
+
+                traceback.print_exc()
+                self._show_load_error(fname, type)
+                return
+            self._apply_loaded_file(fname, type, *result)
+            return
+
+        self._start_async_load(fname, type, aptrack_config)
+
+    def _apply_loaded_file(
+        self, fname, type, data, analog_signal, event_signal, spike_groups
+    ):
         self.title = fname
         self.segment = data
         self.cur_spike_group = 0
+        self.event_signal = event_signal
+        self.analog_signal = analog_signal
+        self.restore_candidate_store(
+            data.annotations.get("spikespy_candidates"), event_signal=event_signal
+        )
         self.set_data(analog_signal, event_signal, spike_groups=spike_groups)
+        self.onFileLoaded.emit(fname, type)
+
+    def _show_load_error(self, fname, type):
+        app = QApplication.instance()
+        if app and app.platformName() != "offscreen":
+            qmb = QMessageBox(
+                QMessageBox.Critical,
+                "Sorry :(",
+                f'Unable to load "{fname}" using {type}',
+            )
+            qmb.setModal(True)
+            qmb.exec()
+
+    def _start_async_load(self, fname, type, aptrack_config=None):
+        app = QApplication.instance()
+        worker = getattr(self, "_file_load_worker", None)
+        if worker is not None and worker.isRunning():
+            QMessageBox.warning(
+                app.activeWindow() if app else None,
+                "Still loading",
+                "A file is already being loaded.\nPlease wait for it to finish.",
+            )
+            return
+
+        self._file_load_cancelled = False
+        self._file_load_progress = self._make_load_progress(fname)
+        worker = FileLoadWorker(fname, type, aptrack_config=aptrack_config, parent=self)
+        self._file_load_worker = worker
+        worker.stage.connect(self._on_load_stage)
+        worker.loaded.connect(self._on_async_file_loaded)
+        worker.failed.connect(self._on_async_file_failed)
+        worker.start()
+
+    def _make_load_progress(self, fname):
+        app = QApplication.instance()
+        if app is None or app.platformName() == "offscreen":
+            return None
+        dlg = QProgressDialog(
+            f"Loading {Path(fname).name}...", "Cancel", 0, 0, app.activeWindow()
+        )
+        dlg.setWindowTitle("Loading")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.canceled.connect(self._on_load_cancelled)
+        dlg.show()
+        return dlg
+
+    def _on_load_stage(self, msg):
+        dlg = getattr(self, "_file_load_progress", None)
+        if dlg is not None:
+            dlg.setLabelText(msg)
+
+    def _on_load_cancelled(self):
+        self._file_load_cancelled = True
+
+    def _finish_load_ui(self):
+        dlg = getattr(self, "_file_load_progress", None)
+        self._file_load_progress = None
+        if dlg is not None:
+            # QProgressDialog.reset()/close() emit canceled(); disconnect first
+            # so closing the dialog programmatically is not read as a cancel.
+            try:
+                dlg.canceled.disconnect(self._on_load_cancelled)
+            except (RuntimeError, TypeError):
+                pass
+            dlg.reset()
+            dlg.close()
+            dlg.deleteLater()
+        self._file_load_worker = None
+
+    def _on_async_file_loaded(
+        self, fname, type, data, analog_signal, event_signal, spike_groups
+    ):
+        self._finish_load_ui()
+        if getattr(self, "_file_load_cancelled", False):
+            return
+        self._apply_loaded_file(fname, type, data, analog_signal, event_signal, spike_groups)
+
+    def _on_async_file_failed(self, fname, type, error):
+        self._finish_load_ui()
+        if getattr(self, "_file_load_cancelled", False):
+            return
+        self._show_load_error(fname, type)
 
     def removeUnitGroup(self, unit):
         spike_groups = self.spike_groups
@@ -1432,6 +2006,1131 @@ class ViewerState(QObject):
         self.update_idx_arrs()
         self.onUnitGroupChange.emit()
         self.onUnitListChanged.emit()
+
+    def mergeUnitGroups(self, keep_idx: int, remove_idx: int, save_undo: bool = True):
+        """Merge unit ``remove_idx`` into unit ``keep_idx``.
+
+        Combines both units' spike times into a single sorted event kept by
+        ``keep_idx`` (its name, channel and annotations win; conflicting
+        empty metadata is filled from ``remove_idx``), removes ``remove_idx``
+        from the unit list, and supports undo.  Returns the new index of the
+        merged unit or -1 on failure.
+        """
+        n = len(self.spike_groups)
+        if not (0 <= keep_idx < n) or not (0 <= remove_idx < n) or keep_idx == remove_idx:
+            return -1
+        keep_sg = self.spike_groups[keep_idx]
+        rm_sg = self.spike_groups[remove_idx]
+
+        def _times(ev):
+            if ev is None or len(ev) == 0:
+                return np.empty(0, dtype=np.float64)
+            return np.asarray(ev.rescale(pq.s).magnitude, dtype=np.float64).ravel()
+
+        keep_ev = keep_sg.event
+        merged = np.unique(np.concatenate([_times(keep_ev), _times(rm_sg.event)]))
+
+        anns = dict(getattr(keep_ev, "annotations", {}) or {})
+        anns.pop("name", None)
+        rm_anns = dict(getattr(rm_sg.event, "annotations", {}) or {})
+        # Fill blanks from the removed unit so its metadata is not lost.
+        keep_notes = str(anns.get("notes", "") or getattr(keep_sg, "notes", "") or "")
+        rm_notes = str(rm_anns.get("notes", "") or getattr(rm_sg, "notes", "") or "")
+        if keep_notes and rm_notes and rm_notes != keep_notes:
+            anns["notes"] = f"{keep_notes}; {rm_notes}"
+        elif rm_notes:
+            anns["notes"] = rm_notes
+        keep_ft = str(anns.get("fibre_type", "") or getattr(keep_sg, "fibre_type", "") or "")
+        rm_ft = str(rm_anns.get("fibre_type", "") or getattr(rm_sg, "fibre_type", "") or "")
+        if not keep_ft and rm_ft:
+            anns["fibre_type"] = rm_ft
+        new_event = Event(
+            merged * pq.s,
+            name=getattr(keep_ev, "name", f"unit_{keep_idx}"),
+            units=pq.s,
+            **anns,
+        )
+
+        old_groups = list(self.spike_groups)
+        old_keep_ev = keep_ev
+        old_keep_idx_arr = list(keep_sg.idx_arr) if keep_sg.idx_arr is not None else None
+        old_rm_ev = rm_sg.event
+        old_rm_idx_arr = list(rm_sg.idx_arr) if rm_sg.idx_arr is not None else None
+        old_cur = int(self.cur_spike_group)
+
+        keep_sg.event = new_event
+        keep_sg._template_matcher = None
+        keep_sg._tracked_count = (
+            getattr(keep_sg, "_tracked_count", 0) + getattr(rm_sg, "_tracked_count", 0)
+        )
+        self.spike_groups = [sg for i, sg in enumerate(old_groups) if i != remove_idx]
+        new_keep_idx = keep_idx - 1 if remove_idx < keep_idx else keep_idx
+
+        if self.segment is not None:
+            for i, seg_ev in enumerate(self.segment.events):
+                if getattr(seg_ev, "name", None) == getattr(new_event, "name", None):
+                    self.segment.events[i] = new_event
+                    break
+            self.segment.events = [
+                ev for ev in self.segment.events if ev is not old_rm_ev
+            ]
+
+        def undo(
+            self=self,
+            groups=old_groups,
+            keep_sg=keep_sg,
+            keep_ev=old_keep_ev,
+            keep_idx_arr=old_keep_idx_arr,
+            rm_sg=rm_sg,
+            rm_ev=old_rm_ev,
+            rm_idx_arr=old_rm_idx_arr,
+            old_cur=old_cur,
+        ):
+            self.spike_groups = groups
+            keep_sg.event = keep_ev
+            keep_sg.idx_arr = keep_idx_arr
+            rm_sg.event = rm_ev
+            rm_sg.idx_arr = rm_idx_arr
+            self.cur_spike_group = old_cur
+            self.update_idx_arrs()
+            self.onUnitChange.emit(self.stimno)
+            self.onUnitGroupChange.emit()
+            self.onUnitListChanged.emit()
+
+        if save_undo:
+            self.save_undo(undo)
+
+        self.update_idx_arrs()
+        self.cur_spike_group = max(0, min(new_keep_idx, len(self.spike_groups) - 1))
+        self.onUnitChange.emit(self.stimno)
+        self.onNewSpikeEvents.emit(new_keep_idx)
+        self.onUnitSpikeChanged.emit(new_keep_idx, self.stimno)
+        self.onUnitGroupChange.emit()
+        self.onUnitListChanged.emit()
+        self.setUnitGroup(new_keep_idx)
+        return new_keep_idx
+
+    # ------------------------------------------------------------------
+    # Candidate-unit search and review
+    # ------------------------------------------------------------------
+
+    def _candidate_sampling_rate(self) -> float:
+        sr = self.sampling_rate
+        if sr is None and self.analog_signal is not None:
+            sr = self.analog_signal.sampling_rate
+        if sr is None and self.segment is not None:
+            for sig in getattr(self.segment, "analogsignals", []) or []:
+                sr = getattr(sig, "sampling_rate", None)
+                if sr is not None:
+                    break
+        if hasattr(sr, "rescale"):
+            return float(sr.rescale(pq.Hz).magnitude)
+        return float(sr or 30000.0)
+
+    def _candidate_active_channel(self) -> str:
+        primary = getattr(self.analog_signal, "name", "") or ""
+        if primary:
+            return primary
+        names = list(getattr(self, "active_channel_names", None) or [])
+        return names[0] if names else ""
+
+    def _candidate_scan_channels(self) -> List[str]:
+        names = [str(c) for c in (getattr(self, "active_channel_names", None) or []) if c]
+        primary = getattr(self.analog_signal, "name", "") or ""
+        if primary and primary not in names:
+            names.insert(0, primary)
+        if not names and primary:
+            names = [primary]
+        return names
+
+    def _candidate_merge_tolerance_samples(self) -> int:
+        sr = self._candidate_sampling_rate()
+        return max(
+            1,
+            int(
+                round(
+                    float(self.candidate_config.merge_tolerance_ms) * sr / 1000.0
+                )
+            ),
+        )
+
+    def _candidate_now(self) -> float:
+        return float(time.monotonic())
+
+    def _touch_candidate_review(self) -> None:
+        self._candidate_last_interaction = self._candidate_now()
+
+    def get_active_candidate(self) -> Optional[CandidateUnit]:
+        if self.active_candidate_id is None:
+            return None
+        return self.candidate_units.get(self.active_candidate_id)
+
+    def get_visible_candidates(self) -> List[CandidateUnit]:
+        pending = [c for c in self.candidate_units.values() if c.status == "pending"]
+        pending.sort(key=lambda c: (-float(c.score), int(c.candidate_id)))
+        return pending[: int(self.candidate_config.max_candidates)]
+
+    def _pending_candidate_count(self) -> int:
+        return sum(1 for c in self.candidate_units.values() if c.status == "pending")
+
+    def set_active_candidate(self, candidate_id: Optional[int]) -> None:
+        if candidate_id is not None and candidate_id not in self.candidate_units:
+            candidate_id = None
+        if self.active_candidate_id == candidate_id:
+            return
+        self.active_candidate_id = candidate_id
+        self._touch_candidate_review()
+        self.onCandidateSelectionChanged.emit(
+            -1 if candidate_id is None else int(candidate_id)
+        )
+
+    def clear_candidates(self, emit: bool = True) -> None:
+        self.candidate_units = {}
+        self.active_candidate_id = None
+        self._candidate_id_counter = 0
+        self._candidate_scan_truncated = False
+        self._candidate_last_scan_stim = -1
+        self._candidate_last_interaction = 0.0
+        self._candidate_rescan_discarded = False
+        if self._candidate_scan_manager is not None:
+            self._candidate_scan_manager.shutdown()
+        if emit:
+            self.onCandidatesChanged.emit()
+            self.onCandidateSelectionChanged.emit(-1)
+
+    def _next_candidate_id(self) -> int:
+        self._candidate_id_counter += 1
+        while self._candidate_id_counter in self.candidate_units:
+            self._candidate_id_counter += 1
+        return self._candidate_id_counter
+
+    def _next_candidate_name(self) -> str:
+        used = {c.name for c in self.candidate_units.values()}
+        used.update(getattr(sg.event, "name", "") for sg in self.spike_groups)
+        index = len(used)
+        while f"candidate_{index}" in used:
+            index += 1
+        return f"candidate_{index}"
+
+    def _next_unit_name(self) -> str:
+        used = {getattr(sg.event, "name", "") for sg in self.spike_groups}
+        used.update(c.name for c in self.candidate_units.values())
+        index = len(self.spike_groups)
+        while f"unit_{index}" in used:
+            index += 1
+        return f"unit_{index}"
+
+    def _candidate_timestamp_s(self, stim: int, sample: int) -> float:
+        sr = self._candidate_sampling_rate()
+        base = None
+        if (
+            self.event_signal is not None
+            and 0 <= int(stim) < len(self.event_signal)
+        ):
+            base = self.event_signal[int(stim)]
+        if base is None:
+            return float(sample) / sr
+        try:
+            return float((base + (float(sample) / sr) * pq.s).rescale(pq.s).magnitude)
+        except Exception:
+            return float(sample) / sr
+
+    def _candidate_event(
+        self,
+        name: str,
+        detections: Dict[int, int],
+        channel: str,
+        neighbors: List[str],
+        candidate_id: Optional[int] = None,
+    ) -> Event:
+        times = [
+            self._candidate_timestamp_s(stim, sample)
+            for stim, sample in sorted(detections.items())
+        ]
+        evt = Event(np.asarray(times, dtype=np.float64) * pq.s, name=name, units=pq.s)
+        evt.annotations["type"] = "candidate"
+        if candidate_id is not None:
+            evt.annotations["candidate_id"] = int(candidate_id)
+        if channel:
+            evt.annotations["channel"] = channel
+        if neighbors:
+            evt.annotations["neighbor_channels"] = list(neighbors)
+        return evt
+
+    def _candidate_unit_payload(
+        self,
+        name: str,
+        detections: Dict[int, int],
+        channel: str,
+        neighbors: List[str],
+        candidate_id: Optional[int] = None,
+        algorithm: str = "zscore",
+        detector_params: Optional[Dict[str, Any]] = None,
+        notes: str = "",
+    ) -> tracked_neuron_unit:
+        evt = self._candidate_event(
+            name, detections, channel, neighbors, candidate_id=candidate_id
+        )
+        n_sweeps = (
+            len(self.event_signal) if self.event_signal is not None else 0
+        )
+        idx_arr: List[Any] = [None for _ in range(n_sweeps)]
+        for stim, sample in sorted(detections.items()):
+            if 0 <= int(stim) < n_sweeps:
+                idx_arr[int(stim)] = (int(sample), 1)
+        return tracked_neuron_unit(
+            event=evt,
+            channel=channel,
+            neighbor_channels=list(neighbors),
+            notes=notes,
+            idx_arr=idx_arr,
+            tracking_algorithm=algorithm,
+            tracking_params=dict(detector_params or {}),
+        )
+
+    def _candidate_threshold_mv(self, candidate: CandidateUnit) -> float:
+        raw = float(
+            candidate.threshold_signal
+            or candidate.detector_params.get("threshold", 0.0)
+            or 0.0
+        )
+        if raw <= 0:
+            return 0.01
+        units = candidate.signal_units or str(
+            getattr(self.analog_signal, "units", pq.mV)
+        )
+        try:
+            return float((pq.Quantity(raw, units)).rescale(pq.mV).magnitude)
+        except Exception:
+            lowered = str(units or "").lower()
+            if "uv" in lowered or "µv" in lowered:
+                return raw / 1000.0
+            return raw
+
+    def _candidate_tracking_params(self, candidate: CandidateUnit) -> Dict[str, Any]:
+        params = {
+            k: v
+            for k, v in dict(candidate.detector_params or {}).items()
+            if k
+            not in (
+                "window_ms",
+                "max_skip",
+                "track_limit",
+                "threshold",
+            )
+        }
+        if candidate.algorithm == "zscore":
+            params.setdefault("polarity", "both")
+            params.setdefault("z_thresh", float(self.candidate_config.min_peak_snr))
+            params.setdefault("use_mad", True)
+        return params
+
+    def _candidate_tracking_window_ms(self, candidate: CandidateUnit) -> float:
+        jitter = float(getattr(candidate.evidence, "jitter_ms", 0.0) or 0.0)
+        return float(min(10.0, max(2.0, 4.0 * jitter + 0.5)))
+
+    def _candidate_from_proposal(
+        self, proposal: CandidateProposal, status: str = "pending"
+    ) -> CandidateUnit:
+        candidate_id = self._next_candidate_id()
+        name = self._next_candidate_name()
+        unit = self._candidate_unit_payload(
+            name,
+            dict(proposal.samples_by_sweep),
+            proposal.channel,
+            list(proposal.neighbor_channels),
+            candidate_id=candidate_id,
+            algorithm=proposal.algorithm,
+            detector_params=proposal.detector_params,
+        )
+        candidate = CandidateUnit(
+            candidate_id=candidate_id,
+            unit=unit,
+            algorithm=proposal.algorithm,
+            detector_params=dict(proposal.detector_params or {}),
+            template_refined=bool(proposal.template_refined),
+            name=name,
+            channel=proposal.channel,
+            neighbor_channels=list(proposal.neighbor_channels),
+            score=float(proposal.score),
+            evidence=proposal.evidence,
+            latency_center_samples=float(proposal.latency_center_samples),
+            latency_tolerance_samples=float(proposal.latency_tolerance_samples),
+            status=status,
+            first_seen_stim=int(proposal.first_seen_stim),
+            last_seen_stim=int(proposal.last_seen_stim),
+            threshold_signal=float(proposal.threshold_signal),
+            signal_units=str(proposal.signal_units),
+        )
+        candidate.tracking_window_ms = self._candidate_tracking_window_ms(candidate)
+        candidate.tracking_threshold_mv = self._candidate_threshold_mv(candidate)
+        self.candidate_units[candidate_id] = candidate
+        return candidate
+
+    def _match_candidate(self, proposal: CandidateProposal) -> Optional[CandidateUnit]:
+        best: Optional[CandidateUnit] = None
+        best_distance = float("inf")
+        for candidate in self.candidate_units.values():
+            if candidate.channel != proposal.channel:
+                continue
+            tolerance = max(
+                float(candidate.latency_tolerance_samples),
+                float(proposal.latency_tolerance_samples),
+                float(self._candidate_merge_tolerance_samples()),
+            )
+            distance = abs(
+                float(candidate.latency_center_samples)
+                - float(proposal.latency_center_samples)
+            )
+            if distance <= tolerance and distance < best_distance:
+                best = candidate
+                best_distance = distance
+        return best
+
+    def _update_candidate_from_proposal(
+        self,
+        candidate: CandidateUnit,
+        proposal: CandidateProposal,
+        scan_start: int,
+        scan_end: int,
+    ) -> None:
+        old_detections: Dict[int, int] = {}
+        idx_arr = candidate.unit.idx_arr or []
+        for stim, item in enumerate(idx_arr):
+            if item is None:
+                continue
+            sample = item[0] if isinstance(item, (tuple, list)) else item
+            try:
+                old_detections[int(stim)] = int(sample)
+            except (TypeError, ValueError):
+                continue
+        merged = {
+            stim: sample
+            for stim, sample in old_detections.items()
+            if not (int(scan_start) <= stim <= int(scan_end))
+        }
+        merged.update(
+            {int(s): int(v) for s, v in proposal.samples_by_sweep.items()}
+        )
+        if merged:
+            center = float(np.median(np.asarray(list(merged.values()), dtype=float)))
+            latencies_ms = np.asarray(list(merged.values()), dtype=float) / (
+                self._candidate_sampling_rate()
+            ) * 1000.0
+            jitter = (
+                1.4826 * float(np.median(np.abs(latencies_ms - np.median(latencies_ms))))
+                if latencies_ms.size >= 2
+                else 0.0
+            )
+        else:
+            center = float(proposal.latency_center_samples)
+            jitter = float(getattr(proposal.evidence, "jitter_ms", 0.0) or 0.0)
+
+        candidate.unit = self._candidate_unit_payload(
+            candidate.name,
+            merged,
+            proposal.channel,
+            list(proposal.neighbor_channels),
+            candidate_id=candidate.candidate_id,
+            algorithm=proposal.algorithm,
+            detector_params=proposal.detector_params,
+            notes=candidate.notes,
+        )
+        candidate.channel = proposal.channel
+        candidate.neighbor_channels = list(proposal.neighbor_channels)
+        candidate.algorithm = proposal.algorithm
+        candidate.detector_params = dict(proposal.detector_params or {})
+        candidate.template_refined = bool(proposal.template_refined)
+        candidate.score = float(proposal.score)
+        candidate.evidence = proposal.evidence
+        candidate.evidence.hit_count = len(merged)
+        candidate.evidence.jitter_ms = jitter
+        candidate.latency_center_samples = center
+        candidate.latency_tolerance_samples = float(
+            proposal.latency_tolerance_samples
+        )
+        candidate.first_seen_stim = min(
+            [int(stim) for stim in merged] + [int(candidate.first_seen_stim)]
+        )
+        candidate.last_seen_stim = max(
+            [int(stim) for stim in merged] + [int(candidate.last_seen_stim)]
+        )
+        candidate.threshold_signal = float(proposal.threshold_signal)
+        candidate.signal_units = str(proposal.signal_units)
+        candidate.tracking_window_ms = self._candidate_tracking_window_ms(candidate)
+        candidate.tracking_threshold_mv = self._candidate_threshold_mv(candidate)
+
+        if not merged:
+            candidate.status = "dormant"
+            return
+
+        if candidate.status == "pending":
+            if int(proposal.evidence.recent_hit_count) < 1:
+                candidate.status = "dormant"
+        elif candidate.status == "dormant":
+            if (
+                float(proposal.score)
+                >= float(candidate.score_at_discard or 0.0)
+                or int(proposal.evidence.recent_hit_count) >= 1
+            ):
+                candidate.status = "pending"
+        elif candidate.status == "discarded":
+            channel_changed = bool(candidate.channel_at_discard) and (
+                candidate.channel_at_discard != self._candidate_active_channel()
+            )
+            strong_enough = float(proposal.score) > float(
+                candidate.score_at_discard or 0.0
+            ) + float(self.candidate_config.reactivation_score_margin)
+            if self._candidate_rescan_discarded and strong_enough:
+                candidate.status = "pending"
+                candidate.score_at_discard = None
+                candidate.channel_at_discard = None
+            elif channel_changed and strong_enough:
+                candidate.status = "pending"
+                candidate.score_at_discard = None
+                candidate.channel_at_discard = None
+
+    def _dormant_stale_candidates(self, scan_end: int, matched_ids: set) -> None:
+        recency = int(self.candidate_config.recency_window_sweeps)
+        cutoff = int(scan_end) - recency
+        for candidate in self.candidate_units.values():
+            if candidate.candidate_id in matched_ids:
+                continue
+            if candidate.status == "pending" and int(candidate.last_seen_stim) < cutoff:
+                candidate.status = "dormant"
+                if self.active_candidate_id == candidate.candidate_id:
+                    self.active_candidate_id = None
+                    self.onCandidateSelectionChanged.emit(-1)
+
+    def _apply_candidate_scan_result(
+        self,
+        generation: int,
+        proposals: Any,
+        scan_start: int,
+        scan_end: int,
+        error: str = "",
+    ) -> None:
+        if error:
+            logger.warning("Candidate scan failed: %s", error)
+            return
+        if int(generation) != int(self._candidate_scan_generation):
+            return
+        matched_ids: set = set()
+        for proposal in proposals or []:
+            candidate = self._match_candidate(proposal)
+            if candidate is None:
+                if self._pending_candidate_count() >= int(
+                    self.candidate_config.max_candidates
+                ):
+                    pending = [
+                        c
+                        for c in self.candidate_units.values()
+                        if c.status == "pending"
+                        and c.candidate_id != self.active_candidate_id
+                    ]
+                    if pending:
+                        lowest = min(pending, key=lambda c: float(c.score))
+                        if float(proposal.score) > float(lowest.score):
+                            lowest.status = "dormant"
+                            candidate = self._candidate_from_proposal(proposal)
+                        else:
+                            candidate = self._candidate_from_proposal(
+                                proposal, status="dormant"
+                            )
+                    else:
+                        candidate = self._candidate_from_proposal(
+                            proposal, status="dormant"
+                        )
+                else:
+                    recent = int(getattr(proposal.evidence, "recent_hit_count", 0))
+                    candidate = self._candidate_from_proposal(
+                        proposal, status="pending" if recent >= 1 else "dormant"
+                    )
+            else:
+                self._update_candidate_from_proposal(
+                    candidate, proposal, scan_start, scan_end
+                )
+            matched_ids.add(candidate.candidate_id)
+        self._dormant_stale_candidates(scan_end, matched_ids)
+        self._candidate_last_scan_stim = int(scan_end)
+        if self._candidate_rescan_discarded:
+            self._candidate_rescan_discarded = False
+        self.onCandidatesChanged.emit()
+
+    def _build_candidate_scan_snapshot(self, scope: str = "auto") -> Optional[Dict[str, Any]]:
+        n_sweeps = len(self.event_signal) if self.event_signal is not None else 0
+        if n_sweeps <= 0:
+            return None
+        cfg = self.candidate_config
+        live = str(scope) in ("auto", "live", "recent")
+        if live:
+            requested_start = max(0, n_sweeps - int(cfg.live_scan_window_sweeps))
+            requested_end = n_sweeps - 1
+            self._candidate_scan_truncated = False
+        else:
+            requested_start = 0
+            requested_end = n_sweeps - 1
+            if n_sweeps > int(cfg.max_scan_sweeps):
+                requested_end = int(cfg.max_scan_sweeps) - 1
+                self._candidate_scan_truncated = True
+            else:
+                self._candidate_scan_truncated = False
+
+        channels = self._candidate_scan_channels()
+        arrays: Dict[str, np.ndarray] = {}
+        offsets: Dict[str, int] = {}
+        for channel in channels:
+            erp = self.get_channel_erp(channel)
+            if erp is None:
+                continue
+            arr = getattr(erp, "magnitude", erp)
+            arr = np.asarray(arr, dtype=np.float32)
+            if arr.ndim == 1:
+                arr = arr.reshape(1, -1)
+            if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] == 0:
+                continue
+            arrays[channel] = arr
+            offsets[channel] = max(0, n_sweeps - int(arr.shape[0]))
+        if not arrays:
+            return None
+
+        start = max(requested_start, max(offsets.values()))
+        end = min(requested_end, n_sweeps - 1)
+        if end < start:
+            return None
+
+        erp_by_channel: Dict[str, np.ndarray] = {}
+        for channel, arr in arrays.items():
+            local_start = start - offsets[channel]
+            local_end = min(arr.shape[0], end - offsets[channel] + 1)
+            if local_start < 0:
+                local_start = 0
+            if local_end > local_start:
+                erp_by_channel[channel] = arr[local_start:local_end]
+
+        if not erp_by_channel:
+            return None
+
+        existing_units: Dict[str, List[Dict[int, int]]] = {}
+        for sg in self.spike_groups:
+            channel = (
+                getattr(sg, "channel", "")
+                or getattr(sg, "tracking_channel", "")
+                or self._candidate_active_channel()
+            )
+            samples: Dict[int, int] = {}
+            for stim, item in enumerate(getattr(sg, "idx_arr", None) or []):
+                if item is None or stim >= n_sweeps:
+                    continue
+                sample = item[0] if isinstance(item, (tuple, list)) else item
+                try:
+                    samples[int(stim)] = int(sample)
+                except (TypeError, ValueError):
+                    continue
+            if samples:
+                existing_units.setdefault(channel, []).append(samples)
+
+        candidate_memory = [
+            {
+                "id": int(c.candidate_id),
+                "channel": c.channel,
+                "center": float(c.latency_center_samples),
+                "tolerance": float(c.latency_tolerance_samples),
+                "status": c.status,
+                "score": float(c.score),
+            }
+            for c in self.candidate_units.values()
+        ]
+
+        units = (
+            getattr(self.analog_signal, "units", None)
+            if self.analog_signal is not None
+            else None
+        )
+        return {
+            "erp_by_channel": erp_by_channel,
+            "sampling_rate_hz": self._candidate_sampling_rate(),
+            "scan_start_stim": int(start),
+            "scan_end_stim": int(end),
+            "existing_units": existing_units,
+            "candidate_memory": candidate_memory,
+            "config": replace(self.candidate_config),
+            "waveform_units": units,
+            "truncated": bool(self._candidate_scan_truncated),
+        }
+
+    def _ensure_candidate_scan_manager(self):
+        manager = self._candidate_scan_manager
+        if manager is not None:
+            return manager
+        from .candidate_worker import CandidateScanManager
+
+        manager = CandidateScanManager(
+            on_result=self._apply_candidate_scan_result,
+            tick_cb=lambda: self.request_candidate_scan(
+                synchronous=False, scope="live"
+            ),
+            parent=self,
+        )
+        manager.scanStateChanged.connect(self.onCandidateScanStateChanged.emit)
+        self._candidate_scan_manager = manager
+        return manager
+
+    def _candidate_scan_gate(self, scope: str) -> bool:
+        if self._candidate_scan_manager is not None and self._candidate_scan_manager.busy:
+            return False
+        if str(scope) not in ("live", "auto", "recent"):
+            return True
+        if self.event_signal is None or len(self.event_signal) == 0:
+            return False
+        latest = len(self.event_signal) - 1
+        if latest <= self._candidate_last_scan_stim:
+            return False
+        quiet_ms = float(self.candidate_config.review_quiet_ms)
+        if (self._candidate_now() - self._candidate_last_interaction) * 1000.0 < quiet_ms:
+            return False
+        if self._pending_candidate_count() >= int(
+            self.candidate_config.max_candidates
+        ):
+            return False
+        return True
+
+    def request_candidate_scan(self, synchronous: bool = False, scope: str = "auto") -> bool:
+        """Run a candidate scan.  ``scope`` is 'live', 'offline', or 'auto'."""
+        scope = str(scope or "auto")
+        if scope == "auto":
+            scope = "live" if self.is_streaming else "offline"
+        if scope in ("live", "recent") and not self.is_streaming:
+            scope = "live"
+        if not synchronous and not self._candidate_scan_gate(scope):
+            return False
+        snapshot = self._build_candidate_scan_snapshot(scope)
+        if snapshot is None:
+            return False
+        manager = self._ensure_candidate_scan_manager()
+        # Set the expected generation before the synchronous path runs so its
+        # inline result is not rejected as stale.
+        self._candidate_scan_generation = int(manager.generation) + 1
+        generation = manager.request(snapshot, scope=scope, synchronous=synchronous)
+        if generation is None:
+            return False
+        self._candidate_scan_generation = int(generation)
+        self._candidate_last_scan_stim = int(snapshot["scan_end_stim"])
+        return True
+
+    def set_auto_scan_live(self, enabled: bool) -> None:
+        self.auto_scan_live = bool(enabled)
+        self._update_candidate_auto_scan()
+
+    def _update_candidate_auto_scan(self, *args) -> None:
+        manager = self._candidate_scan_manager
+        if manager is None:
+            if not self.auto_scan_live:
+                return
+            manager = self._ensure_candidate_scan_manager()
+        if self.auto_scan_live and self.is_streaming:
+            manager.start_auto(self.candidate_config.scan_interval_ms)
+        else:
+            manager.stop_auto()
+
+    def accept_candidate(self, candidate_id: int) -> int:
+        candidate = self.candidate_units.get(int(candidate_id))
+        if candidate is None or candidate.status == "discarded":
+            return -1
+        detections: Dict[int, int] = {}
+        for stim, item in enumerate(candidate.unit.idx_arr or []):
+            if item is None:
+                continue
+            sample = item[0] if isinstance(item, (tuple, list)) else item
+            try:
+                detections[int(stim)] = int(sample)
+            except (TypeError, ValueError):
+                continue
+        if not detections:
+            return -1
+
+        name = candidate.name if candidate.name_edited else self._next_unit_name()
+        used = {getattr(sg.event, "name", "") for sg in self.spike_groups}
+        used.update(
+            c.name
+            for c in self.candidate_units.values()
+            if c.candidate_id != candidate.candidate_id
+        )
+        if name in used:
+            base = name
+            suffix = 1
+            while name in used:
+                name = f"{base}_{suffix}"
+                suffix += 1
+        unit = self._candidate_unit_payload(
+            name,
+            detections,
+            candidate.channel,
+            list(candidate.neighbor_channels),
+            candidate_id=None,
+            algorithm=candidate.algorithm,
+            detector_params=self._candidate_tracking_params(candidate),
+        )
+        evt = unit.event
+        evt.annotations["type"] = "unit"
+        evt.annotations["fibre_type"] = ""
+        evt.annotations["notes"] = candidate.notes if candidate.notes_edited else ""
+        evt.annotations["auto_track"] = True
+        evt.annotations["tracking_window_ms"] = float(candidate.tracking_window_ms)
+        evt.annotations["tracking_threshold_mv"] = float(
+            candidate.tracking_threshold_mv
+        )
+        evt.annotations["tracking_max_skips"] = 3
+        evt.annotations["tracking_algorithm"] = candidate.algorithm
+        evt.annotations["tracking_params"] = self._candidate_tracking_params(candidate)
+        evt.annotations["candidate_source"] = "search"
+        evt.annotations["candidate_score"] = float(candidate.score)
+        evt.annotations["candidate_first_seen_stim"] = int(candidate.first_seen_stim)
+
+        tracked = tracked_neuron_unit(
+            event=evt,
+            channel=candidate.channel,
+            neighbor_channels=list(candidate.neighbor_channels),
+            notes=str(evt.annotations.get("notes", "")),
+            idx_arr=[None for _ in range((len(self.event_signal) if self.event_signal is not None else 0))],
+            auto_track=True,
+            tracking_window_ms=float(candidate.tracking_window_ms),
+            tracking_threshold_mv=float(candidate.tracking_threshold_mv),
+            tracking_max_skips=3,
+            tracking_algorithm=str(candidate.algorithm),
+            tracking_params=self._candidate_tracking_params(candidate),
+        )
+        exact_idx: List[Any] = [None for _ in range((len(self.event_signal) if self.event_signal is not None else 0))]
+        for stim, sample in detections.items():
+            if 0 <= int(stim) < len(exact_idx):
+                exact_idx[int(stim)] = (int(sample), 1)
+        tracked._idx_arr = exact_idx
+
+        old_cur = int(self.cur_spike_group)
+        old_candidate = candidate
+        self.spike_groups.append(tracked)
+        new_idx = len(self.spike_groups) - 1
+        self.update_idx_arrs()
+        tracked._idx_arr = exact_idx
+
+        if candidate.template_refined:
+            try:
+                self.rebuild_unit_template(new_idx)
+            except Exception:
+                logger.debug("Could not initialise accepted candidate template", exc_info=True)
+
+        del self.candidate_units[int(candidate_id)]
+        self.active_candidate_id = None
+
+        def undo_accept(
+            self=self,
+            tracked=tracked,
+            name=name,
+            candidate=old_candidate,
+            cid=int(candidate_id),
+            old_cur=old_cur,
+        ):
+            self.spike_groups = [
+                sg for sg in self.spike_groups if sg is not tracked and sg.event.name != name
+            ]
+            self.candidate_units[cid] = candidate
+            self.active_candidate_id = cid
+            self.cur_spike_group = max(0, min(old_cur, len(self.spike_groups) - 1))
+            self.update_idx_arrs()
+            self.onUnitGroupChange.emit()
+            self.onUnitListChanged.emit()
+            self.onCandidatesChanged.emit()
+            self.onCandidateSelectionChanged.emit(cid)
+
+        self.save_undo(undo_accept)
+        self.cur_spike_group = new_idx
+        self.onUnitGroupChange.emit()
+        self.onUnitListChanged.emit()
+        self.onNewSpikeEvents.emit(new_idx)
+        self.onCandidatesChanged.emit()
+        self.onCandidateSelectionChanged.emit(-1)
+        self.setUnitGroup(new_idx)
+        return new_idx
+
+    def discard_candidate(self, candidate_id: int) -> bool:
+        candidate = self.candidate_units.get(int(candidate_id))
+        if candidate is None:
+            return False
+        previous_status = candidate.status
+        previous_score = candidate.score_at_discard
+        previous_channel = candidate.channel_at_discard
+        candidate.status = "discarded"
+        candidate.score_at_discard = float(candidate.score)
+        candidate.channel_at_discard = candidate.channel
+        was_active = self.active_candidate_id == candidate.candidate_id
+        if was_active:
+            self.active_candidate_id = None
+        self._touch_candidate_review()
+
+        def undo_discard(
+            self=self,
+            candidate=candidate,
+            previous_status=previous_status,
+            previous_score=previous_score,
+            previous_channel=previous_channel,
+            was_active=was_active,
+        ):
+            candidate.status = previous_status
+            candidate.score_at_discard = previous_score
+            candidate.channel_at_discard = previous_channel
+            if was_active:
+                self.active_candidate_id = candidate.candidate_id
+            self.onCandidatesChanged.emit()
+            self.onCandidateSelectionChanged.emit(
+                candidate.candidate_id if was_active else -1
+            )
+
+        self.save_undo(undo_discard)
+        self.onCandidatesChanged.emit()
+        self.onCandidateSelectionChanged.emit(-1)
+        return True
+
+    def reactivate_candidate(self, candidate_id: int) -> bool:
+        candidate = self.candidate_units.get(int(candidate_id))
+        if candidate is None:
+            return False
+        candidate.status = "pending"
+        candidate.score_at_discard = None
+        candidate.channel_at_discard = None
+        self.onCandidatesChanged.emit()
+        return True
+
+    def export_candidate_store(self) -> Dict[str, Any]:
+        sr = self._candidate_sampling_rate()
+        candidates = []
+        for candidate in sorted(
+            self.candidate_units.values(), key=lambda c: int(c.candidate_id)
+        ):
+            detections = []
+            for stim, item in enumerate(candidate.unit.idx_arr or []):
+                if item is None:
+                    continue
+                sample = item[0] if isinstance(item, (tuple, list)) else item
+                try:
+                    sample = int(sample)
+                except (TypeError, ValueError):
+                    continue
+                detections.append(
+                    [int(stim), sample, self._candidate_timestamp_s(stim, sample)]
+                )
+            evidence = candidate.evidence or CandidateEvidence()
+            candidates.append(
+                {
+                    "id": int(candidate.candidate_id),
+                    "status": candidate.status,
+                    "name": candidate.name,
+                    "name_edited": bool(candidate.name_edited),
+                    "channel": candidate.channel,
+                    "neighbors": list(candidate.neighbor_channels),
+                    "score": float(candidate.score),
+                    "score_at_discard": candidate.score_at_discard,
+                    "channel_at_discard": candidate.channel_at_discard,
+                    "latency_center_s": float(candidate.latency_center_samples) / sr,
+                    "latency_tolerance_s": float(candidate.latency_tolerance_samples)
+                    / sr,
+                    "algorithm": candidate.algorithm,
+                    "detector_params": dict(candidate.detector_params or {}),
+                    "template_refined": bool(candidate.template_refined),
+                    "features": {
+                        "hits": int(getattr(evidence, "hit_count", 0)),
+                        "recent_hits": int(getattr(evidence, "recent_hit_count", 0)),
+                        "jitter_ms": float(getattr(evidence, "jitter_ms", 0.0)),
+                        "snr": float(getattr(evidence, "median_snr", 0.0)),
+                        "hit_rate": float(getattr(evidence, "hit_rate", 0.0)),
+                        "waveform_score": float(
+                            getattr(evidence, "waveform_score", 0.5)
+                        ),
+                        "footprint_score": float(
+                            getattr(evidence, "footprint_score", 0.5)
+                        ),
+                        "recency_score": float(
+                            getattr(evidence, "recency_score", 0.0)
+                        ),
+                        "distinctiveness": float(
+                            getattr(evidence, "distinctiveness", 0.0)
+                        ),
+                    },
+                    "tracking": {
+                        "window_ms": float(candidate.tracking_window_ms),
+                        "threshold_mv": float(candidate.tracking_threshold_mv),
+                        "max_skips": int(candidate.tracking_max_skips),
+                    },
+                    "detections": detections,
+                    "first_seen_stim": int(candidate.first_seen_stim),
+                    "last_seen_stim": int(candidate.last_seen_stim),
+                    "notes": candidate.notes,
+                    "notes_edited": bool(candidate.notes_edited),
+                    "threshold_signal": float(candidate.threshold_signal),
+                    "signal_units": candidate.signal_units,
+                }
+            )
+        return {"version": 1, "candidates": candidates}
+
+    def restore_candidate_store(
+        self, payload: Any, event_signal: Optional[Event] = None
+    ) -> bool:
+        """Restore candidates from a saved payload (dict or JSON string)."""
+        if payload is None or payload == "" or payload == {}:
+            self.clear_candidates(emit=True)
+            return True
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                logger.warning("Ignoring malformed candidate annotation")
+                self.clear_candidates(emit=True)
+                return False
+        if not isinstance(payload, dict):
+            self.clear_candidates(emit=True)
+            return False
+        version = payload.get("version", 0)
+        if int(version or 0) != 1:
+            logger.warning("Ignoring unknown candidate store version %r", version)
+            self.clear_candidates(emit=True)
+            return False
+
+        ev = event_signal if event_signal is not None else self.event_signal
+        n_sweeps = len(ev) if ev is not None else 0
+        self.candidate_units = {}
+        self.active_candidate_id = None
+        self._candidate_id_counter = 0
+        for item in payload.get("candidates", []) or []:
+            try:
+                cid = int(item.get("id", 0))
+            except (TypeError, ValueError):
+                continue
+            detections: Dict[int, int] = {}
+            stored_times: Dict[int, float] = {}
+            for det in item.get("detections", []) or []:
+                if not isinstance(det, (list, tuple)) or len(det) < 2:
+                    continue
+                try:
+                    stim, sample = int(det[0]), int(det[1])
+                except (TypeError, ValueError):
+                    continue
+                if n_sweeps and not (0 <= stim < n_sweeps):
+                    continue
+                if sample < 0:
+                    continue
+                detections[stim] = sample
+                if len(det) >= 3:
+                    try:
+                        stored_times[stim] = float(det[2])
+                    except (TypeError, ValueError):
+                        pass
+            if cid <= 0:
+                cid = self._next_candidate_id()
+            else:
+                self._candidate_id_counter = max(self._candidate_id_counter, cid)
+            status = str(item.get("status", "pending") or "pending")
+            if status not in ("pending", "dormant", "discarded"):
+                status = "dormant"
+            if not detections:
+                status = "dormant"
+            name = str(item.get("name", "") or f"candidate_{cid}")
+            used = {getattr(sg.event, "name", "") for sg in self.spike_groups}
+            used.update(c.name for c in self.candidate_units.values())
+            if name in used:
+                base = name
+                suffix = 1
+                while name in used:
+                    name = f"{base}_{suffix}"
+                    suffix += 1
+            channel = str(item.get("channel", "") or "")
+            neighbors = [str(c) for c in (item.get("neighbors") or [])]
+            algorithm = str(item.get("algorithm", "zscore") or "zscore")
+            detector_params = dict(item.get("detector_params") or {})
+            unit = self._candidate_unit_payload(
+                name,
+                detections,
+                channel,
+                neighbors,
+                candidate_id=cid,
+                algorithm=algorithm,
+                detector_params=detector_params,
+                notes=str(item.get("notes", "") or ""),
+            )
+            if n_sweeps == 0 and detections:
+                times = [
+                    stored_times.get(stim, sample / self._candidate_sampling_rate())
+                    for stim, sample in sorted(detections.items())
+                ]
+                evt = Event(np.asarray(times, dtype=float) * pq.s, name=name, units=pq.s)
+                evt.annotations.update(dict(unit.event.annotations))
+                unit.event = evt
+                unit.idx_arr = [None for _ in range(max(detections) + 1)]
+                for stim, sample in detections.items():
+                    unit.idx_arr[int(stim)] = (int(sample), 1)
+            features = dict(item.get("features") or {})
+            evidence = CandidateEvidence(
+                hit_count=int(features.get("hits", len(detections)) or 0),
+                recent_hit_count=int(features.get("recent_hits", 0) or 0),
+                jitter_ms=float(features.get("jitter_ms", 0.0) or 0.0),
+                hit_rate=float(features.get("hit_rate", 0.0) or 0.0),
+                median_snr=float(features.get("snr", 0.0) or 0.0),
+                waveform_score=float(features.get("waveform_score", 0.5) or 0.5),
+                footprint_score=float(features.get("footprint_score", 0.5) or 0.5),
+                recency_score=float(features.get("recency_score", 0.0) or 0.0),
+                distinctiveness=float(features.get("distinctiveness", 0.0) or 0.0),
+            )
+            sr = self._candidate_sampling_rate()
+            candidate = CandidateUnit(
+                candidate_id=cid,
+                unit=unit,
+                algorithm=algorithm,
+                detector_params=detector_params,
+                template_refined=bool(item.get("template_refined", False)),
+                name=name,
+                name_edited=bool(item.get("name_edited", False)),
+                channel=channel,
+                neighbor_channels=neighbors,
+                score=float(item.get("score", 0.0) or 0.0),
+                evidence=evidence,
+                latency_center_samples=float(item.get("latency_center_s", 0.0) or 0.0)
+                * sr,
+                latency_tolerance_samples=float(
+                    item.get("latency_tolerance_s", 0.0) or 0.0
+                )
+                * sr,
+                status=status,
+                score_at_discard=item.get("score_at_discard"),
+                channel_at_discard=item.get("channel_at_discard"),
+                first_seen_stim=int(item.get("first_seen_stim", 0) or 0),
+                last_seen_stim=int(item.get("last_seen_stim", 0) or 0),
+                notes=str(item.get("notes", "") or ""),
+                notes_edited=bool(item.get("notes_edited", False)),
+                threshold_signal=float(item.get("threshold_signal", 0.0) or 0.0),
+                signal_units=str(item.get("signal_units", "") or ""),
+            )
+            tracking = dict(item.get("tracking") or {})
+            candidate.tracking_window_ms = float(
+                tracking.get("window_ms", 5.0) or 5.0
+            )
+            candidate.tracking_threshold_mv = float(
+                tracking.get("threshold_mv", 0.01) or 0.01
+            )
+            candidate.tracking_max_skips = int(tracking.get("max_skips", 3) or 3)
+            unit.tracking_algorithm = algorithm
+            unit.tracking_window_ms = candidate.tracking_window_ms
+            unit.tracking_threshold_mv = candidate.tracking_threshold_mv
+            unit.tracking_max_skips = candidate.tracking_max_skips
+            if not candidate.latency_center_samples and detections:
+                candidate.latency_center_samples = float(
+                    np.median(list(detections.values()))
+                )
+            if not candidate.latency_tolerance_samples:
+                candidate.latency_tolerance_samples = float(
+                    max(1, int(self._candidate_merge_tolerance_samples()))
+                )
+            self.candidate_units[cid] = candidate
+        self.onCandidatesChanged.emit()
+        self.onCandidateSelectionChanged.emit(-1)
+        return True
 
     def update_idx_arrs(self):
         if self.event_signal is None or len(self.event_signal) == 0:
@@ -1698,6 +3397,11 @@ class ViewerState(QObject):
             self.cur_spike_group = cur_sel[0]
 
         self.segment = data
+        self.event_signal = event_signal
+        self.analog_signal = analog_signal
+        self.restore_candidate_store(
+            data.annotations.get("spikespy_candidates"), event_signal=event_signal
+        )
 
         self.set_data(analog_signal, event_signal, spike_groups=spike_event_groups)
 
@@ -1737,6 +3441,7 @@ class ViewerState(QObject):
         self._live_aux_erp_buffers = {}
         self._live_channel_signals = {}
         self.segment = None
+        self.clear_candidates(emit=False)
         self.analog_signal = None
         self.event_signal = None
         self.spike_groups = []
@@ -1787,6 +3492,7 @@ class ViewerState(QObject):
 
         self._release_live_disk_cache()
         self.segment = neo.Segment(name="OpenEphys Live")
+        self.clear_candidates(emit=False)
         self._live_channel_signals = {}
         self._live_aux_erp_buffers = {}
         window_samples = int(sampling_rate * window_size_ms / 1000.0)
@@ -1873,6 +3579,23 @@ class ViewerState(QObject):
         if self.stimno is not None:
             self.onStimNoChange.emit(self.stimno)
 
+    def _reactivate_candidates_for_channel(self, channel: str) -> None:
+        if not channel or not self.candidate_units:
+            return
+        revived = False
+        for candidate in self.candidate_units.values():
+            if (
+                candidate.status == "discarded"
+                and candidate.channel == channel
+                and float(candidate.score) >= 0.5
+            ):
+                candidate.status = "pending"
+                candidate.score_at_discard = None
+                candidate.channel_at_discard = None
+                revived = True
+        if revived:
+            self.onCandidatesChanged.emit()
+
     def set_active_channel(self, channel_name_or_sig: Union[str, neo.AnalogSignal]):
         """
         Switch the active displayed channel in real time during live streaming or offline mode.
@@ -1899,6 +3622,7 @@ class ViewerState(QObject):
                 self._get_erp.cache_clear()
                 self.update_idx_arrs()
                 self.onChannelChange.emit(ch_name)
+                self._reactivate_candidates_for_channel(ch_name)
                 self._notify_dataset_loaded("channel")
                 self.onLoadNewFile.emit()
                 if self.event_signal is not None and len(self.event_signal) > 0:
@@ -1918,6 +3642,7 @@ class ViewerState(QObject):
             if found_sig is not None:
                 self.set_data(analog_signal=found_sig)
                 self.onChannelChange.emit(found_sig.name)
+                self._reactivate_candidates_for_channel(found_sig.name)
             else:
                 self.onChannelChange.emit(ch_name)
         else:
@@ -1934,6 +3659,7 @@ class ViewerState(QObject):
                 self._get_erp.cache_clear()
                 self.update_idx_arrs()
                 self.onChannelChange.emit(sig_name)
+                self._reactivate_candidates_for_channel(sig_name)
                 self._notify_dataset_loaded("channel")
                 self.onLoadNewFile.emit()
                 if self.event_signal is not None and len(self.event_signal) > 0:
@@ -1942,6 +3668,7 @@ class ViewerState(QObject):
             else:
                 self.set_data(analog_signal=sig)
                 self.onChannelChange.emit(sig_name)
+                self._reactivate_candidates_for_channel(sig_name)
 
     def _schedule_live_frame(self, stim_idx: int):
         """
@@ -2379,7 +4106,18 @@ class ViewerState(QObject):
         if self.follow_live:
             self.stimno = new_stim_idx
 
-        # Live multi-unit auto-tracking (asynchronous on background thread pool)
+        # Live multi-unit auto-tracking (asynchronous on background thread pool).
+        # Register the state-owned processor first so it is the single live
+        # tracking path regardless of which views are open.
+        wants_tracking = getattr(self, "auto_track_enabled", False) or any(
+            getattr(sg, "auto_track", False) for sg in self.spike_groups
+        )
+        if wants_tracking:
+            try:
+                self.ensure_live_tracking_processor()
+            except Exception:
+                logger.exception("Unable to register live tracking processor")
+
         # Avoid race if live_orchestrator already has a tracking function registered
         orch = getattr(self, "_live_orchestrator", None)
         has_orch_tracker = False
@@ -2393,9 +4131,7 @@ class ViewerState(QObject):
                     )
 
         if not has_orch_tracker:
-            if getattr(self, "auto_track_enabled", False) or any(
-                getattr(sg, "auto_track", False) for sg in self.spike_groups
-            ):
+            if wants_tracking:
                 self.tracking_manager.track_stimulus_async(self, new_stim_idx)
 
         # Feed the raw sweep to view-registered orchestrator processors.

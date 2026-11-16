@@ -276,11 +276,12 @@ class ViewSettingsPanel(QWidget):
         layout.addLayout(btn_layout)
 
         # Per-plot management (channel plots and summary line graphs)
-        plots_header = QLabel("<b>Plots</b>")
-        plots_header.setToolTip(
+        self.lbl_mt_plots = QLabel("<b>Plots</b>")
+        self.lbl_mt_plots.setToolTip(
             "Add, remove, reorder and configure each channel or summary plot"
         )
-        layout.addWidget(plots_header)
+        layout.addWidget(self.lbl_mt_plots)
+        self.lbl_mt_plots.setVisible(False)
         self.mt_plot_manager = MultiTracePlotManager(grp)
         self.mt_plot_manager.setVisible(False)
         layout.addWidget(self.mt_plot_manager)
@@ -1342,6 +1343,8 @@ class ViewSettingsPanel(QWidget):
         )
         if hasattr(self, "mt_plot_manager"):
             self.mt_plot_manager.setVisible(supports_plots)
+            if hasattr(self, "lbl_mt_plots"):
+                self.lbl_mt_plots.setVisible(supports_plots)
             self.mt_plot_manager.set_view(view if supports_plots else None)
 
         # Scale mode

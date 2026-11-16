@@ -1199,6 +1199,25 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             plot.addItem(empty_text)
             empty_text.setVisible(False)
 
+            # 6. Candidate preview overlay (amber open circles + dashed band)
+            candidate_band = pg.LinearRegionItem(
+                orientation="vertical",
+                brush=pg.mkBrush(255, 170, 0, 30),
+                pen=pg.mkPen((255, 170, 0), width=1, style=Qt.DashLine),
+                movable=False,
+            )
+            candidate_band.setVisible(False)
+            candidate_band.setZValue(15)
+            plot.addItem(candidate_band)
+            candidate_scatter = pg.ScatterPlotItem(
+                size=10,
+                symbol="o",
+                pen=pg.mkPen((255, 170, 0), width=1.5),
+                brush=pg.mkBrush(255, 170, 0, 40),
+            )
+            candidate_scatter.setZValue(16)
+            plot.addItem(candidate_scatter)
+
             panel = ChannelPlotPanel(
                 slot_idx=i,
                 channel_name=ch_name,
@@ -1213,6 +1232,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 highlight_segments=highlight_segments,
                 points_scatter=points_scatter,
             )
+            panel.candidate_band = candidate_band
+            panel.candidate_scatter = candidate_scatter
             self.channel_panels.append(panel)
 
         # Backward compatibility aliases
@@ -1225,6 +1246,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.stim_line = self.channel_panels[0].stim_line
         self.tracked_unit_scatter = self.channel_panels[0].tracked_unit_scatter
         self.other_unit_scatters = self.channel_panels[0].other_unit_scatters
+        self.candidate_scatter = self.channel_panels[0].candidate_scatter
+        self.candidate_band = self.channel_panels[0].candidate_band
         self.time_axis = self.channel_panels[0].time_axis
 
         self._update_axis_linking()
@@ -2016,6 +2039,12 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         if hasattr(self.state, "onUnitListChanged"):
             self._connect_state(self.state.onUnitListChanged, _on_unit_updated)
         self._connect_state(self.state.onUnitChange, _on_unit_updated)
+        if hasattr(self.state, "onCandidatesChanged"):
+            self._connect_state(self.state.onCandidatesChanged, self._on_candidates_changed)
+        if hasattr(self.state, "onCandidateSelectionChanged"):
+            self._connect_state(
+                self.state.onCandidateSelectionChanged, self._on_candidates_changed
+            )
         self._connect_state(self.state.onStimNoChange, self._on_stim_no_changed)
 
         if hasattr(self.state, "onChannelChange"):
@@ -2039,6 +2068,17 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self._schedule_render(self.state.stimno)
             self._schedule_right_axis_update(force=True)
             self.plot_spikegroups()
+
+    @Slot()
+    @Slot(int)
+    def _on_candidates_changed(self, *args):
+        if not getattr(self, "channel_panels", None):
+            return
+        self.plot_spikegroups()
+        if getattr(self.state, "is_streaming", False):
+            self.on_new_sweep_throttled()
+        else:
+            self.render()
 
     @quiet_fail
     def on_new_sweep(self, stimno: Optional[int] = None):
@@ -2376,6 +2416,38 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         if error or not result:
             return
 
+        stim_times_s = self._get_stim_times_s()
+        is_time = (
+            getattr(self, "y_axis_mode", "sweep") == "time"
+            and stim_times_s is not None
+            and len(stim_times_s) > 0
+        )
+        cur_stim = (
+            min(
+                max(0, self.state.stimno if self.state and self.state.stimno is not None else 0),
+                len(stim_times_s) - 1,
+            )
+            if is_time
+            else 0
+        )
+        t_selected = stim_times_s[cur_stim] if is_time else 0.0
+        candidate = None
+        candidate_pts = []
+        if self.state is not None and hasattr(self.state, "get_active_candidate"):
+            candidate = self.state.get_active_candidate()
+        if candidate is not None and getattr(candidate.unit, "idx_arr", None) is not None:
+            for s_idx, a in enumerate(candidate.unit.idx_arr):
+                if a is not None:
+                    y_val = (
+                        stim_times_s[s_idx] - t_selected
+                        if is_time and s_idx < len(stim_times_s)
+                        else float(s_idx)
+                    )
+                    candidate_pts.append((a[0], y_val))
+        candidate_arr = (
+            np.array(candidate_pts) if candidate_pts else np.empty((0, 2))
+        )
+
         target_unit_idx = self.get_target_unit_idx()
 
         for panel_idx, panel in enumerate(self.channel_panels):
@@ -2452,12 +2524,33 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                             lbl.setPos(pts_arr[0, 0], pts_arr[0, 1])
                             panel.plot.addItem(lbl)
                             panel.legend_items.append(lbl)
-                    else:
-                        panel.tracked_unit_scatter.clear()
-                else:
-                    panel.tracked_unit_scatter.clear()
             else:
                 panel.tracked_unit_scatter.clear()
+
+            # 3. Candidate preview (amber open circles + dashed latency band)
+            show_candidate = (
+                candidate is not None
+                and candidate_arr.size > 0
+                and panel.channel_name == candidate.channel
+            )
+            if show_candidate:
+                panel.candidate_scatter.setData(
+                    x=candidate_arr[:, 0],
+                    y=candidate_arr[:, 1],
+                    size=10,
+                    symbol="o",
+                    pen=pg.mkPen((255, 170, 0), width=1.5),
+                    brush=pg.mkBrush(255, 170, 0, 40),
+                )
+                panel.candidate_scatter.setVisible(True)
+                center = float(candidate.latency_center_samples)
+                half = max(1.0, float(candidate.latency_tolerance_samples))
+                panel.candidate_band.setRegion((center - half, center + half))
+                panel.candidate_band.setVisible(True)
+            else:
+                panel.candidate_scatter.clear()
+                panel.candidate_scatter.setVisible(False)
+                panel.candidate_band.setVisible(False)
 
 
     @quiet_fail
@@ -2857,6 +2950,17 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 u_name = getattr(unit.event, "name", str(i)) or str(i)
                 other_units_data.append((i, u_name, c, pts_arr))
 
+        candidate = None
+        candidate_pts = []
+        if hasattr(self.state, "get_active_candidate"):
+            candidate = self.state.get_active_candidate()
+        if candidate is not None and getattr(candidate.unit, "idx_arr", None) is not None:
+            for s_idx, a in enumerate(candidate.unit.idx_arr):
+                if a is not None:
+                    y_val = stim_times_s[s_idx] - t_selected if is_time and s_idx < len(stim_times_s) else float(s_idx)
+                    candidate_pts.append((a[0], y_val))
+        candidate_arr = np.array(candidate_pts) if candidate_pts else np.empty((0, 2))
+
         for panel_idx, panel in enumerate(self.channel_panels):
             for item in panel.legend_items:
                 try:
@@ -2939,6 +3043,31 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                     panel.legend_items.append(lbl)
             else:
                 panel.tracked_unit_scatter.clear()
+
+            # 3. Candidate preview (amber open circles + dashed latency band)
+            show_candidate = (
+                candidate is not None
+                and candidate_arr.size > 0
+                and panel.channel_name == candidate.channel
+            )
+            if show_candidate:
+                panel.candidate_scatter.setData(
+                    x=candidate_arr[:, 0],
+                    y=candidate_arr[:, 1],
+                    size=10,
+                    symbol="o",
+                    pen=pg.mkPen((255, 170, 0), width=1.5),
+                    brush=pg.mkBrush(255, 170, 0, 40),
+                )
+                panel.candidate_scatter.setVisible(True)
+                center = float(candidate.latency_center_samples)
+                half = max(1.0, float(candidate.latency_tolerance_samples))
+                panel.candidate_band.setRegion((center - half, center + half))
+                panel.candidate_band.setVisible(True)
+            else:
+                panel.candidate_scatter.clear()
+                panel.candidate_scatter.setVisible(False)
+                panel.candidate_band.setVisible(False)
 
     def render(self):
         self.plot_spikegroups()

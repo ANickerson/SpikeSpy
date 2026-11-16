@@ -339,6 +339,11 @@ class MultiTracePlotManager(QWidget):
             is_channel_stat = bool(spec.get("is_channel_stat"))
 
             self._populate_channel_combo(spec, allow_edit=is_channel or is_channel_stat)
+            self._set_row_visible(
+                self.lbl_channel,
+                self.combo_channel,
+                is_channel or is_channel_stat,
+            )
             self._set_row_visible(self.lbl_visible, self.chk_visible, not is_channel)
             self.chk_visible.setChecked(bool(spec.get("visible", True)))
             self.chk_visible.setText(

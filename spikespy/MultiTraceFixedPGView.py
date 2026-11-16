@@ -73,6 +73,20 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
         self.points_scatter = pg.ScatterPlotItem(
             size=8, symbol="o", brush=pg.mkBrush("black"), pen=None
         )
+        self.candidate_band = pg.LinearRegionItem(
+            orientation="vertical",
+            brush=pg.mkBrush(255, 170, 0, 30),
+            pen=pg.mkPen((255, 170, 0), width=1, style=Qt.DashLine),
+            movable=False,
+        )
+        self.candidate_band.setVisible(False)
+        self.candidate_scatter = pg.ScatterPlotItem(
+            size=11,
+            symbol="o",
+            pen=pg.mkPen((255, 170, 0), width=1.8),
+            brush=pg.mkBrush(255, 170, 0, 40),
+        )
+        self.candidate_scatter.setVisible(False)
 
         self._has_initialized_xrange: bool = False
         self._dirty: bool = False
@@ -147,6 +161,8 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
         self.main_plot.addItem(self.active_curve)
         self.main_plot.addItem(self.highlight_segments)
         self.main_plot.addItem(self.points_scatter)
+        self.main_plot.addItem(self.candidate_band)
+        self.main_plot.addItem(self.candidate_scatter)
 
         self.main_plot.scene().sigMouseClicked.connect(self._on_click)
 
@@ -283,6 +299,14 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
         self.update_figure()
 
     @Slot()
+    @Slot(int)
+    def _on_candidates_changed(self, *args):
+        if getattr(self.state, "is_streaming", False):
+            self.on_new_sweep_throttled()
+        else:
+            self.update_figure(force=True)
+
+    @Slot()
     @Slot(str)
     def _on_channel_change(self, *args):
         self.update_figure(force=True)
@@ -306,6 +330,14 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
         self._connect_state(self.state.onStimNoChange, self._on_stim_no_change)
         self._connect_state(self.state.onUnitChange, self._on_unit_change)
         self._connect_state(self.state.onUnitGroupChange, self._on_unit_group_change)
+        if hasattr(self.state, "onCandidatesChanged"):
+            self._connect_state(
+                self.state.onCandidatesChanged, self._on_candidates_changed
+            )
+        if hasattr(self.state, "onCandidateSelectionChanged"):
+            self._connect_state(
+                self.state.onCandidateSelectionChanged, self._on_candidates_changed
+            )
         self._register_data_reload(state, self._on_load_new_file)
         if hasattr(self.state, "onChannelChange"):
             self._connect_state(self.state.onChannelChange, self._on_channel_change)
@@ -737,6 +769,57 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
             self.points_scatter.setData(x=pts_arr[:, 0], y=pts_arr[:, 1])
         else:
             self.points_scatter.clear()
+
+        # Candidate preview (amber open circles + dashed latency band)
+        candidate = (
+            self.state.get_active_candidate()
+            if self.state is not None and hasattr(self.state, "get_active_candidate")
+            else None
+        )
+        primary_ch = (
+            self.channel_bar.get_primary_channel()
+            if hasattr(self, "channel_bar") and self.channel_bar is not None
+            else ""
+        )
+        if (
+            candidate is None
+            or (candidate.channel and primary_ch and candidate.channel != primary_ch)
+            or getattr(candidate.unit, "idx_arr", None) is None
+        ):
+            self.candidate_scatter.clear()
+            self.candidate_scatter.setVisible(False)
+            self.candidate_band.setVisible(False)
+        else:
+            cand_pts = []
+            idx_arr = candidate.unit.idx_arr
+            for i, s_idx in enumerate(range(start, stop)):
+                if s_idx < 0 or s_idx >= len(idx_arr):
+                    continue
+                entry = idx_arr[s_idx]
+                if entry is None:
+                    continue
+                sample_no = int(entry[0])
+                if 0 <= sample_no < len(dpts_mag[i]):
+                    cand_pts.append(
+                        (
+                            sample_no / sr,
+                            (dpts_mag[i][sample_no] * eff_scale * -1.0)
+                            + y_baselines[i],
+                        )
+                    )
+            if cand_pts:
+                cand_arr = np.array(cand_pts)
+                self.candidate_scatter.setData(
+                    x=cand_arr[:, 0], y=cand_arr[:, 1]
+                )
+                self.candidate_scatter.setVisible(True)
+            else:
+                self.candidate_scatter.clear()
+                self.candidate_scatter.setVisible(False)
+            center_s = float(candidate.latency_center_samples) / sr
+            half_s = max(1.0 / sr, float(candidate.latency_tolerance_samples) / sr)
+            self.candidate_band.setRegion((center_s - half_s, center_s + half_s))
+            self.candidate_band.setVisible(True)
 
         # Update Y-axis ticks and range
         if y_axis_mode == "time" and stim_times_s is not None:

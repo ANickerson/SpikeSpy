@@ -752,13 +752,16 @@ class MultiChannelTemplateMatcher:
         self.max_template_spikes = int(max_template_spikes)
         self.templates: Dict[str, np.ndarray] = {}
         self.weights: Dict[str, float] = {}
+        self.threshold: float = 0.5
         self.version = 0
+        self._initialized: bool = False
         self._sweep_cache: OrderedDict[
             Tuple[int, Tuple[str, ...]], np.ndarray
         ] = OrderedDict()
         self._sweep_cache_capacity = 32
 
     def build_template(self, state, sg, channels: List[str] = None) -> bool:
+        self._initialized = False
         if state is None or sg is None or state.analog_signal is None:
             return False
 
@@ -872,7 +875,96 @@ class MultiChannelTemplateMatcher:
         self.weights = new_weights
         self.version += 1
         self._sweep_cache.clear()
+        self._initialized = True
         return True
+
+    def compute_composite_score(
+        self,
+        getter,
+        use_correlate: bool = False,
+    ) -> Optional[np.ndarray]:
+        """SNR-weighted composite convolution score from a channel getter.
+
+        ``getter(channel)`` returns a 1-D waveform for that channel, so this is
+        usable from live workers without touching ``ViewerState`` buffers.
+        """
+        if not self.templates:
+            return None
+
+        composite_score = None
+        weights_sum = 0.0
+        for ch, tmpl in self.templates.items():
+            sweep = getter(ch)
+            if sweep is None:
+                continue
+            sweep_data = np.asarray(
+                getattr(sweep, "magnitude", sweep), dtype=np.float64
+            ).ravel()
+            if sweep_data.size == 0:
+                continue
+
+            std_sw = float(np.std(sweep_data))
+            if std_sw > 1e-9:
+                sweep_norm = (sweep_data - np.mean(sweep_data)) / std_sw
+            else:
+                sweep_norm = sweep_data - np.mean(sweep_data)
+
+            tmpl_norm = np.asarray(tmpl, dtype=np.float64)
+            conv = signal.fftconvolve(sweep_norm, tmpl_norm, mode="same")
+            L = len(tmpl_norm)
+            if L < len(conv):
+                conv[:L] = 0.0
+                conv[-L:] = 0.0
+
+            w = self.weights.get(ch, 1.0)
+            if composite_score is None:
+                composite_score = conv * w
+            else:
+                composite_score += conv * w
+            weights_sum += w
+
+        if composite_score is None:
+            return None
+        if weights_sum > 0:
+            composite_score /= float(weights_sum)
+        return composite_score.astype(np.float32)
+
+    def match_single_stimulus(
+        self,
+        getter,
+        expected_idx: Optional[int] = None,
+        search_radius_samples: Optional[int] = None,
+    ) -> Optional[Tuple[int, float]]:
+        """Return ``(sample, score)`` for the best template match on one sweep.
+
+        When ``expected_idx`` is given, only peaks within
+        ``search_radius_samples`` of it are considered, matching the causal
+        windowed search used by the live tracker.
+        """
+        score = self.compute_composite_score(getter)
+        if score is None or score.size == 0:
+            return None
+
+        if expected_idx is None:
+            lo, hi = 0, score.size
+        else:
+            radius = (
+                max(1, int(search_radius_samples))
+                if search_radius_samples is not None
+                else score.size
+            )
+            exp = int(expected_idx)
+            lo = max(0, exp - radius)
+            hi = min(score.size, exp + radius + 1)
+        if hi <= lo:
+            return None
+
+        window = score[lo:hi]
+        peak = int(np.argmax(window))
+        value = float(window[peak])
+        if value < float(self.threshold):
+            return None
+        return (int(lo + peak), value)
 
     def score_sweep(
         self,

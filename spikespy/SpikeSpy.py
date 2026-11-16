@@ -76,6 +76,7 @@ from .io_manager import (
     export_units_csv,
     export_units_npz,
     import_units_csv,
+    prompt_for_neo_folder,
     save_state_to_nix,
 )
 from .UnitSuggestor import UnitSuggestor
@@ -464,8 +465,8 @@ class MdiView(QMainWindow):
         version = get_version("spikespy")
         self.setWindowTitle(f"SpikeSpy - {version}")
         self.state = state or ViewerState(**kwargs)
-        self.loadFile.connect(self.state.loadFile)
-        self.loadFile.connect(self.updateRecents)
+        self.loadFile.connect(self._dispatch_load_file)
+        self.state.onFileLoaded.connect(self.updateRecents)
         self.state.onLoadNewFile.connect(
             lambda self=self: self.setWindowTitle(
                 f"SpikeSpy ({version}) - {Path(self.state.title).name}"
@@ -600,6 +601,14 @@ class MdiView(QMainWindow):
         file_menu = self.menubar.addMenu("&File")
         file_menu.addAction(
             QAction("Open...", self, shortcut="Ctrl+O", triggered=lambda: self.open())
+        )
+        file_menu.addAction(
+            QAction(
+                "Open Folder...",
+                self,
+                shortcut="Ctrl+Shift+O",
+                triggered=self.open_folder,
+            )
         )
         self.recent_menu = file_menu.addMenu("Open Recent")
         file_menu.addAction(
@@ -928,32 +937,34 @@ class MdiView(QMainWindow):
     def updateRecents(self, filename, type):
 
         if filename is not None:
-            to_save = [filename]
+            to_save = [(filename, type)]
             for i in range(self.settings_file.beginReadArray("Recent")):
                 self.settings_file.setArrayIndex(i)
                 prevVal = self.settings_file.value("filename")
                 if prevVal == filename:
                     continue
-                to_save.append(prevVal)
+                to_save.append((prevVal, self.settings_file.value("type", "h5")))
             self.settings_file.endArray()
 
             self.settings_file.beginWriteArray("Recent")
-            for i in range(len(to_save)):
+            for i, (fname, ftype) in enumerate(to_save):
                 self.settings_file.setArrayIndex(i)
-                self.settings_file.setValue("filename", to_save[i])
+                self.settings_file.setValue("filename", fname)
+                self.settings_file.setValue("type", ftype)
             self.settings_file.endArray()
 
         self.recent_menu.clear()
         for i in range(self.settings_file.beginReadArray("Recent")):
             self.settings_file.setArrayIndex(i)
             fname = self.settings_file.value("filename")
+            ftype = self.settings_file.value("type", "h5")
             self.recent_menu.addAction(
                 QAction(
                     Path(fname).name,
                     self,
-                    triggered=lambda n, fname=fname: self.loadFile.emit(
-                        fname, "h5"
-                    ),  # currently assumes h5
+                    triggered=lambda n, fname=fname, ftype=ftype: self.loadFile.emit(
+                        fname, ftype
+                    ),
                 )
             )
 
@@ -1102,7 +1113,22 @@ class MdiView(QMainWindow):
         triggered on file->open
         """
         fname, type = prompt_for_neo_file(type)
+        if not fname:
+            return
         self.loadFile.emit(fname, type)
+
+    @Slot()
+    def open_folder(self):
+        """File -> Open Folder... for folder-based formats (Open Ephys, APTrack, MATLAB)."""
+        fname, type = prompt_for_neo_folder(self)
+        if not fname:
+            return
+        self.loadFile.emit(fname, type)
+
+    @Slot(str, str)
+    def _dispatch_load_file(self, fname, type):
+        """Route file loads through the state's non-blocking loader."""
+        self.state.loadFile(fname, type, blocking=False)
 
     @Slot()
     def save_as(
@@ -1127,6 +1153,7 @@ class MdiView(QMainWindow):
             fname,
             self.state.spike_groups,
             s,
+            candidates=self.state.export_candidate_store(),
         )
 
 
@@ -1168,9 +1195,9 @@ def run(filename=None):
     # )
     w = MdiView()
     if filename is not None:
-        w.state.loadFile(filename)
+        w.state.loadFile(filename, blocking=False)
     elif len(sys.argv) > 1:
-        w.state.loadFile(sys.argv[1])
+        w.state.loadFile(sys.argv[1], blocking=False)
 
     # w = SpikeGroupView()
     w.showMaximized()

@@ -9,6 +9,7 @@ so ViewerState and SpikeSpy can delegate cleanly.
 from __future__ import annotations
 
 import csv
+import json
 import logging
 from csv import DictReader, writer
 from datetime import datetime
@@ -22,6 +23,7 @@ import quantities as pq
 from neo import Event
 from neo.core.objectlist import ObjectList
 from neo.io import NixIO
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -188,39 +190,125 @@ class APTrackDialog(QDialog):
         self.inputBoxes.pop()
 
 
-def prompt_for_neo_file(type=None):
-    if type is None:
-        type = QInputDialog().getItem(
+FILE_TYPE_EXTENSIONS = {
+    ".h5": "h5",
+    ".hdf5": "h5",
+    ".nwb": "nwb",
+    ".smr": "spike2",
+    ".smrx": "spike2",
+}
+
+OPEN_FILE_FILTERS = ";;".join(
+    [
+        "All supported recordings (*.h5 *.hdf5 *.nwb *.smr *.smrx)",
+        "NIX h5 (*.h5 *.hdf5)",
+        "NWB (*.nwb)",
+        "Spike2 (*.smr *.smrx)",
+        "All files (*)",
+    ]
+)
+
+FOLDER_TYPES = ["openEphys", "APTrack", "matlab"]
+ALL_TYPES = ["h5", "nwb", "spike2"] + FOLDER_TYPES
+
+
+def infer_file_type(path) -> Optional[str]:
+    """Guess a loader type from a file extension, e.g. '.h5' -> 'h5'."""
+    return FILE_TYPE_EXTENSIONS.get(Path(path).suffix.lower())
+
+
+def infer_folder_type(folder) -> Optional[str]:
+    """Guess a loader type from the contents of a recording folder.
+
+    Returns 'openEphys' for Open Ephys binary folders, 'matlab' for folders of
+    .mat files, 'APTrack' for legacy *.continuous recordings, or None when the
+    contents are unrecognised.
+    """
+    folder = Path(folder)
+    try:
+        entries = [x.name.lower() for x in folder.iterdir()]
+    except OSError:
+        return None
+    if "structure.oebin" in entries or "settings.xml" in entries or "continuous" in entries:
+        return "openEphys"
+    if any(n.endswith(".continuous") for n in entries):
+        return "APTrack"
+    if any(n.endswith(".mat") for n in entries):
+        return "matlab"
+    return None
+
+
+def _prompt_file_type(default: str = "h5") -> str:
+    return str(
+        QInputDialog.getItem(
             None,
             "Select file type",
             "Filetype",
-            ["h5", "openEphys", "APTrack", "matlab", "spike2", "nwb"],
+            ALL_TYPES,
+            max(0, ALL_TYPES.index(default)) if default in ALL_TYPES else 0,
+            False,
         )[0]
+    )
 
+
+def prompt_for_neo_file(type=None, parent=None):
+    """Ask for a recording file with a single dialog; the loader type is inferred
+    from the chosen extension when not given explicitly."""
+    if type in ("openEphys", "APTrack", "matlab"):
+        fname = QFileDialog.getExistingDirectory(parent, "Open recording folder")[0]
+        return fname, (type if fname else None)
     if type in ("h5", "spike2", "nwb"):
-        fname = QFileDialog.getOpenFileName(None, "Open")[0]
-    elif type in ("openEphys", "APTrack", "matlab"):
-        fname = QFileDialog.getExistingDirectory(None, "Open OpenEphys")
-    else:
-        raise Exception(f"Unknown filetype: {type}")
+        fname = QFileDialog.getOpenFileName(parent, "Open")[0]
+        return fname, (type if fname else None)
+
+    fname, _selected = QFileDialog.getOpenFileName(
+        parent, "Open recording", "", OPEN_FILE_FILTERS
+    )
+    if not fname:
+        return "", None
+    type = infer_file_type(fname)
+    if type is None:
+        type = _prompt_file_type()
     return fname, type
 
 
-def load_file(data_path, type="h5", **kwargs):
+def prompt_for_neo_folder(parent=None):
+    """Ask for a recording folder and infer the loader from its contents."""
+    folder = QFileDialog.getExistingDirectory(parent, "Open recording folder")
+    if not folder:
+        return "", None
+    type = infer_folder_type(folder)
+    if type is None:
+        type = _prompt_file_type()
+    return folder, type
+
+
+def load_file(data_path, type="h5", aptrack_config=None, progress_cb=None):
     from .ViewerState import tracked_neuron_unit
 
+    def _stage(msg):
+        if progress_cb is not None:
+            progress_cb(msg)
+
     if type == "h5":
+        _stage("Reading NIX file...")
         data = NixIO(data_path, mode="ro").read_block(0).segments
     elif type == "openEphys":
+        _stage("Reading Open Ephys data...")
         data = neo.OpenEphysBinaryIO(data_path).read_block(0).segments[0]
     elif type == "nwb":
+        _stage("Reading NWB file...")
         data = neo.NWBIO(data_path).read_block(block_index=0).segments[0]
     elif type == "matlab":
+        _stage("Reading MATLAB folder...")
         data = open_matlab_to_neo(data_path)
     elif type == "APTrack":
-        d = APTrackDialog()
-        val = d.exec_() if hasattr(d, "exec_") else d.exec()
-        config = d.get_config()
+        if aptrack_config is None:
+            d = APTrackDialog()
+            val = d.exec_() if hasattr(d, "exec_") else d.exec()
+            config = d.get_config()
+        else:
+            config = dict(aptrack_config)
         t = config.pop("record")
 
         skip_list = ["rd.0", "rd.0.bp", "stimVolt", "stim"]
@@ -231,11 +319,15 @@ def load_file(data_path, type="h5", **kwargs):
             extra_channel = APTrackRecording(v, TypeID.ANALOG, k, "")
             additional_channels.append(extra_channel)
 
+        _stage("Reading APTrack folder...")
         data = open_aptrack(data_path, t, config, additional_channels)
     elif type == "spike2":
+        _stage("Reading Spike2 file...")
         data = neo.Spike2IO(data_path)
     else:
         raise ValueError(f"Unknown file type: {type}")
+
+    _stage("Preparing channels...")
 
     if isinstance(data, (list, ObjectList)):
         final_sig = next(
@@ -294,6 +386,33 @@ def load_file(data_path, type="h5", **kwargs):
 
     data.file_origin = data_path
     return data, signal_chan, event_signal, spike_event_groups
+
+
+class FileLoadWorker(QThread):
+    """Loads a recording off the GUI thread; results are marshalled via signals."""
+
+    loaded = Signal(str, str, object, object, object, object)
+    failed = Signal(str, str, str)
+    stage = Signal(str)
+
+    def __init__(self, fname, type, aptrack_config=None, parent=None):
+        super().__init__(parent)
+        self.fname = fname
+        self.type = type
+        self.aptrack_config = aptrack_config
+
+    def run(self):
+        try:
+            self.stage.emit(f"Opening {Path(self.fname).name}...")
+            data, analog_signal, event_signal, spike_groups = load_file(
+                self.fname, self.type, aptrack_config=self.aptrack_config, progress_cb=self.stage.emit
+            )
+            self.loaded.emit(self.fname, self.type, data, analog_signal, event_signal, spike_groups)
+        except Exception:
+            import traceback
+
+            logger.exception("Failed to load %s using %s", self.fname, self.type)
+            self.failed.emit(self.fname, self.type, traceback.format_exc())
 
 
 def export_units_csv(save_filename: str, unit_evts, stim_evt: neo.Event):
@@ -549,10 +668,18 @@ def export_units_npz(
 
 
 def save_state_to_nix(
-    filename: str, spike_groups, data: neo.Segment = None, metadata=None
+    filename: str,
+    spike_groups,
+    data: neo.Segment = None,
+    metadata=None,
+    candidates=None,
 ):
     """Saves a file containing the spike groups and multi-channel signals to NIX/NWB format.
     Ensures MultiAnalogSignal is converted appropriately and saves channel/neighbor_channels in annotations.
+
+    ``candidates`` may be the dict returned by ``ViewerState.export_candidate_store``
+    or an already-serialized JSON string; it is stored in the segment annotation
+    ``spikespy_candidates`` so the four-tuple ``load_file`` contract stays intact.
     """
     if metadata is None:
         metadata = {
@@ -594,6 +721,13 @@ def save_state_to_nix(
         ]
     else:
         data2 = neo.Segment()
+
+    if candidates is not None:
+        if isinstance(candidates, str):
+            payload = candidates
+        else:
+            payload = json.dumps(candidates, separators=(",", ":"), default=str)
+        data2.annotations["spikespy_candidates"] = payload
 
     for i, sg in enumerate(spike_groups):
         evt = sg.event if hasattr(sg, "event") else sg

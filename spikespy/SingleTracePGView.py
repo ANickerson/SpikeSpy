@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QToolBar,
     QCheckBox,
+    QDoubleSpinBox,
+    QLabel,
 )
 import pyqtgraph as pg
 
@@ -96,6 +98,8 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self._aux_plot_by_channel: Dict[str, pg.PlotItem] = {}
         self._aux_trace_by_channel: Dict[str, pg.PlotDataItem] = {}
         self._separate_axes: bool = True
+        self._syncing_tracking_controls: bool = False
+        self.template_curve: Optional[pg.PlotDataItem] = None
 
         # Time-based LIFO convolution buffer: accumulates latest sweep, flushes periodically
         self._pending_conv_stimno: Optional[int] = None
@@ -135,6 +139,42 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.separate_axes_check.setChecked(self._separate_axes)
         self.separate_axes_check.toggled.connect(self._on_axis_mode_changed)
         self.axis_bar.addWidget(self.separate_axes_check)
+
+        self.show_track_window_check = QCheckBox("Show search window", self)
+        self.show_track_window_check.setChecked(True)
+        self.show_track_window_check.setToolTip(
+            "Shade the latency window used to search for the next spike"
+        )
+        self.show_track_window_check.toggled.connect(
+            self._on_track_overlay_visibility_changed
+        )
+        self.axis_bar.addWidget(self.show_track_window_check)
+
+        self.track_window_spin = QDoubleSpinBox(self)
+        self.track_window_spin.setRange(0.1, 500.0)
+        self.track_window_spin.setDecimals(1)
+        self.track_window_spin.setSingleStep(0.5)
+        self.track_window_spin.setSuffix(" ms")
+        self.track_window_spin.setToolTip(
+            "Tracking window for the bound unit (editable here or by dragging "
+            "the shaded region)"
+        )
+        self.track_window_spin.valueChanged.connect(
+            self._on_track_window_spin_changed
+        )
+        self.axis_bar.addWidget(QLabel("track window:", self))
+        self.axis_bar.addWidget(self.track_window_spin)
+
+        self.show_template_check = QCheckBox("Show template", self)
+        self.show_template_check.setChecked(True)
+        self.show_template_check.setToolTip(
+            "Overlay the multi-channel template used for convolution"
+        )
+        self.show_template_check.toggled.connect(
+            self._on_track_overlay_visibility_changed
+        )
+        self.axis_bar.addWidget(self.show_template_check)
+
         self.add_navigation_actions(self.axis_bar)
         self.addToolBarBreak(Qt.TopToolBarArea)
         self.addToolBar(Qt.TopToolBarArea, self.axis_bar)
@@ -185,6 +225,22 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.trace_curve.setClipToView(True)
         self.main_plot.addItem(self.trace_curve)
 
+        # Shaded tracking search window. Its width is the unit's
+        # tracking_window_ms and dragging either edge updates it.
+        self.track_window_region = pg.LinearRegionItem(
+            values=(0.0, 0.0),
+            movable=True,
+            brush=pg.mkBrush(90, 140, 255, 35),
+            pen=pg.mkPen((60, 110, 220), width=1, style=Qt.DashLine),
+            hoverBrush=pg.mkBrush(90, 140, 255, 70),
+        )
+        self.track_window_region.setZValue(-10)
+        self.track_window_region.setVisible(False)
+        self.main_plot.addItem(self.track_window_region)
+        self.track_window_region.sigRegionChangeFinished.connect(
+            self._on_track_region_changed
+        )
+
         # Identified spike vertical line
         self.identified_spike_line = pg.InfiniteLine(
             angle=90, pen=pg.mkPen("blue", width=1.5, style=Qt.DashLine), movable=False
@@ -204,12 +260,40 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.main_plot.addItem(self.next_spike_line)
         self.next_spike_line.setVisible(False)
 
+        # Candidate preview: amber dashed latency line + open circle marker.
+        # Deliberately distinct from the blue movable tracking-window band.
+        if not hasattr(self, "candidate_line"):
+            self.candidate_line = pg.InfiniteLine(
+                angle=90,
+                pen=pg.mkPen(255, 170, 0, 220, width=1.5, style=Qt.DashLine),
+                movable=False,
+            )
+            self.candidate_line.setZValue(12)
+            self.main_plot.addItem(self.candidate_line)
+            self.candidate_line.setVisible(False)
+            self.candidate_marker = pg.ScatterPlotItem(
+                size=11,
+                symbol="o",
+                pen=pg.mkPen((255, 170, 0), width=1.8),
+                brush=pg.mkBrush(255, 170, 0, 40),
+            )
+            self.candidate_marker.setZValue(13)
+            self.main_plot.addItem(self.candidate_marker)
+            self.candidate_marker.setVisible(False)
+
         # All convolution peaks drawn as one item (vertical segments y=0..1).
         self.conv_curve = pg.PlotDataItem(
             pen=pg.mkPen(218, 165, 32, 100, width=1), connect="pairs"
         )
         self.top_plot.addItem(self.conv_curve)
         self.conv_curve.setVisible(False)
+
+        # Convolution template preview (normalized and aligned to the spike).
+        self.template_curve = pg.PlotDataItem(
+            pen=pg.mkPen((0, 140, 200), width=1.6, style=Qt.DashLine)
+        )
+        self.top_plot.addItem(self.template_curve)
+        self.template_curve.setVisible(False)
 
         # Sweep label text
         self.stimno_label = pg.TextItem(text="", color=(0, 0, 0), anchor=(0, 1))
@@ -363,6 +447,11 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     def _on_new_spike_events(self, *args):
         self.update_histogram()
 
+    @Slot()
+    @Slot(int)
+    def _on_candidates_changed(self, *args):
+        self.update_figure(force=True)
+
     def set_state(self, state: ViewerState):
         self.unset_connections()
         self.state = state
@@ -386,6 +475,14 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self._connect_state(self.state.onStimNoChange, self._on_stim_no_change)
         self._connect_state(self.state.onUnitChange, self._on_unit_change)
         self._connect_state(self.state.onUnitGroupChange, self._on_unit_group_changed)
+        if hasattr(self.state, "onCandidatesChanged"):
+            self._connect_state(
+                self.state.onCandidatesChanged, self._on_candidates_changed
+            )
+        if hasattr(self.state, "onCandidateSelectionChanged"):
+            self._connect_state(
+                self.state.onCandidateSelectionChanged, self._on_candidates_changed
+            )
         if hasattr(self.state, "onChannelChange"):
             self._connect_state(self.state.onChannelChange, self._on_channel_change_event)
         def _on_live_frame_cb(stimno):
@@ -857,6 +954,157 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             return 10000.0
         return float(sr.rescale("Hz").magnitude) if hasattr(sr, "rescale") else float(sr)
 
+    def _target_tracking_center_s(
+        self, sg: Optional[tracked_neuron_unit], stimno: int, sr: float
+    ) -> Optional[float]:
+        """Latency (s) to center the search-window overlay on."""
+        if sg is None or sr <= 0:
+            return None
+        idx_arr = getattr(sg, "idx_arr", None)
+        if idx_arr:
+            if 0 <= stimno < len(idx_arr) and idx_arr[stimno] is not None:
+                item = idx_arr[stimno]
+                sample = item[0] if isinstance(item, (tuple, list)) else item
+                return float(sample) / sr
+            for step in (-1, 1):
+                for offset in range(1, 50):
+                    i = stimno + step * offset
+                    if 0 <= i < len(idx_arr) and idx_arr[i] is not None:
+                        item = idx_arr[i]
+                        sample = item[0] if isinstance(item, (tuple, list)) else item
+                        return float(sample) / sr
+        if self.state is not None and self.state.event_signal is not None:
+            if 0 <= stimno < len(self.state.event_signal):
+                try:
+                    lat = sg.get_latencies(
+                        np.array([self.state.event_signal[stimno]])
+                        * self.state.event_signal.units
+                    )[0]
+                    if not np.isnan(lat):
+                        return float(lat.rescale(pq.s).magnitude)
+                except Exception:
+                    pass
+        return None
+
+    def _update_tracking_controls(
+        self, sg: Optional[tracked_neuron_unit] = None
+    ) -> None:
+        """Sync the tracking spinbox and search-window region from the unit."""
+        if self.state is None:
+            return
+        if sg is None:
+            sg = self.get_target_unit()
+        window_ms = float(getattr(sg, "tracking_window_ms", 5.0)) if sg else 5.0
+
+        self._syncing_tracking_controls = True
+        try:
+            with QSignalBlocker(self.track_window_spin):
+                if abs(self.track_window_spin.value() - window_ms) > 1e-9:
+                    self.track_window_spin.setValue(window_ms)
+
+            if sg is None or not self.show_track_window_check.isChecked():
+                self.track_window_region.setVisible(False)
+                return
+
+            center = self._target_tracking_center_s(
+                sg, int(self.state.stimno), self._sampling_rate_hz()
+            )
+            if center is None:
+                self.track_window_region.setVisible(False)
+                return
+
+            half = max(0.00005, window_ms / 2000.0)
+            self.track_window_region.setRegion((center - half, center + half))
+            self.track_window_region.setVisible(True)
+        finally:
+            self._syncing_tracking_controls = False
+
+    def _on_track_window_spin_changed(self, value: float) -> None:
+        if self._syncing_tracking_controls or self.state is None:
+            return
+        sg = self.get_target_unit()
+        if sg is None:
+            return
+        sg.tracking_window_ms = float(value)
+        if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+            sg.event.annotations["tracking_window_ms"] = float(value)
+        sg._template_matcher = None
+        self._update_tracking_controls(sg)
+        if hasattr(self.state, "onUnitParamsChanged"):
+            self.state.onUnitParamsChanged.emit(self.get_target_unit_idx())
+
+    def _on_track_region_changed(self) -> None:
+        if self._syncing_tracking_controls or self.state is None:
+            return
+        sg = self.get_target_unit()
+        if sg is None:
+            return
+        lo, hi = self.track_window_region.getRegion()
+        width_ms = abs(float(hi) - float(lo)) * 1000.0
+        if width_ms < 0.1:
+            return
+        sg.tracking_window_ms = float(width_ms)
+        if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+            sg.event.annotations["tracking_window_ms"] = float(width_ms)
+        sg._template_matcher = None
+        self._syncing_tracking_controls = True
+        try:
+            with QSignalBlocker(self.track_window_spin):
+                self.track_window_spin.setValue(float(width_ms))
+        finally:
+            self._syncing_tracking_controls = False
+        if hasattr(self.state, "onUnitParamsChanged"):
+            self.state.onUnitParamsChanged.emit(self.get_target_unit_idx())
+
+    def _on_track_overlay_visibility_changed(self, *args) -> None:
+        self._update_tracking_controls()
+        self._update_template_curve()
+
+    def _update_template_curve(
+        self, sg: Optional[tracked_neuron_unit] = None
+    ) -> None:
+        """Draw the convolution template currently used for this unit."""
+        if self.template_curve is None:
+            return
+        if not self.show_template_check.isChecked() or not self._templates:
+            self.template_curve.setVisible(False)
+            return
+        if sg is None:
+            sg = self.get_target_unit()
+
+        primary = (
+            self.channel_bar.get_primary_channel()
+            if hasattr(self, "channel_bar")
+            else ""
+        )
+        tpl = self._templates.get(primary) if primary else None
+        if tpl is None:
+            tpl = next(iter(self._templates.values()))
+        tpl = np.asarray(tpl, dtype=np.float64).ravel()
+        if tpl.size < 2 or not np.all(np.isfinite(tpl)):
+            self.template_curve.setVisible(False)
+            return
+
+        lo = float(np.min(tpl))
+        hi = float(np.max(tpl))
+        if hi - lo < 1e-12:
+            self.template_curve.setVisible(False)
+            return
+
+        y = 0.05 + 0.90 * (tpl - lo) / (hi - lo)
+        sr = self._sampling_rate_hz()
+        if sr <= 0:
+            self.template_curve.setVisible(False)
+            return
+
+        center = self._target_tracking_center_s(
+            sg, int(self.state.stimno), sr
+        ) if self.state is not None else None
+        start_s = (center - 0.010) if center is not None else 0.0
+        x = start_s + np.arange(tpl.size) / sr
+        self.template_curve.setData(x=x, y=y)
+        self.template_curve.setVisible(True)
+
     def _apply_conv_peaks(self, peaks: Optional[np.ndarray]):
         """Draw convolution peaks using a single pair-connected curve."""
         if self.conv_curve is None:
@@ -914,6 +1162,53 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
 
         self._set_marker_lines(cur_latency, _nearest(-1), _nearest(1))
 
+    def _update_candidate_overlay(self, stimno: int, dpts_mag, sr: float):
+        if not hasattr(self, "candidate_line"):
+            return
+        candidate = (
+            self.state.get_active_candidate()
+            if self.state is not None and hasattr(self.state, "get_active_candidate")
+            else None
+        )
+        if candidate is None:
+            self.candidate_line.setVisible(False)
+            self.candidate_marker.clear()
+            self.candidate_marker.setVisible(False)
+            return
+        primary = (
+            self.channel_bar.get_primary_channel()
+            if hasattr(self, "channel_bar") and self.channel_bar is not None
+            else getattr(getattr(self.state, "analog_signal", None), "name", "")
+        )
+        if candidate.channel and primary and candidate.channel != primary:
+            self.candidate_line.setVisible(False)
+            self.candidate_marker.clear()
+            self.candidate_marker.setVisible(False)
+            return
+        sr = float(sr) or 1.0
+        center_s = float(candidate.latency_center_samples) / sr
+        self.candidate_line.setValue(center_s)
+        self.candidate_line.setVisible(True)
+        item = None
+        idx_arr = getattr(candidate.unit, "idx_arr", None) or []
+        if 0 <= int(stimno) < len(idx_arr):
+            item = idx_arr[int(stimno)]
+        if item is not None:
+            sample = int(item[0] if isinstance(item, (tuple, list)) else item)
+            if 0 <= sample < len(dpts_mag):
+                self.candidate_marker.setData(
+                    x=[sample / sr],
+                    y=[float(dpts_mag[sample])],
+                    size=11,
+                    symbol="o",
+                    pen=pg.mkPen((255, 170, 0), width=1.8),
+                    brush=pg.mkBrush(255, 170, 0, 40),
+                )
+                self.candidate_marker.setVisible(True)
+                return
+        self.candidate_marker.clear()
+        self.candidate_marker.setVisible(False)
+
     def _on_histogram_result(self, result: Dict[str, Any], error: str):
         """Handle completed histogram computation."""
         if error or not result:
@@ -943,6 +1238,7 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self._templates = result or {}
         if self.conv is not None:
             self.conv.clear_cache()
+        self._update_template_curve()
         if not getattr(self.state, "is_streaming", False):
             self.update_figure(force=True)
 
@@ -1169,8 +1465,30 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         ug_idx = self.get_target_unit_idx()
         primary_ch = self.channel_bar.get_primary_channel() if hasattr(self, "channel_bar") else ""
         aux_chans = tuple(sorted(self.channel_bar.get_selected_channels())) if hasattr(self, "channel_bar") else ()
+        candidate = (
+            self.state.get_active_candidate()
+            if hasattr(self.state, "get_active_candidate")
+            else None
+        )
+        candidate_key = (
+            (
+                int(candidate.candidate_id),
+                int(candidate.hit_count),
+                int(candidate.latency_center_samples),
+            )
+            if candidate is not None
+            else None
+        )
 
-        render_key = (stimno, len(erp), primary_ch, aux_chans, ug_idx, ug_spikes)
+        render_key = (
+            stimno,
+            len(erp),
+            primary_ch,
+            aux_chans,
+            ug_idx,
+            ug_spikes,
+            candidate_key,
+        )
         if not force and getattr(self, "_last_render_key", None) == render_key:
             return
         self._last_render_key = render_key
@@ -1208,6 +1526,9 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         # Update sweep label and markers in place (no item churn)
         self._update_sweep_label(stimno)
         self._update_spike_markers()
+        self._update_candidate_overlay(stimno, dpts_mag, sr)
+        self._update_tracking_controls(ug)
+        self._update_template_curve(ug)
 
         # During live streaming the worker supplies convolution peaks; only
         # compute the fallback for offline/interactive paths.
@@ -1352,6 +1673,8 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         res = {
             "xlim": self.main_plot.viewRange()[0],
             "separate_axes": self._separate_axes,
+            "show_track_window": self.show_track_window_check.isChecked(),
+            "show_template": self.show_template_check.isChecked(),
         }
         if hasattr(self, "channel_bar") and self.channel_bar is not None:
             res["channel_bar"] = self.channel_bar.get_settings()
@@ -1363,10 +1686,20 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             if hasattr(self, "separate_axes_check"):
                 with QSignalBlocker(self.separate_axes_check):
                     self.separate_axes_check.setChecked(self._separate_axes)
+        if "show_track_window" in values:
+            with QSignalBlocker(self.show_track_window_check):
+                self.show_track_window_check.setChecked(
+                    bool(values["show_track_window"])
+                )
+        if "show_template" in values:
+            with QSignalBlocker(self.show_template_check):
+                self.show_template_check.setChecked(bool(values["show_template"]))
         if "xlim" in values:
             self.main_plot.setXRange(values["xlim"][0], values["xlim"][1], padding=0)
         if "channel_bar" in values and hasattr(self, "channel_bar") and self.channel_bar is not None:
             self.channel_bar.set_settings(values["channel_bar"])
+        self._update_tracking_controls()
+        self._update_template_curve()
 
     def closeEvent(self, event):
         self.unset_connections()

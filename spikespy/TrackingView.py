@@ -23,10 +23,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .basic_tracking import track_basic, track_sweep_waveform
+from .basic_tracking import track_basic
 from .dsp.detectors import DetectorParamSpec, SpikeDetectorRegistry
 from .ViewerState import ViewerState
-from .live_orchestrator import BatchingMode
 from .helpers import qsignal_throttle
 from neo import Event
 
@@ -140,6 +139,17 @@ class TrackingView(QMainWindow):
         self.qbut_track_all.clicked.connect(self.track_all_enabled_units)
         layout.addRow(self.qbut_track_all)
 
+        self.qbut_fill_missing = QPushButton("Fill Missing Spikes (This Unit)")
+        self.qbut_fill_missing.setToolTip(
+            "Run the selected algorithm between existing spikes to fill gaps; "
+            "existing annotations are kept as anchors."
+        )
+        self.qbut_fill_missing.clicked.connect(self.fill_missing_spikes)
+        layout.addRow(self.qbut_fill_missing)
+
+        self.lbl_status = QLabel("")
+        layout.addRow(self.lbl_status)
+
         main_vbox.addLayout(layout)
         w = QWidget()
         w.setLayout(main_vbox)
@@ -195,16 +205,6 @@ class TrackingView(QMainWindow):
                 sig = getattr(self.state, sig_name)
                 sig.connect(self._on_state_unit_sync)
                 self._state_connections.append((sig, self._on_state_unit_sync))
-
-        orch = getattr(self.state, "live_orchestrator", None)
-        if orch is not None:
-            orch.register(
-                f"trackingview_{id(self)}",
-                "auto_track",
-                self._live_tracking_fn,
-                self._on_live_tracking_result,
-                batching=BatchingMode.BATCH,
-            )
 
         self.sync_from_active_unit()
 
@@ -400,6 +400,12 @@ class TrackingView(QMainWindow):
             if not hasattr(sg, "tracking_params") or sg.tracking_params is None:
                 sg.tracking_params = {}
             sg.tracking_params.update(extra_params)
+            sg._template_matcher = None
+            if track_val and getattr(self.state, "is_streaming", False):
+                try:
+                    self.state.ensure_live_tracking_processor()
+                except Exception:
+                    pass
 
             if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
                 sg.event.annotations["tracking_algorithm"] = algo_val
@@ -424,6 +430,8 @@ class TrackingView(QMainWindow):
         win_val = float(self.qsb_window_size.value())
         thresh_val = float(self.qsb_threshold.value())
         skip_val = int(self.qsb_max_skip.value())
+        limit_val = int(self.qsb_track_limit.value())
+        track_val = bool(self.qcb_auto_track.isChecked())
         extra_params = self._read_extra_params()
         self._updating_ui = True
         try:
@@ -432,21 +440,36 @@ class TrackingView(QMainWindow):
                 sg.tracking_window_ms = win_val
                 sg.tracking_threshold_mv = thresh_val
                 sg.tracking_max_skips = skip_val
+                sg.track_limit = limit_val
+                sg.auto_track = track_val
                 if not hasattr(sg, "tracking_params") or sg.tracking_params is None:
                     sg.tracking_params = {}
                 sg.tracking_params.update(extra_params)
+                sg._template_matcher = None
                 if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
                     sg.event.annotations["tracking_algorithm"] = algo_val
                     sg.event.annotations["tracking_window_ms"] = win_val
                     sg.event.annotations["tracking_threshold_mv"] = thresh_val
                     sg.event.annotations["tracking_max_skips"] = skip_val
-                    sg.event.annotations["tracking_params"] = dict(sg.tracking_params)
+                    sg.event.annotations["track_limit"] = limit_val
+                    sg.event.annotations["auto_track"] = track_val
+                    sg.event.annotations["tracking_params"] = dict(
+                        sg.tracking_params
+                    )
+
+            if track_val and getattr(self.state, "is_streaming", False):
+                try:
+                    self.state.ensure_live_tracking_processor()
+                except Exception:
+                    pass
+
             if hasattr(self.state, "onUnitParamsChanged"):
                 self.state.onUnitParamsChanged.emit(-1)
             elif hasattr(self.state, "onUnitGroupChange"):
                 self.state.onUnitGroupChange.emit()
         finally:
             self._updating_ui = False
+
 
     def enable_all_units_tracking(self):
         """Enable auto-tracking for all units and notify views."""
@@ -499,94 +522,17 @@ class TrackingView(QMainWindow):
             return
         self.state.track_stimulus_all_units(stimno)
 
-    def _live_tracking_fn(self, batch):
-        """Runs on the orchestrator worker thread for a batch of new sweeps."""
-        state = self.state
-        detections = []
-        if state is None or state.event_signal is None or not batch.items:
-            return detections
-
-        sr = float(
-            state.sampling_rate
-            if state.sampling_rate is not None
-            else 30000.0
-        )
-        window_size = state.window_size
-
-        units = [
-            (i, sg)
-            for i, sg in enumerate(state.spike_groups)
-            if getattr(sg, "auto_track", False)
-        ]
-        if not units:
-            return detections
-
-        for item in batch.items:
-            stimno = item.stim_index
-            if stimno < 0 or stimno >= len(state.event_signal):
-                continue
-            for unit_idx, sg in units:
-                if sg.get_sweep_sample(stimno, state.event_signal, sr, window_size) is not None:
-                    continue
-                ch = (
-                    getattr(sg, "tracking_channel", "")
-                    or getattr(sg, "channel", "")
-                )
-                row = item.erp_row(ch) if ch else None
-                if row is None or row.size == 0:
-                    continue
-                sig_units = getattr(getattr(state, "analog_signal", None), "units", None)
-                if sig_units is not None:
-                    row = row * sig_units
-
-                prev_latency = None
-                max_skips = getattr(sg, "tracking_max_skips", 1)
-                min_stim = max(0, stimno - 1 - max_skips)
-                for prev_s in range(stimno - 1, min_stim - 1, -1):
-                    prev_sample = sg.get_sweep_sample(
-                        prev_s, state.event_signal, sr, window_size
-                    )
-                    if prev_sample is not None:
-                        prev_latency = (prev_sample / sr) * pq.s
-                        break
-                    idx_arr = getattr(sg, "idx_arr", None)
-                    if idx_arr is not None and prev_s < len(idx_arr) and idx_arr[prev_s] is not None:
-                        prev_latency = (idx_arr[prev_s][0] / sr) * pq.s
-                        break
-                if prev_latency is None:
-                    continue
-
-                algo = getattr(sg, "tracking_algorithm", "basic") or "basic"
-                unit_params = getattr(sg, "tracking_params", {}) or {}
-                detected = track_sweep_waveform(
-                    row,
-                    sr,
-                    prev_latency,
-                    threshold=getattr(sg, "tracking_threshold_mv", 0.01),
-                    window_ms=getattr(sg, "tracking_window_ms", 5.0),
-                    algorithm=algo,
-                    params=unit_params,
-                    template_matcher=getattr(sg, "_template_matcher", None),
-                )
-                if detected is not None:
-                    detections.append((unit_idx, int(detected), int(stimno)))
-
-        return detections
-
-    def _on_live_tracking_result(self, detections, error):
-        """Applies orchestrator detections on the GUI thread."""
-        if error or not detections or self.state is None:
+    def fill_missing_spikes(self):
+        """Fill gaps between existing annotations for the active unit."""
+        if self.state is None:
             return
-        for unit_idx, detected_sample, stimno in detections:
-            self.state.setUnit(detected_sample, stimno=stimno, unit_idx=unit_idx, save_undo=False)
+        unit_idx = getattr(self.state, "cur_spike_group", 0)
+        added = self.state.track_unit_range(unit_idx, only_missing=True)
+        self.lbl_status.setText(f"Filled {len(added)} missing spike(s)")
+        self.sync_from_active_unit()
 
     def closeEvent(self, event):
         self.unset_connections()
-        state = getattr(self, "state", None)
-        if state is not None:
-            orch = getattr(state, "live_orchestrator", None)
-            if orch is not None:
-                orch.unregister(f"trackingview_{id(self)}")
         super().closeEvent(event)
 
     def updateThresholdFromUnit(self):
