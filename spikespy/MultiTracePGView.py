@@ -92,6 +92,8 @@ class ChannelPlotPanel:
         tracked_unit_scatter: pg.ScatterPlotItem,
         empty_text_item: pg.TextItem,
         time_axis: Optional[EphysTimeAxisItem] = None,
+        highlight_segments: Optional[pg.PlotDataItem] = None,
+        points_scatter: Optional[pg.ScatterPlotItem] = None,
     ):
         self.slot_idx: int = slot_idx
         self.channel_name: Optional[str] = channel_name
@@ -99,6 +101,8 @@ class ChannelPlotPanel:
         self.img_item: pg.ImageItem = img_item
         self.lines_curve: pg.PlotDataItem = lines_curve
         self.active_sweep_curve: pg.PlotDataItem = active_sweep_curve
+        self.highlight_segments: Optional[pg.PlotDataItem] = highlight_segments
+        self.points_scatter: Optional[pg.ScatterPlotItem] = points_scatter
         self.stim_line: pg.InfiniteLine = stim_line
         self.tracked_unit_scatter: pg.ScatterPlotItem = tracked_unit_scatter
         self.other_unit_scatters: List[pg.ScatterPlotItem] = []
@@ -107,6 +111,12 @@ class ChannelPlotPanel:
         self.time_axis: Optional[EphysTimeAxisItem] = time_axis
         self.std: float = 1.0
         self.has_data: bool = False
+
+        # Independent X-axis linking, unit pinning, and window groups
+        self.x_linked: bool = True
+        self.pinned_unit_idx: Optional[int] = None
+        self.window_width_ms: float = 20.0
+        self.window_group: Optional[str] = None
 
 
 class SummaryLinePanel:
@@ -158,7 +168,15 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.state: Optional[ViewerState] = None
         self.mode: str = "heatmap"
         self.lock_to_stim: bool = False
+        self.fixed_height: bool = False
+        self.y_axis_mode: str = "sweep"
+        self.n_lines_pre: int = 5
+        self.n_lines_post: int = 5
+        self.time_window_s: float = 10.0
+        self.post_seconds: float = 0.0
+        self.scale: float = 1.0
         self.scale_mode: str = "std"
+        self.link_x_axis: bool = True
         self.std: float = 1.0
         self.rightPlots: Dict[str, bool] = {}
         self.right_plots: Dict[str, pg.PlotItem] = {}
@@ -267,7 +285,15 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     def _build_toolbars(self):
         toolbar = QToolBar("Controls", self)
 
-        # Contrast Min/Max Spinners
+        # Scale & Contrast Spinners
+        self.scale_spinner = QDoubleSpinBox(self)
+        self.scale_spinner.setDecimals(4)
+        self.scale_spinner.setRange(0.0001, 1000.0)
+        self.scale_spinner.setSingleStep(0.05)
+        self.scale_spinner.setValue(self.scale)
+        self.scale_spinner.setMinimumWidth(80)
+        self.scale_spinner.valueChanged.connect(self._on_scale_changed)
+
         self.lowerSpinBox = QDoubleSpinBox(self)
         self.lowerSpinBox.setDecimals(2)
         self.lowerSpinBox.setSingleStep(0.1)
@@ -287,15 +313,18 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.lowerSpinBox.valueChanged.connect(self.upperSpinBox.setMinimum)
         self.upperSpinBox.valueChanged.connect(self.lowerSpinBox.setMaximum)
 
-        toolbar.addWidget(QLabel("Colour scale: "))
+        toolbar.addWidget(QLabel("Scale: "))
         self.scale_mode_combo = QComboBox(self)
         self.scale_mode_combo.addItems(["std", "mV"])
         self.scale_mode_combo.setCurrentText(getattr(self, "scale_mode", "std"))
         self.scale_mode_combo.currentTextChanged.connect(self._on_scale_mode_changed)
         toolbar.addWidget(self.scale_mode_combo)
-        toolbar.addWidget(QLabel("Min"))
+        toolbar.addWidget(self.scale_spinner)
+        self.contrast_min_label = QLabel("Min")
+        self.contrast_max_label = QLabel("Max")
+        toolbar.addWidget(self.contrast_min_label)
         toolbar.addWidget(self.lowerSpinBox)
-        toolbar.addWidget(QLabel("Max"))
+        toolbar.addWidget(self.contrast_max_label)
         toolbar.addWidget(self.upperSpinBox)
         toolbar.addSeparator()
 
@@ -312,9 +341,37 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         toolbar.addWidget(self.includeAllUnitsCheckBox)
         toolbar.addSeparator()
 
-        # Mode Radio Buttons
+        # Mode Radio Buttons & Fixed Height & Y-Axis Mode
         self.lock_to_stimCheckBox = QCheckBox("lock")
         self.lock_to_stimCheckBox.stateChanged.connect(self._on_lock_changed)
+
+        self.fixed_height_checkbox = QCheckBox("Fixed Height")
+        self.fixed_height_checkbox.setChecked(self.fixed_height)
+        self.fixed_height_checkbox.stateChanged.connect(self._on_fixed_height_changed)
+
+        self.y_axis_combo = QComboBox(self)
+        self.y_axis_combo.addItems(["Sweep", "Time"])
+        self.y_axis_combo.setCurrentText("Time" if self.y_axis_mode == "time" else "Sweep")
+        self.y_axis_combo.currentTextChanged.connect(self._on_y_axis_mode_changed)
+
+        self.pre_label = QLabel("Pre:")
+        self.pre_spinner = QSpinBox(self)
+        self.pre_spinner.setRange(0, 500)
+        self.pre_spinner.setValue(self.n_lines_pre)
+        self.pre_spinner.valueChanged.connect(self._on_pre_changed)
+
+        self.post_label = QLabel("Post:")
+        self.post_spinner = QSpinBox(self)
+        self.post_spinner.setRange(0, 500)
+        self.post_spinner.setValue(self.n_lines_post)
+        self.post_spinner.valueChanged.connect(self._on_post_changed)
+
+        self.time_window_label = QLabel("Window:")
+        self.time_window_spinner = QDoubleSpinBox(self)
+        self.time_window_spinner.setRange(0.1, 3600.0)
+        self.time_window_spinner.setValue(self.time_window_s)
+        self.time_window_spinner.setSuffix(" s")
+        self.time_window_spinner.valueChanged.connect(self._on_time_window_changed)
 
         linesRadio = QRadioButton("lines")
         heatmapRadio = QRadioButton("heatmap")
@@ -335,18 +392,27 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 self.mode = "lines"
             elif unitOnlyRadio.isChecked():
                 self.mode = "unitonly"
+            self._update_toolbar_visibility()
             self.setup_figure()
 
         self.butgrp.buttonToggled.connect(on_mode_toggle)
 
         toolbar.addWidget(QLabel("Mode:"))
         toolbar.addWidget(self.lock_to_stimCheckBox)
+        toolbar.addWidget(self.fixed_height_checkbox)
+        toolbar.addWidget(self.y_axis_combo)
+        toolbar.addWidget(self.pre_label)
+        toolbar.addWidget(self.pre_spinner)
+        toolbar.addWidget(self.post_label)
+        toolbar.addWidget(self.post_spinner)
+        toolbar.addWidget(self.time_window_label)
+        toolbar.addWidget(self.time_window_spinner)
         toolbar.addWidget(linesRadio)
         toolbar.addWidget(heatmapRadio)
         toolbar.addWidget(unitOnlyRadio)
         toolbar.addSeparator()
 
-        # Channel Display Controls (Add, Remove, Group Size N, Presets)
+        # Channel Display Controls (Add, Remove, Group Size N, Presets, Link X)
         toolbar.addWidget(QLabel("Channels: "))
 
         self.btn_add_channel = QToolButton(self)
@@ -377,6 +443,12 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.btn_presets.setToolTip("Quick group size presets (1-Ch, 2-Ch, 4-Ch Tetrode, 8-Ch)")
         self.btn_presets.setPopupMode(QToolButton.InstantPopup)
         toolbar.addWidget(self.btn_presets)
+
+        self.link_x_checkbox = QCheckBox("Link X")
+        self.link_x_checkbox.setChecked(self.link_x_axis)
+        self.link_x_checkbox.setToolTip("Link horizontal time/sample zooming across channels")
+        self.link_x_checkbox.stateChanged.connect(self._on_link_x_changed)
+        toolbar.addWidget(self.link_x_checkbox)
 
         self._build_channel_menus()
         toolbar.addSeparator()
@@ -432,6 +504,71 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
         self.addToolBarBreak()
         self.addToolBar(Qt.TopToolBarArea, toolbar)
+        self._update_toolbar_visibility()
+
+    def _on_scale_changed(self, val: float):
+        self.scale = float(val)
+        if self.mode == "lines":
+            self.setup_figure()
+
+    def _on_fixed_height_changed(self, state):
+        self.fixed_height = bool(state)
+        self._update_toolbar_visibility()
+        if self.state and self.state.stimno is not None:
+            self.update_ylim(self.state.stimno)
+        self.setup_figure()
+
+    def _on_y_axis_mode_changed(self, mode_text: str):
+        self.y_axis_mode = mode_text.lower()
+        self._update_toolbar_visibility()
+        if self.state and self.state.stimno is not None:
+            self.update_ylim(self.state.stimno)
+        self.setup_figure()
+
+    def _on_pre_changed(self, val: int):
+        self.n_lines_pre = int(val)
+        if self.fixed_height and self.state and self.state.stimno is not None:
+            self.update_ylim(self.state.stimno)
+            self.setup_figure()
+
+    def _on_post_changed(self, val: int):
+        self.n_lines_post = int(val)
+        if self.fixed_height and self.state and self.state.stimno is not None:
+            self.update_ylim(self.state.stimno)
+            self.setup_figure()
+
+    def _on_time_window_changed(self, val: float):
+        self.time_window_s = float(val)
+        if self.fixed_height and self.state and self.state.stimno is not None:
+            self.update_ylim(self.state.stimno)
+            self.setup_figure()
+
+    def _on_link_x_changed(self, state):
+        self.link_x_axis = bool(state)
+        self._update_axis_linking()
+
+    def _update_toolbar_visibility(self):
+        is_lines = self.mode == "lines"
+        is_fixed = getattr(self, "fixed_height", False)
+        is_time = getattr(self, "y_axis_mode", "sweep") == "time"
+
+        if hasattr(self, "scale_spinner"):
+            self.scale_spinner.setVisible(is_lines)
+        if hasattr(self, "contrast_min_label"):
+            self.contrast_min_label.setVisible(not is_lines)
+            self.contrast_max_label.setVisible(not is_lines)
+            self.lowerSpinBox.setVisible(not is_lines)
+            self.upperSpinBox.setVisible(not is_lines)
+
+        if hasattr(self, "pre_label"):
+            self.pre_label.setVisible(is_fixed and not is_time)
+            self.pre_spinner.setVisible(is_fixed and not is_time)
+            self.post_label.setVisible(is_fixed and not is_time)
+            self.post_spinner.setVisible(is_fixed and not is_time)
+
+        if hasattr(self, "time_window_label"):
+            self.time_window_label.setVisible(is_fixed and is_time)
+            self.time_window_spinner.setVisible(is_fixed and is_time)
 
     def _build_channel_menus(self):
         # + Channel menu
@@ -543,6 +680,58 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         menu.addSeparator()
         act_add = menu.addAction("+ Add Channel Screen...")
         act_add.triggered.connect(self.add_empty_slot)
+
+        # X-Axis Linking & Pinning Submenu
+        menu.addSeparator()
+        x_menu = menu.addMenu("X-Axis Linking & Pinning")
+
+        act_link = x_menu.addAction("Link X with Ch 1")
+        act_link.setCheckable(True)
+        act_link.setChecked(getattr(panel, "x_linked", True) and getattr(panel, "pinned_unit_idx", None) is None)
+        def toggle_x_link(checked):
+            panel.x_linked = checked
+            if checked:
+                panel.pinned_unit_idx = None
+            self._update_axis_linking()
+            self._update_channel_titles()
+            self.setup_figure()
+        act_link.triggered.connect(toggle_x_link)
+
+        pin_menu = x_menu.addMenu("Pin X to Unit Latency...")
+        act_unpin = pin_menu.addAction("Unpinned (Free)")
+        act_unpin.setCheckable(True)
+        act_unpin.setChecked(getattr(panel, "pinned_unit_idx", None) is None)
+        act_unpin.triggered.connect(lambda: self._pin_channel_to_unit(panel.slot_idx, None))
+
+        if self.state and hasattr(self.state, "spike_groups"):
+            sr = float(self.state.sampling_rate) if self.state.sampling_rate else 10000.0
+            for u_i, sg in enumerate(self.state.spike_groups):
+                u_name = getattr(sg.event, "name", str(u_i)) or str(u_i)
+                approx_lat = ""
+                if getattr(sg, "idx_arr", None) is not None:
+                    valid_samples = [float(a[0]) for a in sg.idx_arr if a is not None]
+                    if valid_samples:
+                        approx_lat = f" (~{np.median(valid_samples) / sr * 1000.0:.1f} ms)"
+                act_u = pin_menu.addAction(f"Unit {u_i}: {u_name}{approx_lat}")
+                act_u.setCheckable(True)
+                act_u.setChecked(getattr(panel, "pinned_unit_idx", None) == u_i)
+                act_u.triggered.connect(lambda chk=False, s_idx=panel.slot_idx, u_idx=u_i: self._pin_channel_to_unit(s_idx, u_idx))
+
+        act_width = pin_menu.addAction(f"Window Width: {panel.window_width_ms:.1f} ms...")
+        def set_window_w():
+            val, ok = QInputDialog.getDouble(self, "Window Width", "Window width around latency (ms):", panel.window_width_ms, 0.5, 1000.0, 1)
+            if ok:
+                panel.window_width_ms = float(val)
+                self._apply_pinned_unit_windows()
+        act_width.triggered.connect(set_window_w)
+
+        grp_menu = x_menu.addMenu("Window Group...")
+        for g_name in [None, "Group A", "Group B", "Group C"]:
+            label = "None (Independent)" if g_name is None else g_name
+            act_g = grp_menu.addAction(label)
+            act_g.setCheckable(True)
+            act_g.setChecked(getattr(panel, "window_group", None) == g_name)
+            act_g.triggered.connect(lambda chk=False, s_idx=panel.slot_idx, g=g_name: self._set_channel_window_group(s_idx, g))
 
         if hasattr(self, "channel_bar") and self.channel_bar is not None:
             menu.addSeparator()
@@ -691,8 +880,111 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         status = f"({stat_name})" if has_data else "(No data)"
         return f"{star}[{slot_label}] {ch_name} {status}"
 
+    def _pin_channel_to_unit(self, slot_idx: int, unit_idx: Optional[int]):
+        if 0 <= slot_idx < len(self.channel_panels):
+            p = self.channel_panels[slot_idx]
+            p.pinned_unit_idx = unit_idx
+            if unit_idx is not None:
+                p.x_linked = False
+            else:
+                p.x_linked = True
+            self._update_axis_linking()
+            self._apply_pinned_unit_windows()
+            self._update_channel_titles()
+
+    def _set_channel_window_group(self, slot_idx: int, group_name: Optional[str]):
+        if 0 <= slot_idx < len(self.channel_panels):
+            p = self.channel_panels[slot_idx]
+            p.window_group = group_name
+            self._update_axis_linking()
+            self._update_channel_titles()
+
+    def _update_channel_titles(self):
+        primary_ch = self.channel_bar.get_primary_channel() if hasattr(self, "channel_bar") and self.channel_bar else ""
+        for i, p in enumerate(self.channel_panels):
+            title = self._format_channel_title(i, len(self.channel_panels), p.channel_name, primary_ch, panel=p)
+            p.plot.setTitle(title, color="#333", size="9pt")
+
+    def _update_axis_linking(self):
+        if not self.channel_panels:
+            return
+        leader_0 = self.channel_panels[0].plot
+
+        group_leaders: Dict[str, pg.PlotItem] = {}
+        for p in self.channel_panels:
+            if p.window_group:
+                if p.window_group not in group_leaders:
+                    group_leaders[p.window_group] = p.plot
+
+        for i, panel in enumerate(self.channel_panels):
+            if i > 0:
+                panel.plot.setYLink(leader_0)
+
+            if not getattr(self, "link_x_axis", True) or not getattr(panel, "x_linked", True) or getattr(panel, "pinned_unit_idx", None) is not None:
+                panel.plot.setXLink(None)
+            elif panel.window_group:
+                leader = group_leaders.get(panel.window_group)
+                if leader is not None and leader is not panel.plot:
+                    panel.plot.setXLink(leader)
+                else:
+                    panel.plot.setXLink(None)
+            else:
+                if i > 0:
+                    panel.plot.setXLink(leader_0)
+                else:
+                    panel.plot.setXLink(None)
+
+    def _apply_pinned_unit_windows(self):
+        if self.state is None or not hasattr(self.state, "spike_groups"):
+            return
+        sr = float(self.state.sampling_rate) if self.state.sampling_rate else 10000.0
+        cur_stim = self.state.stimno if self.state.stimno is not None else 0
+
+        for panel in self.channel_panels:
+            u_idx = getattr(panel, "pinned_unit_idx", None)
+            if u_idx is None or not (0 <= u_idx < len(self.state.spike_groups)):
+                continue
+            sg = self.state.spike_groups[u_idx]
+
+            center_sample = None
+            if getattr(sg, "idx_arr", None) is not None and 0 <= cur_stim < len(sg.idx_arr):
+                entry = sg.idx_arr[cur_stim]
+                if entry is not None:
+                    center_sample = float(entry[0])
+
+            if center_sample is None and getattr(sg, "idx_arr", None) is not None:
+                valid_samples = [float(a[0]) for a in sg.idx_arr if a is not None]
+                if valid_samples:
+                    center_sample = float(np.median(valid_samples))
+
+            if center_sample is None and hasattr(sg, "get_latencies") and self.state.event_signal is not None:
+                lats = sg.get_latencies(self.state.event_signal)
+                valid_lats = [float(l.rescale("s").magnitude) * sr for l in lats if not np.isnan(l)]
+                if valid_lats:
+                    center_sample = float(np.median(valid_lats))
+
+            if center_sample is not None:
+                half_w_samples = (panel.window_width_ms / 1000.0) * sr / 2.0
+                panel.plot.setXRange(center_sample - half_w_samples, center_sample + half_w_samples, padding=0)
+
+    def _get_stim_times_s(self) -> Optional[np.ndarray]:
+        if self.state is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
+            return None
+        try:
+            ev = self.state.event_signal
+            if hasattr(ev, "times"):
+                times = ev.times
+                if hasattr(times, "rescale"):
+                    return np.asarray(times.rescale(pq.s).magnitude, dtype=float)
+                return np.asarray(times, dtype=float)
+            elif hasattr(ev, "rescale"):
+                return np.asarray(ev.rescale(pq.s).magnitude, dtype=float)
+            return np.asarray(ev, dtype=float)
+        except Exception:
+            return None
+
     def _format_channel_title(
-        self, slot_idx: int, total_n: int, ch_name: Optional[str], primary_ch: str = ""
+        self, slot_idx: int, total_n: int, ch_name: Optional[str], primary_ch: str = "", panel: Optional[ChannelPlotPanel] = None
     ) -> str:
         """Format informative label linking channel to its channel group position (N in group with label)."""
         star = "★ " if ch_name and ch_name == primary_ch else ""
@@ -706,7 +998,18 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             has_data = erp is not None and len(erp) > 0
 
         status = "" if has_data else " (No data)"
-        return f"{star}[{slot_label}] {ch_name}{status}"
+
+        extra = ""
+        if panel is not None:
+            if getattr(panel, "pinned_unit_idx", None) is not None and self.state and 0 <= panel.pinned_unit_idx < len(self.state.spike_groups):
+                u_name = getattr(self.state.spike_groups[panel.pinned_unit_idx].event, "name", str(panel.pinned_unit_idx))
+                extra = f" [Pin: Unit {u_name}]"
+            elif getattr(panel, "window_group", None):
+                extra = f" [{panel.window_group}]"
+            elif not getattr(panel, "x_linked", True):
+                extra = " [X-Detached]"
+
+        return f"{star}[{slot_label}] {ch_name}{status}{extra}"
 
     def _rebuild_channel_panels(self):
         """Construct or adjust per-channel PlotItems side-by-side in self.glw."""
@@ -737,8 +1040,9 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             for i, p in enumerate(self.channel_panels):
                 p.slot_idx = i
                 p.channel_name = self.displayed_channels[i]
-                title = self._format_channel_title(i, target_n, p.channel_name, primary_ch)
+                title = self._format_channel_title(i, target_n, p.channel_name, primary_ch, panel=p)
                 p.plot.setTitle(title, color="#333", size="9pt")
+            self._update_axis_linking()
             self.plot_right_axis()
             return
 
@@ -775,10 +1079,11 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self.glw.ci.layout.setColumnStretchFactor(i, 3)
 
             if i == 0:
-                plot.setLabel("left", "Stimulus #")
+                if getattr(self, "y_axis_mode", "sweep") == "time":
+                    plot.setLabel("left", "Time", units="s")
+                else:
+                    plot.setLabel("left", "Stimulus #")
             else:
-                plot.setYLink(self.channel_panels[0].plot)
-                plot.setXLink(self.channel_panels[0].plot)
                 plot.getAxis("left").setStyle(showValues=False)
 
             title = self._format_channel_title(i, target_n, ch_name, primary_ch)
@@ -790,12 +1095,19 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             plot.addItem(img_item)
 
             # 2. Lines mode curves
-            lines_curve = pg.PlotDataItem(pen=pg.mkPen(color=(128, 128, 128), width=1), connect="finite")
+            lines_curve = pg.PlotDataItem(pen=pg.mkPen(color=(150, 150, 150), width=1), connect="finite")
             active_sweep_curve = pg.PlotDataItem(pen=pg.mkPen(color="purple", width=2))
+            highlight_segments = pg.PlotDataItem(pen=pg.mkPen(color="red", width=2), connect="finite")
+            points_scatter = pg.ScatterPlotItem(size=8, symbol="o", brush=pg.mkBrush("black"), pen=None)
+
             plot.addItem(lines_curve)
             plot.addItem(active_sweep_curve)
+            plot.addItem(highlight_segments)
+            plot.addItem(points_scatter)
             lines_curve.setVisible(False)
             active_sweep_curve.setVisible(False)
+            highlight_segments.setVisible(False)
+            points_scatter.setVisible(False)
 
             # 3. Current stimulus cursor line
             stim_line = pg.InfiniteLine(angle=0, pen=pg.mkPen("purple", width=1.5), movable=False)
@@ -824,6 +1136,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 tracked_unit_scatter=tracked_scatter,
                 empty_text_item=empty_text,
                 time_axis=time_axis,
+                highlight_segments=highlight_segments,
+                points_scatter=points_scatter,
             )
             self.channel_panels.append(panel)
 
@@ -832,10 +1146,15 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.img_item = self.channel_panels[0].img_item
         self.lines_curve = self.channel_panels[0].lines_curve
         self.active_sweep_curve = self.channel_panels[0].active_sweep_curve
+        self.highlight_segments = self.channel_panels[0].highlight_segments
+        self.points_scatter = self.channel_panels[0].points_scatter
         self.stim_line = self.channel_panels[0].stim_line
         self.tracked_unit_scatter = self.channel_panels[0].tracked_unit_scatter
         self.other_unit_scatters = self.channel_panels[0].other_unit_scatters
         self.time_axis = self.channel_panels[0].time_axis
+
+        self._update_axis_linking()
+        self._apply_pinned_unit_windows()
 
         # Attach selector items to panel 0
         self.corridor_item = QtWidgets.QGraphicsPolygonItem()
@@ -1212,10 +1531,21 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         # Normal mode: single left-click selects stimulus sweep
         if event.button() == Qt.LeftButton:
             if not np.isnan(pos.y()):
-                stimno = int(round(pos.y()))
-                if self.state and self.state.event_signal is not None:
-                    if 0 <= stimno < len(self.state.event_signal):
-                        self.state.setStimNo(stimno)
+                if getattr(self, "y_axis_mode", "sweep") == "time":
+                    stim_times_s = self._get_stim_times_s()
+                    if stim_times_s is not None and len(stim_times_s) > 0:
+                        cur_stim = min(max(0, self.state.stimno if self.state else 0), len(stim_times_s) - 1)
+                        t_selected = stim_times_s[cur_stim]
+                        t_clicked = t_selected + pos.y()
+                        diffs = np.abs(stim_times_s - t_clicked)
+                        closest_stim = int(np.argmin(diffs))
+                        if self.state and self.state.event_signal is not None and 0 <= closest_stim < len(self.state.event_signal):
+                            self.state.setStimNo(closest_stim)
+                else:
+                    stimno = int(round(pos.y()))
+                    if self.state and self.state.event_signal is not None:
+                        if 0 <= stimno < len(self.state.event_signal):
+                            self.state.setStimNo(stimno)
 
     def _on_plot_mouse_moved(self, scene_pos):
         """Draw dynamic preview from the last point to cursor when selector is active."""
@@ -1861,7 +2191,27 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
 
     @quiet_fail
     def update_ylim(self, curStim: int):
-        if self.lock_to_stim and self.state and self.state.event_signal is not None:
+        if self.state is None or self.state.event_signal is None:
+            return
+        ch_n_sweeps = len(self.state.event_signal)
+
+        if getattr(self, "fixed_height", False):
+            if getattr(self, "y_axis_mode", "sweep") == "time":
+                stim_times_s = self._get_stim_times_s()
+                if stim_times_s is not None and len(stim_times_s) > 0:
+                    time_win = float(getattr(self, "time_window_s", 10.0))
+                    post_s = float(getattr(self, "post_seconds", 0.0))
+                    pad = max(time_win * 0.05, 0.1)
+                    y_top = -time_win - pad
+                    y_bottom = max(0.0, post_s) + pad
+                    self.main_plot.setYRange(y_top, y_bottom, padding=0)
+            else:
+                pre = int(getattr(self, "n_lines_pre", 5))
+                post = int(getattr(self, "n_lines_post", 5))
+                start = max(curStim - pre, 0)
+                stop = min(start + pre + post + 1, ch_n_sweeps)
+                self.main_plot.setYRange(start - 0.5, stop - 0.5, padding=0)
+        elif self.lock_to_stim:
             y_range = self.main_plot.viewRange()[1]
             w = max(abs(y_range[1] - y_range[0]) / 2, 2)
             self.main_plot.setYRange(curStim - w, curStim + w, padding=0)
@@ -1904,9 +2254,14 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         y_max = max(y_range)
         pad = max(10, int(abs(y_max - y_min) * 0.15))
 
+        stim_times_s = self._get_stim_times_s()
+        is_time = getattr(self, "y_axis_mode", "sweep") == "time" and stim_times_s is not None and len(stim_times_s) > 0
+        cur_stim = min(max(0, self.state.stimno if self.state.stimno is not None else 0), n_sweeps - 1)
+        t_selected = stim_times_s[cur_stim] if is_time and cur_stim < len(stim_times_s) else 0.0
+
         for i, panel in enumerate(self.channel_panels):
             ch_name = panel.channel_name
-            title = self._format_channel_title(i, N, ch_name, primary_ch)
+            title = self._format_channel_title(i, N, ch_name, primary_ch, panel=panel)
             panel.plot.setTitle(title, color="#333", size="9pt")
 
             erp = self.get_channel_erp_signal(ch_name) if ch_name else None
@@ -1916,6 +2271,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 panel.img_item.setVisible(False)
                 panel.lines_curve.setVisible(False)
                 panel.active_sweep_curve.setVisible(False)
+                panel.highlight_segments.setVisible(False)
+                panel.points_scatter.setVisible(False)
                 panel.stim_line.setVisible(False)
                 panel.tracked_unit_scatter.clear()
 
@@ -1941,54 +2298,194 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 vmin = panel.std * self.lowerSpinBox.value()
                 vmax = panel.std * self.upperSpinBox.value()
 
+            ch_n_sweeps, n_pts = erp_mag.shape
+
             if self.mode == "heatmap":
                 panel.lines_curve.setVisible(False)
                 panel.active_sweep_curve.setVisible(False)
+                panel.highlight_segments.setVisible(False)
+                panel.points_scatter.setVisible(False)
                 panel.img_item.setVisible(True)
                 panel.stim_line.setVisible(True)
 
-                panel.img_item.setImage(erp_mag, autoLevels=False, levels=(vmin, max(vmin + 0.001, vmax)))
-                panel.img_item.setRect(QRectF(0, 0, erp_mag.shape[1], erp_mag.shape[0]))
+                if is_time:
+                    if getattr(self, "fixed_height", False):
+                        time_window_s = float(getattr(self, "time_window_s", 10.0))
+                        post_s = float(getattr(self, "post_seconds", 0.0))
+                        t_min = t_selected - time_window_s
+                        t_max = t_selected + post_s
+                        start = int(np.searchsorted(stim_times_s[:ch_n_sweeps], t_min, side="left"))
+                        stop = int(np.searchsorted(stim_times_s[:ch_n_sweeps], t_max, side="right"))
+                        start = max(0, min(start, cur_stim))
+                        stop = max(cur_stim + 1, min(stop, ch_n_sweeps))
+
+                        span = max(time_window_s + post_s, 0.1)
+                        n_bins = int(np.clip(span / 0.02, 100, 1000))
+                        dt = span / n_bins
+                        time_raster = np.zeros((n_bins, n_pts), dtype=np.float32)
+                        for k in range(start, stop):
+                            t_k = stim_times_s[k]
+                            bin_idx = int(np.clip(np.floor((t_k - t_min) / dt), 0, n_bins - 1))
+                            time_raster[bin_idx] = erp_mag[k]
+                            if bin_idx + 1 < n_bins and np.all(time_raster[bin_idx + 1] == 0):
+                                time_raster[bin_idx + 1] = erp_mag[k]
+
+                        panel.img_item.setImage(time_raster, autoLevels=False, levels=(vmin, max(vmin + 0.001, vmax)))
+                        panel.img_item.setRect(QRectF(0, -time_window_s, n_pts, span))
+                        panel.stim_line.setValue(0.0)
+                    else:
+                        t_start = stim_times_s[0] - t_selected
+                        t_end = stim_times_s[-1] - t_selected
+                        span = max(t_end - t_start, 0.1)
+                        panel.img_item.setImage(erp_mag, autoLevels=False, levels=(vmin, max(vmin + 0.001, vmax)))
+                        panel.img_item.setRect(QRectF(0, t_start, n_pts, span))
+                        panel.stim_line.setValue(0.0)
+                else:
+                    panel.img_item.setImage(erp_mag, autoLevels=False, levels=(vmin, max(vmin + 0.001, vmax)))
+                    panel.img_item.setRect(QRectF(0, 0, erp_mag.shape[1], erp_mag.shape[0]))
+                    panel.stim_line.setValue(cur_stim)
 
             elif self.mode == "lines":
                 panel.img_item.setVisible(False)
                 panel.stim_line.setVisible(False)
                 panel.lines_curve.setVisible(True)
                 panel.active_sweep_curve.setVisible(True)
+                panel.highlight_segments.setVisible(True)
+                panel.points_scatter.setVisible(True)
 
-                ch_n_sweeps, n_pts = erp_mag.shape
-                slice_start = max(0, int(np.floor(y_min - pad)))
-                slice_stop = min(ch_n_sweeps, int(np.ceil(y_max + pad)))
-                if slice_stop <= slice_start:
-                    slice_start = 0
-                    slice_stop = ch_n_sweeps
+                scale = float(getattr(self, "scale", 1.0))
+                scale_mode = getattr(self, "scale_mode", "std")
+                if scale_mode == "std":
+                    std_val = float(panel.std) if panel.std > 0 else 1.0
+                    eff_scale = scale / (std_val * 8.0)
+                else:
+                    eff_scale = scale
 
-                p90 = float(panel.std.magnitude if hasattr(panel.std, "magnitude") else panel.std) * 10
-                norm_erp = np.clip(erp_mag[slice_start:slice_stop], -p90, p90) / (p90 * 2)
-                n_sub_sweeps = norm_erp.shape[0]
-                ys = (norm_erp * -1) + (np.arange(n_sub_sweeps) + slice_start)[:, np.newaxis]
+                if is_time:
+                    if getattr(self, "fixed_height", False):
+                        time_window_s = float(getattr(self, "time_window_s", 10.0))
+                        post_s = float(getattr(self, "post_seconds", 0.0))
+                        t_min = t_selected - time_window_s
+                        t_max = t_selected + post_s
+                        start = int(np.searchsorted(stim_times_s[:ch_n_sweeps], t_min, side="left"))
+                        stop = int(np.searchsorted(stim_times_s[:ch_n_sweeps], t_max, side="right"))
+                        start = max(0, min(start, cur_stim))
+                        stop = max(cur_stim + 1, min(stop, ch_n_sweeps))
+                    else:
+                        start = 0
+                        stop = ch_n_sweeps
+                    y_baselines = stim_times_s[start:stop] - t_selected
+                    active_idx = cur_stim - start
+                else:
+                    if getattr(self, "fixed_height", False):
+                        pre = int(getattr(self, "n_lines_pre", 5))
+                        post = int(getattr(self, "n_lines_post", 5))
+                        start = max(cur_stim - pre, 0)
+                        stop = min(start + pre + post + 1, ch_n_sweeps)
+                    else:
+                        slice_start = max(0, int(np.floor(y_min - pad)))
+                        slice_stop = min(ch_n_sweeps, int(np.ceil(y_max + pad)))
+                        if slice_stop <= slice_start:
+                            slice_start = 0
+                            slice_stop = ch_n_sweeps
+                        start = slice_start
+                        stop = slice_stop
+                    y_baselines = np.arange(start, stop, dtype=float)
+                    active_idx = cur_stim - start if start <= cur_stim < stop else -1
+
+                dpts = erp_mag[start:stop]
+                n_display = len(dpts)
+                bg_x_list = []
+                bg_y_list = []
+                active_x = None
+                active_y = None
                 x = np.arange(n_pts)
 
-                all_x = np.tile(np.append(x, np.nan), n_sub_sweeps)
-                all_y = np.column_stack([ys, np.full(n_sub_sweeps, np.nan)]).ravel()
-                panel.lines_curve.setData(
-                    all_x, all_y, pen=pg.mkPen(color=(150, 150, 150), width=1), connect="finite"
-                )
+                for idx in range(n_display):
+                    y = (dpts[idx] * eff_scale * -1.0) + y_baselines[idx]
+                    if idx == active_idx:
+                        active_x = x
+                        active_y = y
+                    else:
+                        bg_x_list.append(np.append(x, np.nan))
+                        bg_y_list.append(np.append(y, np.nan))
 
-                # Active sweep line
-                stimno = min(max(self.state.stimno, 0), ch_n_sweeps - 1)
-                panel.active_sweep_curve.setData(
-                    x,
-                    (np.clip(erp_mag[stimno], -p90, p90) / (p90 * 2) * -1) + stimno,
-                    pen=pg.mkPen(color="purple", width=2),
-                )
+                if bg_x_list:
+                    panel.lines_curve.setData(
+                        np.concatenate(bg_x_list), np.concatenate(bg_y_list),
+                        pen=pg.mkPen(color=(150, 150, 150), width=1), connect="finite"
+                    )
+                else:
+                    panel.lines_curve.clear()
+
+                if active_x is not None:
+                    panel.active_sweep_curve.setData(
+                        active_x, active_y,
+                        pen=pg.mkPen(color="purple", width=2)
+                    )
+                    panel.active_sweep_curve.setVisible(True)
+                else:
+                    panel.active_sweep_curve.setVisible(False)
+
+                # Spike latency waveform highlights and peak dot
+                hl_x = []
+                hl_y = []
+                scat_pts = []
+                target_unit_idx = self.get_target_unit_idx()
+                if 0 <= target_unit_idx < len(self.state.spike_groups):
+                    ug = self.state.spike_groups[target_unit_idx]
+                    idx_arr = getattr(ug, "idx_arr", None)
+                    r = 20
+                    if idx_arr is not None and len(idx_arr) >= stop:
+                        for s_i, s_idx in enumerate(range(start, stop)):
+                            entry = idx_arr[s_idx]
+                            if entry is None:
+                                continue
+                            sample_no = int(entry[0])
+                            if sample_no < 0 or sample_no >= n_pts:
+                                continue
+                            r_start = max(0, sample_no - r)
+                            r_end = min(n_pts, sample_no + r)
+                            seg_x = np.arange(r_start, r_end)
+                            seg_y = (dpts[s_i][r_start:r_end] * eff_scale * -1.0) + y_baselines[s_i]
+                            hl_x.append(np.append(seg_x, np.nan))
+                            hl_y.append(np.append(seg_y, np.nan))
+                            scat_pts.append((sample_no, (dpts[s_i][sample_no] * eff_scale * -1.0) + y_baselines[s_i]))
+
+                if hl_x:
+                    panel.highlight_segments.setData(
+                        np.concatenate(hl_x), np.concatenate(hl_y),
+                        pen=pg.mkPen(color="red", width=2), connect="finite"
+                    )
+                else:
+                    panel.highlight_segments.clear()
+
+                if scat_pts:
+                    pts_arr = np.array(scat_pts)
+                    panel.points_scatter.setData(
+                        x=pts_arr[:, 0], y=pts_arr[:, 1],
+                        symbol="o", size=8, brush=pg.mkBrush("black")
+                    )
+                else:
+                    panel.points_scatter.clear()
 
             elif self.mode == "unitonly":
                 panel.img_item.setVisible(False)
                 panel.lines_curve.setVisible(False)
                 panel.active_sweep_curve.setVisible(False)
+                panel.highlight_segments.setVisible(False)
+                panel.points_scatter.setVisible(False)
                 panel.stim_line.setVisible(False)
 
+        if getattr(self, "y_axis_mode", "sweep") == "time":
+            self.main_plot.setLabel("left", "Time", units="s")
+        else:
+            self.main_plot.setLabel("left", "Stimulus #")
+
+        if getattr(self, "fixed_height", False) and self.state and self.state.stimno is not None:
+            self.update_ylim(self.state.stimno)
+
+        self._apply_pinned_unit_windows()
         self.plot_curstim_line(self.state.stimno, force=True)
         self.plot_spikegroups()
         self.plot_right_axis()
@@ -2007,6 +2504,10 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self._last_curstim_line = stimNo
         self._last_curstim_mode = self.mode
 
+        if getattr(self, "fixed_height", False) or getattr(self, "y_axis_mode", "sweep") == "time":
+            self.setup_figure()
+            return
+
         for p in self.channel_panels:
             if hasattr(p, "stim_line"):
                 p.stim_line.setValue(stimNo)
@@ -2014,15 +2515,21 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 ch_erp = self.get_channel_erp_signal(p.channel_name)
                 if ch_erp is not None and len(ch_erp) > stimNo >= 0:
                     erp_mag = ch_erp.magnitude if hasattr(ch_erp, "magnitude") else ch_erp
-                    p90 = float(p.std.magnitude if hasattr(p.std, "magnitude") else p.std) * 10
-                    norm_erp = np.clip(erp_mag[stimNo], -p90, p90) / (p90 * 2)
-                    y = (norm_erp * -1) + stimNo
+                    scale = float(getattr(self, "scale", 1.0))
+                    scale_mode = getattr(self, "scale_mode", "std")
+                    if scale_mode == "std":
+                        std_val = float(p.std) if p.std > 0 else 1.0
+                        eff_scale = scale / (std_val * 8.0)
+                    else:
+                        eff_scale = scale
+                    y = (erp_mag[stimNo] * eff_scale * -1.0) + stimNo
                     x = np.arange(len(y))
                     p.active_sweep_curve.setData(x, y, pen=pg.mkPen(color="purple", width=2))
 
         for sp in self.summary_panels.values():
             if hasattr(sp, "stim_line") and sp.stim_line is not None:
                 sp.stim_line.setValue(stimNo)
+        self._apply_pinned_unit_windows()
 
     @quiet_fail
     def plot_spikegroups(self):
@@ -2033,11 +2540,18 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         show_legend = hasattr(self, "showLegend") and self.showLegend.isChecked()
         has_tracked = self.includeUnitCheckbox.isChecked() and 0 <= target_unit_idx < len(self.state.spike_groups)
         sg = self.state.spike_groups[target_unit_idx] if has_tracked else None
-        tracked_pts = (
-            [(a[0], s_idx) for s_idx, a in enumerate(sg.idx_arr) if a is not None]
-            if sg and getattr(sg, "idx_arr", None) is not None
-            else []
-        )
+
+        stim_times_s = self._get_stim_times_s()
+        is_time = getattr(self, "y_axis_mode", "sweep") == "time" and stim_times_s is not None and len(stim_times_s) > 0
+        cur_stim = min(max(0, self.state.stimno if self.state.stimno is not None else 0), len(stim_times_s) - 1) if is_time else 0
+        t_selected = stim_times_s[cur_stim] if is_time else 0.0
+
+        tracked_pts = []
+        if sg and getattr(sg, "idx_arr", None) is not None:
+            for s_idx, a in enumerate(sg.idx_arr):
+                if a is not None:
+                    y_val = stim_times_s[s_idx] - t_selected if is_time and s_idx < len(stim_times_s) else float(s_idx)
+                    tracked_pts.append((a[0], y_val))
         tracked_arr = np.array(tracked_pts) if tracked_pts else np.empty((0, 2))
 
         other_units_data = []
@@ -2045,7 +2559,11 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             for i, unit in enumerate(self.state.spike_groups):
                 if i == target_unit_idx or getattr(unit, "idx_arr", None) is None:
                     continue
-                points = [(a[0], s_idx) for s_idx, a in enumerate(unit.idx_arr) if a is not None]
+                points = []
+                for s_idx, a in enumerate(unit.idx_arr):
+                    if a is not None:
+                        y_val = stim_times_s[s_idx] - t_selected if is_time and s_idx < len(stim_times_s) else float(s_idx)
+                        points.append((a[0], y_val))
                 if not points:
                     continue
                 pts_arr = np.array(points)
@@ -2534,12 +3052,23 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             "mode": self.mode,
             "include_all_units": self.includeAllUnitsCheckBox.isChecked(),
             "lock_to_stim": self.lock_to_stim,
+            "fixed_height": getattr(self, "fixed_height", False),
+            "y_axis_mode": getattr(self, "y_axis_mode", "sweep"),
+            "n_lines_pre": getattr(self, "n_lines_pre", 5),
+            "n_lines_post": getattr(self, "n_lines_post", 5),
+            "time_window_s": getattr(self, "time_window_s", 10.0),
+            "post_seconds": getattr(self, "post_seconds", 0.0),
+            "scale": getattr(self, "scale", 1.0),
+            "scale_mode": getattr(self, "scale_mode", "std"),
+            "link_x_axis": getattr(self, "link_x_axis", True),
             "percentiles": (self.lowerSpinBox.value(), self.upperSpinBox.value()),
             "group_size_n": self.group_size_n,
             "displayed_channels": list(self.displayed_channels),
             "right_plots": dict(self.rightPlots),
             "show_max": self.toggleMaxMeanButton.isChecked(),
-            "scale_mode": getattr(self, "scale_mode", "std"),
+            "pinned_units": {p.slot_idx: p.pinned_unit_idx for p in self.channel_panels if getattr(p, "pinned_unit_idx", None) is not None},
+            "window_groups": {p.slot_idx: p.window_group for p in self.channel_panels if getattr(p, "window_group", None) is not None},
+            "window_widths": {p.slot_idx: p.window_width_ms for p in self.channel_panels},
         }
         if hasattr(self, "channel_bar"):
             res["channel_bar"] = self.channel_bar.get_settings()
@@ -2569,6 +3098,12 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self.main_plot.setXRange(values["xlim"][0], values["xlim"][1], padding=0)
         if "mode" in values:
             self.mode = values["mode"]
+        if "scale" in values:
+            self.scale = float(values["scale"])
+            if hasattr(self, "scale_spinner"):
+                self.scale_spinner.blockSignals(True)
+                self.scale_spinner.setValue(self.scale)
+                self.scale_spinner.blockSignals(False)
         if "scale_mode" in values:
             self.scale_mode = values["scale_mode"]
             if hasattr(self, "scale_mode_combo"):
@@ -2577,6 +3112,38 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                     self.scale_mode_combo.blockSignals(True)
                     self.scale_mode_combo.setCurrentIndex(idx)
                     self.scale_mode_combo.blockSignals(False)
+        if "fixed_height" in values:
+            self.fixed_height = bool(values["fixed_height"])
+            if hasattr(self, "fixed_height_checkbox"):
+                self.fixed_height_checkbox.blockSignals(True)
+                self.fixed_height_checkbox.setChecked(self.fixed_height)
+                self.fixed_height_checkbox.blockSignals(False)
+        if "y_axis_mode" in values:
+            self.y_axis_mode = values["y_axis_mode"]
+            if hasattr(self, "y_axis_combo"):
+                idx = self.y_axis_combo.findText("Time" if self.y_axis_mode == "time" else "Sweep")
+                if idx >= 0:
+                    self.y_axis_combo.blockSignals(True)
+                    self.y_axis_combo.setCurrentIndex(idx)
+                    self.y_axis_combo.blockSignals(False)
+        if "n_lines_pre" in values:
+            self.n_lines_pre = int(values["n_lines_pre"])
+            if hasattr(self, "pre_spinner"):
+                self.pre_spinner.setValue(self.n_lines_pre)
+        if "n_lines_post" in values:
+            self.n_lines_post = int(values["n_lines_post"])
+            if hasattr(self, "post_spinner"):
+                self.post_spinner.setValue(self.n_lines_post)
+        if "time_window_s" in values:
+            self.time_window_s = float(values["time_window_s"])
+            if hasattr(self, "time_window_spinner"):
+                self.time_window_spinner.setValue(self.time_window_s)
+        if "post_seconds" in values:
+            self.post_seconds = float(values["post_seconds"])
+        if "link_x_axis" in values:
+            self.link_x_axis = bool(values["link_x_axis"])
+            if hasattr(self, "link_x_checkbox"):
+                self.link_x_checkbox.setChecked(self.link_x_axis)
         if "include_all_units" in values:
             self.includeAllUnitsCheckBox.setChecked(values["include_all_units"])
         if "lock_to_stim" in values:
@@ -2588,6 +3155,28 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         if "yrange" in values and self.state is not None:
             cur = max(self.state.stimno - abs(values["yrange"]) / 2, 0)
             self.main_plot.setYRange(cur, cur + abs(values["yrange"]), padding=0)
+
+        # Restore per-panel pinning / grouping
+        if "pinned_units" in values:
+            for s_idx, u_idx in values["pinned_units"].items():
+                s_int = int(s_idx)
+                if s_int < len(self.channel_panels):
+                    self.channel_panels[s_int].pinned_unit_idx = u_idx
+                    if u_idx is not None:
+                        self.channel_panels[s_int].x_linked = False
+        if "window_groups" in values:
+            for s_idx, g_name in values["window_groups"].items():
+                s_int = int(s_idx)
+                if s_int < len(self.channel_panels):
+                    self.channel_panels[s_int].window_group = g_name
+        if "window_widths" in values:
+            for s_idx, w_ms in values["window_widths"].items():
+                s_int = int(s_idx)
+                if s_int < len(self.channel_panels):
+                    self.channel_panels[s_int].window_width_ms = float(w_ms)
+
+        self._update_axis_linking()
+        self._update_toolbar_visibility()
         self.setup_figure()
 
     def keyPressEvent(self, e):
