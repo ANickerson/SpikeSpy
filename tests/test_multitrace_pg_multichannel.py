@@ -342,3 +342,117 @@ def test_multitrace_pg_settings_persistence(multichannel_8ch_state):
     view.close()
     view2.close()
     app.processEvents()
+
+
+def test_multitrace_pg_summary_line_graphs_channel_group_linking(multichannel_8ch_state):
+    """Test that summary line graphs display per-channel stats with N-in-group labels and star for primary."""
+    app = QApplication.instance() or QApplication([])
+
+    view = MultiTracePGView(state=multichannel_8ch_state)
+    view.show()
+    app.processEvents()
+
+    # Set up 2 channels: CH0 and CH1
+    view.set_group_size_n(2)
+    view.displayed_channels = ["CH0", "CH1"]
+    view.setup_figure()
+    app.processEvents()
+
+    # Check summary panels
+    assert hasattr(view, "summary_panels")
+    assert "CH0" in view.summary_panels
+    assert "CH1" in view.summary_panels
+
+    sp0 = view.summary_panels["CH0"]
+    sp1 = view.summary_panels["CH1"]
+
+    # Labels contain [1/2 in group] and [2/2 in group]
+    assert "[1/2 in group] CH0" in sp0.label
+    assert "[2/2 in group] CH1" in sp1.label
+    # Primary channel CH0 has star
+    assert "★" in sp0.label
+
+    # Summary curves have valid row mean data
+    x0, y0 = sp0.curve.getData()
+    assert len(x0) == 5
+    assert len(y0) == 5
+
+    view.close()
+    app.processEvents()
+
+
+def test_multitrace_pg_summary_line_graphs_toggle_mean_max_and_stim_cursor(multichannel_8ch_state):
+    """Test toggling Mean/Max updates summary graph titles and data, and stim_line updates."""
+    app = QApplication.instance() or QApplication([])
+
+    view = MultiTracePGView(state=multichannel_8ch_state)
+    view.show()
+    app.processEvents()
+
+    view.set_group_size_n(2)
+    view.displayed_channels = ["CH0", "CH1"]
+    view.setup_figure()
+    app.processEvents()
+
+    # Initially in Mean mode
+    sp0 = view.summary_panels["CH0"]
+    assert "(Mean)" in sp0.label
+    mean_val = float(sp0.curve.getData()[0][0])
+
+    # Toggle to Max
+    view.toggleMaxMean()
+    app.processEvents()
+
+    sp0 = view.summary_panels["CH0"]
+    assert "(Max)" in sp0.label
+    max_val = float(sp0.curve.getData()[0][0])
+    # Max should be greater than or equal to mean
+    assert max_val >= mean_val
+
+    # Stim line cursor sync
+    multichannel_8ch_state.setStimNo(3)
+    app.processEvents()
+    for sp in view.summary_panels.values():
+        assert sp.stim_line.value() == 3
+
+    view.close()
+    app.processEvents()
+
+
+def test_multitrace_pg_summary_line_graphs_retains_empty_screens_and_settings(multichannel_8ch_state):
+    """Test that switching groups preserves empty summary screens and settings persistence."""
+    app = QApplication.instance() or QApplication([])
+
+    multichannel_8ch_state.add_channel_group("GroupSmall", ["CH0"])
+    view = MultiTracePGView(state=multichannel_8ch_state)
+    view.show()
+    app.processEvents()
+
+    # Set target group size N = 3 and bind to GroupSmall (1 channel)
+    view.set_group_size_n(3)
+    view.channel_bar.bind_to_group("GroupSmall")
+    app.processEvents()
+
+    assert view.group_size_n == 3
+    assert view.displayed_channels == ["CH0", None, None]
+
+    # Summary panels must maintain 3 slots (1 channel + 2 empty screens)
+    assert "__empty_slot_1__" in view.summary_panels
+    assert "__empty_slot_2__" in view.summary_panels
+
+    sp_empty1 = view.summary_panels["__empty_slot_1__"]
+    sp_empty2 = view.summary_panels["__empty_slot_2__"]
+
+    assert "[2/3 in group] (Empty)" in sp_empty1.label
+    assert "[3/3 in group] (Empty)" in sp_empty2.label
+    assert sp_empty1.empty_text_item.isVisible() is True
+    assert sp_empty2.empty_text_item.isVisible() is True
+
+    # Test settings persistence
+    settings = view.get_settings()
+    assert settings["group_size_n"] == 3
+    assert "right_plots" in settings
+    assert "show_max" in settings
+
+    view.close()
+    app.processEvents()
