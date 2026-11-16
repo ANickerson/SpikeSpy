@@ -203,6 +203,13 @@ class ViewSettingsPanel(QWidget):
         grp = QGroupBox("MultiTraceFixed Configuration")
         layout = QFormLayout(grp)
 
+        self.combo_fix_axis_mode = QComboBox()
+        self.combo_fix_axis_mode.addItems(["Sweep", "Time"])
+        self.combo_fix_axis_mode.currentIndexChanged.connect(
+            self._on_fix_axis_mode_changed
+        )
+        layout.addRow("Y-Axis Mode:", self.combo_fix_axis_mode)
+
         self.spin_fix_scale = QDoubleSpinBox()
         self.spin_fix_scale.setRange(0.001, 100.0)
         self.spin_fix_scale.setValue(1.0)
@@ -221,6 +228,14 @@ class ViewSettingsPanel(QWidget):
         self.spin_fix_post.setValue(5)
         self.spin_fix_post.valueChanged.connect(self._on_fix_sweeps_changed)
         layout.addRow("Post-Sweeps:", self.spin_fix_post)
+
+        self.spin_fix_time_window = QDoubleSpinBox()
+        self.spin_fix_time_window.setRange(0.1, 3600.0)
+        self.spin_fix_time_window.setValue(10.0)
+        self.spin_fix_time_window.setSingleStep(1.0)
+        self.spin_fix_time_window.setSuffix(" s")
+        self.spin_fix_time_window.valueChanged.connect(self._on_fix_time_window_changed)
+        layout.addRow("Time Window:", self.spin_fix_time_window)
 
         return grp
 
@@ -669,6 +684,15 @@ class ViewSettingsPanel(QWidget):
             self.spin_st_maxima.setValue(int(view.select_local_maxima_width))
 
     def _populate_fixed(self, view):
+        if hasattr(self, "combo_fix_axis_mode"):
+            if hasattr(view, "y_axis_combo"):
+                self.combo_fix_axis_mode.setCurrentIndex(
+                    view.y_axis_combo.currentIndex()
+                )
+            elif hasattr(view, "settings") and "y_axis_mode" in view.settings:
+                idx = 1 if view.settings.get("y_axis_mode") == "time" else 0
+                self.combo_fix_axis_mode.setCurrentIndex(idx)
+
         if hasattr(view, "scale_spinner"):
             self.spin_fix_scale.setValue(float(view.scale_spinner.value()))
         elif hasattr(view, "scale"):
@@ -683,6 +707,16 @@ class ViewSettingsPanel(QWidget):
             self.spin_fix_post.setValue(int(view.post_spinner.value()))
         elif hasattr(view, "post_sweeps"):
             self.spin_fix_post.setValue(int(view.post_sweeps))
+
+        if hasattr(self, "spin_fix_time_window"):
+            if hasattr(view, "time_window_spinner"):
+                self.spin_fix_time_window.setValue(
+                    float(view.time_window_spinner.value())
+                )
+            elif hasattr(view, "settings") and "time_window_s" in view.settings:
+                self.spin_fix_time_window.setValue(
+                    float(view.settings.get("time_window_s", 10.0))
+                )
 
     def _populate_unit(self, view):
         if hasattr(view, "chk_show_neighbors"):
@@ -849,6 +883,25 @@ class ViewSettingsPanel(QWidget):
             self.active_view.update_plot()
         elif hasattr(self.active_view, "plot"):
             self.active_view.plot()
+        self.settingsChanged.emit()
+
+    def _on_fix_axis_mode_changed(self, idx: int):
+        if self._block_updates or not self.active_view:
+            return
+        mode = "time" if idx == 1 else "sweep"
+        if hasattr(self.active_view, "set_settings"):
+            self.active_view.set_settings({"y_axis_mode": mode})
+        elif hasattr(self.active_view, "y_axis_combo"):
+            self.active_view.y_axis_combo.setCurrentIndex(idx)
+        self.settingsChanged.emit()
+
+    def _on_fix_time_window_changed(self, val: float):
+        if self._block_updates or not self.active_view:
+            return
+        if hasattr(self.active_view, "set_settings"):
+            self.active_view.set_settings({"time_window_s": val})
+        elif hasattr(self.active_view, "time_window_spinner"):
+            self.active_view.time_window_spinner.setValue(val)
         self.settingsChanged.emit()
 
     def _on_unit_neighbors_toggled(self, checked: bool):
