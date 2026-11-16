@@ -210,6 +210,13 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         self.main_plot.scene().sigMouseClicked.connect(self._on_plot_clicked)
         self.main_plot.scene().sigMouseMoved.connect(self._on_plot_mouse_moved)
 
+        # Handle view range changes to dynamically render visible area
+        self._range_timer = QTimer(self)
+        self._range_timer.setSingleShot(True)
+        self._range_timer.setInterval(60)
+        self._range_timer.timeout.connect(self._on_range_timer_timeout)
+        self.main_plot.vb.sigRangeChanged.connect(self._on_view_range_changed)
+
         layout.addWidget(self.glw)
         self.setCentralWidget(central)
 
@@ -388,6 +395,16 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         if self.state and self.state.stimno is not None:
             self.update_ylim(self.state.stimno)
 
+    def _on_view_range_changed(self, *args):
+        if getattr(self, "_has_initialized_ranges", False) and not self.is_view_culled():
+            self._range_timer.start()
+
+    def _on_range_timer_timeout(self):
+        if self.state is not None and not self.is_view_culled():
+            self._schedule_render(self.state.stimno if self.state else None)
+            if self.mode == "lines":
+                self.setup_figure()
+
     def _on_plot_clicked(self, event):
         """Handle clicks on the plot for both normal sweep navigation and selector point placement."""
         pos = self.main_plot.vb.mapSceneToView(event.scenePos())
@@ -509,12 +526,17 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
     def _on_data_reload(self):
         self.reset_right_axes_data()
         self.setup_figure()
-        self.update_axis()
+        if not getattr(self, "_has_initialized_ranges", False):
+            self.update_axis()
 
     @Slot()
     def _on_unit_updated(self, *args):
-        self.render()
-        self._schedule_right_axis_update(force=True)
+        self.plot_spikegroups()
+        if getattr(self.state, "is_streaming", False):
+            self.on_new_sweep_throttled()
+        else:
+            self.render()
+            self._schedule_right_axis_update(force=True)
 
     @Slot()
     @Slot(int)
@@ -530,6 +552,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
     @Slot()
     @Slot(int)
     def _on_new_spike_events(self, *args):
+        self.plot_spikegroups()
         if getattr(self.state, "is_streaming", False):
             self.on_new_sweep_throttled()
         else:
@@ -576,6 +599,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         )
 
         def _on_unit_updated(*args):
+            self.plot_spikegroups()
             if getattr(self.state, "is_streaming", False):
                 self.on_new_sweep_throttled()
             else:
@@ -583,6 +607,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
                 self._schedule_right_axis_update(force=True)
 
         self._connect_state(self.state.onUnitGroupChange, _on_unit_updated)
+        if hasattr(self.state, "onUnitListChanged"):
+            self._connect_state(self.state.onUnitListChanged, _on_unit_updated)
         self._connect_state(self.state.onUnitChange, _on_unit_updated)
         self._connect_state(self.state.onStimNoChange, self._on_stim_no_changed)
 
@@ -652,7 +678,11 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         elif getattr(self.state, "follow_live", False):
             current_yrange = self.main_plot.viewRange()[1]
             if abs(current_yrange[1] - n_sweeps) <= 3:
-                self.main_plot.setYRange(current_yrange[0], n_sweeps, padding=0)
+                window_height = abs(current_yrange[1] - current_yrange[0])
+                if window_height < n_sweeps:
+                    self.main_plot.setYRange(n_sweeps - window_height, n_sweeps, padding=0)
+                else:
+                    self.main_plot.setYRange(0, n_sweeps, padding=0)
 
         # Schedule heavy rendering to background thread
         if self.mode != getattr(self, "_last_setup_mode", None):
@@ -662,7 +692,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
 
         # Lightweight UI updates
         self.plot_curstim_line(self.state.stimno)
-        # plot_spikegroups and reset_right_axes_data now handled by background tasks
+        self.plot_spikegroups()
 
     # ===== Background Task Scheduling =====
 
@@ -703,17 +733,44 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         
         erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
         full_shape = tuple(erp_mag.shape)
+        n_sweeps, n_samples = full_shape
+
+        # Visible slice determination
+        y_range = self.main_plot.viewRange()[1]
+        y_min = min(y_range)
+        y_max = max(y_range)
+        pad = max(10, int(abs(y_max - y_min) * 0.15))
+        slice_start = max(0, int(np.floor(y_min - pad)))
+        slice_stop = min(n_sweeps, int(np.ceil(y_max + pad)))
+        if slice_stop <= slice_start:
+            slice_start = 0
+            slice_stop = n_sweeps
+
+        n_slice = slice_stop - slice_start
+
         display = None
         if live_buf is not None and (full_shape[0] > 2048 or full_shape[1] > 2048):
             candidate = live_buf.heatmap_decimated_data
             if candidate is not None and candidate.size > 0:
                 display = candidate.magnitude if hasattr(candidate, "magnitude") else candidate
 
+        source = display if display is not None else erp_mag
+        sub_display = source[slice_start:slice_stop]
+
+        if n_slice > 1500:
+            step = int(np.ceil(n_slice / 1000))
+            sub_display = sub_display[::step]
+
+        slice_rect = (0, slice_start, n_samples, n_slice)
+
         ch_names = self._get_channel_names()
         show_max = self.toggleMaxMeanButton.isChecked()
         payload = {
-            "erp_data": display if display is not None else erp_mag,
+            "erp_data": sub_display,
+            "erp_display": sub_display,
             "erp_full_shape": full_shape,
+            "slice_rect": slice_rect,
+            "running_std": float(self.std) if hasattr(self, "std") and self.std else None,
             "spike_groups": self.state.spike_groups,
             "event_signal": self.state.event_signal,
             "sampling_rate": self.state.sampling_rate,
@@ -728,9 +785,6 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             "current_unit_idx": self.get_target_unit_idx(),
             "show_max": show_max,
         }
-        if display is not None:
-            payload["erp_display"] = display
-            payload["erp_display_shape"] = tuple(display.shape)
 
         self._task_manager.submit_render(
             self._viewer_id,
@@ -827,16 +881,15 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             clipped_data = result.get("clipped_data")
             if clipped_data is not None:
                 self.img_item.setImage(clipped_data, autoLevels=False, levels=(vmin, max(vmin + 0.001, vmax)))
-                self.img_item.setRect(QRectF(0, 0, n_samples, n_sweeps))
+                slice_rect = result.get("slice_rect")
+                if slice_rect is not None:
+                    self.img_item.setRect(QRectF(*slice_rect))
+                else:
+                    self.img_item.setRect(QRectF(0, 0, n_samples, n_sweeps))
         
         elif self.mode == "lines":
             # Lines mode rendering is handled in setup_figure
             pass
-        
-        # Update ylim if provided
-        ylim = result.get("ylim")
-        if ylim is not None:
-            self.main_plot.setYRange(ylim[1], ylim[0], padding=0)
         
         # Stim line
         stimno = result.get("stimno")
@@ -1023,21 +1076,32 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             self.lines_curve.setVisible(True)
             self.active_sweep_curve.setVisible(True)
 
-            # Stacked waveform traces
+            # Stacked waveform traces - limit to visible sweeps if large
+            n_sweeps, n_pts = erp_mag.shape
+            y_range = self.main_plot.viewRange()[1]
+            y_min = min(y_range)
+            y_max = max(y_range)
+            pad = max(10, int(abs(y_max - y_min) * 0.15))
+            slice_start = max(0, int(np.floor(y_min - pad)))
+            slice_stop = min(n_sweeps, int(np.ceil(y_max + pad)))
+            if slice_stop <= slice_start:
+                slice_start = 0
+                slice_stop = n_sweeps
+
             p90 = float(self.std.magnitude if hasattr(self.std, "magnitude") else self.std) * 10
-            norm_erp = np.clip(erp_mag, -p90, p90) / (p90 * 2)
-            n_sweeps, n_pts = norm_erp.shape
-            ys = (norm_erp * -1) + np.arange(n_sweeps)[:, np.newaxis]
+            norm_erp = np.clip(erp_mag[slice_start:slice_stop], -p90, p90) / (p90 * 2)
+            n_sub_sweeps = norm_erp.shape[0]
+            ys = (norm_erp * -1) + (np.arange(n_sub_sweeps) + slice_start)[:, np.newaxis]
             x = np.arange(n_pts)
 
             # Vectorized line concatenation with NaN separators for single-draw performance
-            all_x = np.tile(np.append(x, np.nan), n_sweeps)
-            all_y = np.column_stack([ys, np.full(n_sweeps, np.nan)]).ravel()
+            all_x = np.tile(np.append(x, np.nan), n_sub_sweeps)
+            all_y = np.column_stack([ys, np.full(n_sub_sweeps, np.nan)]).ravel()
             self.lines_curve.setData(all_x, all_y, pen=pg.mkPen(color=(150, 150, 150), width=1), connect="finite")
 
             # Active sweep line
             stimno = min(max(self.state.stimno, 0), n_sweeps - 1)
-            self.active_sweep_curve.setData(x, ys[stimno], pen=pg.mkPen(color="purple", width=2))
+            self.active_sweep_curve.setData(x, (np.clip(erp_mag[stimno], -p90, p90) / (p90 * 2) * -1) + stimno, pen=pg.mkPen(color="purple", width=2))
 
         elif self.mode == "unitonly":
             self.img_item.setVisible(False)

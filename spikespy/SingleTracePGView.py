@@ -16,7 +16,7 @@ import pyqtgraph as pg
 
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
-from .helpers import quiet_fail, run_adaptive_render
+from .helpers import quiet_fail, run_adaptive_render, qsignal_throttle
 from .live_orchestrator import LiveFrameConsumerMixin
 from .viewer_worker import get_task_manager, TaskType, TaskPriority
 
@@ -109,6 +109,10 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
         self._histogram_timer.setSingleShot(True)
         self._histogram_timer.setInterval(500)
         self._histogram_timer.timeout.connect(self._update_histogram_core)
+
+        self.on_new_sweep_throttled = qsignal_throttle(
+            self._on_new_sweep_core, 40, parent=self, weight="primary"
+        )
 
         # Background task manager
         self._task_manager = get_task_manager()
@@ -451,7 +455,7 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
             self._setup_done = True
         
         # Schedule background render task (lightweight, no convolution during live)
-        self._schedule_render(stimno)
+        run_adaptive_render(self, lambda: self._schedule_render(stimno), weight="primary")
         
         # During live streaming, queue convolution in LIFO buffer
         if getattr(self.state, "is_streaming", False):
@@ -462,9 +466,9 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
     def on_new_sweep(self, stimno: Optional[int] = None):
         if not getattr(self, "_setup_done", False):
             self._on_new_sweep_core(stimno)
+        elif getattr(self.state, "is_streaming", False) and hasattr(self, "on_new_sweep_throttled"):
+            self.on_new_sweep_throttled(stimno)
         else:
-            # For live streaming, _on_stim_no_change calls _on_new_sweep_core directly
-            # This is kept for compatibility but the throttling is now in _on_new_sweep_core
             self._on_new_sweep_core(stimno)
 
     def find_candidates_with_detector(
@@ -568,17 +572,18 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
             priority=TaskPriority.HIGH,
         )
 
-        # Also schedule histogram updates at lower priority
-        self._task_manager.submit_render(
-            self._viewer_id,
-            TaskType.HISTOGRAM_UPDATE,
-            {
-                "spike_group": ug,
-                "event_signal": self.state.event_signal,
-                "sampling_rate": self._sampling_rate_hz(),
-            },
-            priority=TaskPriority.LOW,
-        )
+        # Also schedule histogram updates at lower priority (offline only; streaming uses _histogram_timer debounce)
+        if not is_streaming:
+            self._task_manager.submit_render(
+                self._viewer_id,
+                TaskType.HISTOGRAM_UPDATE,
+                {
+                    "spike_group": ug,
+                    "event_signal": self.state.event_signal,
+                    "sampling_rate": self._sampling_rate_hz(),
+                },
+                priority=TaskPriority.LOW,
+            )
 
     def _queue_convolution(self, stimno: int):
         """Queue latest sweep for convolution in LIFO buffer (live streaming only)."""
@@ -685,8 +690,6 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
         stimno = result.get("stimno")
         if stimno is not None:
             if getattr(self.state, "is_streaming", False):
-                if stimno != self.state.stimno:
-                    return
                 if stimno < self._last_result_stimno:
                     return
             self._last_result_stimno = stimno

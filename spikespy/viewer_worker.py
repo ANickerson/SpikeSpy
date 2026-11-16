@@ -334,7 +334,9 @@ class ViewerWorker(QThread):
             return {}
         
         # Color scaling
-        std_val = float(np.std(erp))
+        std_val = p.get("running_std")
+        if std_val is None or not np.isfinite(std_val) or std_val <= 0:
+            std_val = float(np.std(erp)) if erp.size else 1.0
         if not np.isfinite(std_val) or std_val <= 0:
             std_val = 1.0
         percentiles = np.arange(0, 100) * 2 * std_val
@@ -358,16 +360,17 @@ class ViewerWorker(QThread):
         
         # Y-lim
         ylim = None
-        if p["lock_to_stim"]:
+        if p.get("lock_to_stim", False):
             w = max(5, full_shape[0] // 50)
             ylim = (p["stimno"] + w, p["stimno"] - w)
-        elif p["follow_live"]:
+        elif p.get("follow_live", False):
             ylim = (full_shape[0], 0)
         
         return {
             "clipped_data": clipped_data,
             "full_shape": full_shape,
             "extent": (0, full_shape[1], full_shape[0], 0),
+            "slice_rect": p.get("slice_rect"),
             "clim": clim,
             "right_ax_data": right_ax_data,
             "ylim": ylim,

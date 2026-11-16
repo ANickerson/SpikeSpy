@@ -8,6 +8,7 @@ from spikespy.MultiTracePGView import MultiTracePGView
 from spikespy.MultiTraceFixedPGView import MultiTraceFixedPGView
 from spikespy.UnitPGView import UnitPGView
 from spikespy.SingleTracePGView import SingleTracePGView
+from spikespy.viewer_worker import TaskType
 
 
 @pytest.fixture()
@@ -257,3 +258,113 @@ def test_unit_pgview_live_streaming(qtbot, live_streaming_state):
 
     assert len(view.lines) == 2
     assert view.mean_curve.isVisible()
+
+
+def test_multitrace_pgview_renders_new_units_detected_in_streaming(qtbot, live_streaming_state):
+    view = MultiTracePGView(state=live_streaming_state)
+    qtbot.addWidget(view)
+    view.show()
+
+    # Append 3 sweeps
+    for i in range(3):
+        w = np.random.randn(1000).astype(np.float32) * 50.0
+        live_streaming_state.append_sweep(1.0 + i, w)
+
+    # Unit 0 is detected/annotated
+    live_streaming_state.setUnit(150, stimno=0, unit_idx=0)
+    live_streaming_state.setUnit(160, stimno=1, unit_idx=0)
+
+    # Tracked unit scatter points should be plotted
+    assert len(view.tracked_unit_scatter.data) == 2
+    assert view.tracked_unit_scatter.isVisible()
+
+    # Now a new unit is added and detected
+    view.includeAllUnitsCheckBox.setChecked(True)
+    live_streaming_state.addUnitGroup()
+    assert len(live_streaming_state.spike_groups) == 2
+    live_streaming_state.setUnit(300, stimno=0, unit_idx=1)
+    live_streaming_state.setUnit(310, stimno=1, unit_idx=1)
+
+    # Other unit scatter must render the new unit's points
+    assert len(view.other_unit_scatters) > 0
+    assert any(len(scat.data) == 2 for scat in view.other_unit_scatters)
+
+
+def test_multitrace_pgview_respects_user_set_y_zoom_on_new_unit_and_sweeps(qtbot, live_streaming_state):
+    view = MultiTracePGView(state=live_streaming_state)
+    qtbot.addWidget(view)
+    view.show()
+
+    # Append 30 sweeps
+    for i in range(30):
+        w = np.random.randn(1000).astype(np.float32) * 50.0
+        live_streaming_state.append_sweep(1.0 + i, w)
+
+    # User sets y-axis zoom on sweeps 10 to 20
+    view.main_plot.setYRange(10.0, 20.0, padding=0)
+    y_range_before = view.main_plot.viewRange()[1]
+    assert np.isclose(y_range_before[0], 10.0, atol=0.5)
+    assert np.isclose(y_range_before[1], 20.0, atol=0.5)
+
+    # New unit added/detected
+    live_streaming_state.addUnitGroup()
+    live_streaming_state.setUnit(200, stimno=15, unit_idx=1)
+
+    # Verify Y-axis zoom was preserved and not reset to 0..30
+    y_range_after = view.main_plot.viewRange()[1]
+    assert np.isclose(y_range_after[0], 10.0, atol=0.5)
+    assert np.isclose(y_range_after[1], 20.0, atol=0.5)
+
+
+def test_multitrace_pgview_visible_slice_rendering(qtbot, live_streaming_state):
+    view = MultiTracePGView(state=live_streaming_state)
+    qtbot.addWidget(view)
+    view.show()
+
+    # Append 50 sweeps
+    for i in range(50):
+        w = np.random.randn(1000).astype(np.float32) * 50.0
+        live_streaming_state.append_sweep(1.0 + i, w)
+
+    # Zoom in to sweeps 20..30
+    view.main_plot.setYRange(20.0, 30.0, padding=0)
+
+    # Captured payload from _schedule_render
+    submitted_payloads = []
+    orig_submit = view._task_manager.submit_render
+
+    def capture_submit(viewer_id, task_type, payload, priority=None):
+        if task_type == TaskType.MULTI_TRACE_RENDER:
+            submitted_payloads.append(payload)
+        return orig_submit(viewer_id, task_type, payload, priority=priority)
+
+    view._task_manager.submit_render = capture_submit
+    try:
+        view._schedule_render(live_streaming_state.stimno)
+        assert len(submitted_payloads) > 0
+        p = submitted_payloads[-1]
+        assert "slice_rect" in p
+        slice_rect = p["slice_rect"]
+        # Sub-slice rect height should be much smaller than 50 sweeps
+        assert slice_rect[3] < 50
+        assert p["erp_data"].shape[0] < 50
+    finally:
+        view._task_manager.submit_render = orig_submit
+
+
+def test_multitrace_fixed_pgview_buffer_at_top_and_bottom(qtbot, live_streaming_state):
+    view = MultiTraceFixedPGView(state=live_streaming_state)
+    qtbot.addWidget(view)
+    view.show()
+
+    # Append 5 sweeps
+    for i in range(5):
+        w = np.random.randn(1000).astype(np.float32) * 50.0
+        live_streaming_state.append_sweep(1.0 + i, w)
+
+    view.update_figure()
+    y_range = view.main_plot.viewRange()[1]
+    # Should have buffer below 0 (e.g. -1.0) and above n_display - 1 (e.g. n_display)
+    assert y_range[0] <= -0.9, f"Expected top buffer <= -0.9, got {y_range[0]}"
+    assert y_range[1] >= 5.0, f"Expected bottom buffer >= 5.0, got {y_range[1]}"
+

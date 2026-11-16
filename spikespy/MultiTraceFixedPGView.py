@@ -346,10 +346,11 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
             pre = self.settings.get("n_lines_pre", 5)
             post = self.settings.get("n_lines_post", 1)
             n_lines = pre + post + 1
-            if y_val < -0.5 or y_val >= n_lines - 0.5:
+            if y_val < -1.0 or y_val > n_lines:
                 return
             start = max(stimno - pre, 0)
-            target_stim = int(round(y_val) + start)
+            target_idx = int(np.clip(round(y_val), 0, n_lines - 1))
+            target_stim = target_idx + start
             if self.state.event_signal is not None and 0 <= target_stim < len(self.state.event_signal):
                 self.state.setStimNo(target_stim)
         except Exception:
@@ -481,7 +482,7 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
         # Update Y-axis ticks with sweep indices
         ticks = [(i, str(start + i)) for i in range(n_display)]
         self.main_plot.getAxis("left").setTicks([ticks])
-        self.main_plot.setYRange(-0.5, n_display - 0.5, padding=0)
+        self.main_plot.setYRange(-1.0, max(n_display, 1), padding=0)
 
         # Only initialize X-range on first sweep or reset; preserve zoom and pan across live sweeps
         if not self._has_initialized_xrange:
