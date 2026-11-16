@@ -396,6 +396,10 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
         # Synchronize child to this container's channel/unit settings immediately
         self._sync_child(child)
 
+        if self.state and getattr(self.state, "hide_view_top_bars", False):
+            from .helpers import apply_top_bars_visibility
+            apply_top_bars_visibility(child, True)
+
         self.viewAdded.emit(child)
 
     def _on_dock_closed(self, child: QWidget):

@@ -84,6 +84,7 @@ from .ChannelGroupBar import ChannelGroupBar, ChannelGroupDialog
 from .SharedChannelPanel import SharedChannelPanel
 from .ChannelGroupContainer import ChannelGroupContainerView
 from .ViewSettingsPanel import ViewSettingsPanel
+from .helpers import apply_top_bars_visibility
 from .dsp.detectors import (
     DetectorParamSpec,
     SpikeDetectorPlugin,
@@ -279,6 +280,21 @@ class MdiView(QMainWindow):
             return self.dock_settings.widget()
         return None
 
+    def _on_hide_top_bars_changed(self, hide: bool):
+        if hasattr(self, "act_hide_top_bars") and self.act_hide_top_bars.isChecked() != hide:
+            self.act_hide_top_bars.setChecked(hide)
+        if hasattr(self, "settings_file"):
+            self.settings_file.setValue("hide_view_top_bars", hide)
+        self.apply_top_bars_visibility_all(hide)
+
+    def apply_top_bars_visibility_all(self, hide: bool):
+        if not hasattr(self, "dock_manager") or self.dock_manager is None:
+            return
+        for dw in self.dock_manager.dockWidgets():
+            w = dw.widget()
+            if w is not None and w is not getattr(self, "settings_panel", None):
+                apply_top_bars_visibility(w, hide)
+
     def _on_focused_dock_widget_changed(self, old, new):
         if new and new.widget():
             w = new.widget()
@@ -395,6 +411,13 @@ class MdiView(QMainWindow):
         self.dock_settings.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
         self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
         self.dock_manager.focusedDockWidgetChanged.connect(self._on_focused_dock_widget_changed)
+
+        if hasattr(self.state, "onHideViewTopBarsChanged"):
+            self.state.onHideViewTopBarsChanged.connect(self._on_hide_top_bars_changed)
+
+        saved_hide_top_bars = self.settings_file.value("hide_view_top_bars", False, type=bool)
+        if self.state is not None and saved_hide_top_bars:
+            self.state.set_hide_view_top_bars(True)
 
         app = QApplication.instance()
         if app is not None:
@@ -574,6 +597,18 @@ class MdiView(QMainWindow):
                 self,
                 triggered=self.open_dual_unit_view,
             )
+        )
+
+        view_menu = self.menubar.addMenu("&View")
+        self.act_hide_top_bars = QAction("Remove View Top Bars", self, checkable=True)
+        self.act_hide_top_bars.setChecked(getattr(self.state, "hide_view_top_bars", False))
+        self.act_hide_top_bars.setToolTip(
+            "Globally remove top bars from views so settings are controlled exclusively from the properties pane."
+        )
+        self.act_hide_top_bars.triggered.connect(lambda checked: self.state.set_hide_view_top_bars(checked))
+        view_menu.addAction(self.act_hide_top_bars)
+        view_menu.addAction(
+            QAction("View Settings Panel...", self, triggered=self.open_or_show_view_settings_panel)
         )
 
         help_menu = self.menubar.addMenu("Help")
@@ -951,6 +986,8 @@ class MdiView(QMainWindow):
             self.dock_manager.addDockWidget(QtAds.NoDockWidgetArea, w2)
         self.cur_windows.append(w2)
         w2.show()
+        if getattr(self.state, "hide_view_top_bars", False):
+            apply_top_bars_visibility(w, True)
         if hasattr(self, "settings_panel") and self.settings_panel is not None:
             self.settings_panel.setActiveView(w)
         return w

@@ -442,6 +442,7 @@ class ViewerState(QObject):
     onUIRefreshRateChange = Signal(int)
     onChannelGroupsChanged = Signal()
     onSharedChannelSetChanged = Signal(str)
+    onHideViewTopBarsChanged = Signal(bool)
 
     def __init__(self, parent=None, segment=None, spike_groups=None):
         super().__init__(parent)
@@ -479,6 +480,7 @@ class ViewerState(QObject):
         self.follow_live: bool = True
         self.auto_track_enabled: bool = False
         self.auto_switch_unit_channel: bool = False
+        self.hide_view_top_bars: bool = False
         self._live_erp_buffer: Optional[LiveERPBuffer] = None
         # Store live sweeps in memory-mapped temp files instead of RAM
         self.live_disk_cache: bool = True
@@ -751,6 +753,15 @@ class ViewerState(QObject):
             self.add_channel_group(g_name, chunk)
             created[g_name] = chunk
         return created
+
+    def set_hide_view_top_bars(self, hide: bool):
+        hide = bool(hide)
+        if getattr(self, "hide_view_top_bars", False) != hide:
+            self.hide_view_top_bars = hide
+            self.onHideViewTopBarsChanged.emit(self.hide_view_top_bars)
+
+    def get_hide_view_top_bars(self) -> bool:
+        return getattr(self, "hide_view_top_bars", False)
 
     def get_multichannel_erp(
         self, channel_names: List[str] = None, combine_mode: str = "mean"

@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QToolButton,
     QMenu,
     QInputDialog,
+    QComboBox,
     QApplication,
 )
 import pyqtgraph as pg
@@ -128,6 +129,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         self.state: Optional[ViewerState] = None
         self.mode: str = "heatmap"
         self.lock_to_stim: bool = False
+        self.scale_mode: str = "std"
         self.std: float = 1.0
         self.rightPlots: Dict[str, bool] = {}
         self.right_plots: Dict[str, pg.PlotItem] = {}
@@ -255,7 +257,12 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         self.lowerSpinBox.valueChanged.connect(self.upperSpinBox.setMinimum)
         self.upperSpinBox.valueChanged.connect(self.lowerSpinBox.setMaximum)
 
-        toolbar.addWidget(QLabel("Colour scale (std): "))
+        toolbar.addWidget(QLabel("Colour scale: "))
+        self.scale_mode_combo = QComboBox(self)
+        self.scale_mode_combo.addItems(["std", "mV"])
+        self.scale_mode_combo.setCurrentText(getattr(self, "scale_mode", "std"))
+        self.scale_mode_combo.currentTextChanged.connect(self._on_scale_mode_changed)
+        toolbar.addWidget(self.scale_mode_combo)
         toolbar.addWidget(QLabel("Min"))
         toolbar.addWidget(self.lowerSpinBox)
         toolbar.addWidget(QLabel("Max"))
@@ -836,6 +843,10 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         if hasattr(self.state, "get_channel_erp"):
             return self.state.get_channel_erp(channel_name)
         return self.get_erp_signal()
+
+    def _on_scale_mode_changed(self, mode: str):
+        self.scale_mode = mode
+        self.render()
 
     def _on_channel_bar_changed(self):
         self._on_channel_change()
@@ -1684,8 +1695,12 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             if i == 0:
                 self.std = panel.std
 
-            vmin = panel.std * self.lowerSpinBox.value()
-            vmax = panel.std * self.upperSpinBox.value()
+            if getattr(self, "scale_mode", "std") == "mV":
+                vmin = self.lowerSpinBox.value()
+                vmax = self.upperSpinBox.value()
+            else:
+                vmin = panel.std * self.lowerSpinBox.value()
+                vmax = panel.std * self.upperSpinBox.value()
 
             if self.mode == "heatmap":
                 panel.lines_curve.setVisible(False)
@@ -2098,6 +2113,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             "percentiles": (self.lowerSpinBox.value(), self.upperSpinBox.value()),
             "group_size_n": self.group_size_n,
             "displayed_channels": list(self.displayed_channels),
+            "scale_mode": getattr(self, "scale_mode", "std"),
         }
         if hasattr(self, "channel_bar"):
             res["channel_bar"] = self.channel_bar.get_settings()
@@ -2118,6 +2134,14 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             self.main_plot.setXRange(values["xlim"][0], values["xlim"][1], padding=0)
         if "mode" in values:
             self.mode = values["mode"]
+        if "scale_mode" in values:
+            self.scale_mode = values["scale_mode"]
+            if hasattr(self, "scale_mode_combo"):
+                idx = self.scale_mode_combo.findText(self.scale_mode)
+                if idx >= 0:
+                    self.scale_mode_combo.blockSignals(True)
+                    self.scale_mode_combo.setCurrentIndex(idx)
+                    self.scale_mode_combo.blockSignals(False)
         if "include_all_units" in values:
             self.includeAllUnitsCheckBox.setChecked(values["include_all_units"])
         if "lock_to_stim" in values:

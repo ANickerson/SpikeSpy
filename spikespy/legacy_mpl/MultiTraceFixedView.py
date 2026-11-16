@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QDoubleSpinBox,
+    QComboBox,
 )
 from PySide6.QtGui import QAction
 from PySide6.QtCore import Qt
@@ -26,12 +27,13 @@ mplstyle.use("fast")
 class MultiTraceFixedView(QMatplotlib):
     def __init__(self, parent=None, state: ViewerState = None):
         self.connections = []
-        self.settings = {
-            "n_lines_pre": 5,
-            "n_lines_post": 5,
-        }
         self.channel_bar = ChannelGroupBar(parent=None, state=state)
         super().__init__(parent=parent, state=state, include_matplotlib_toolbar=True)
+        self.settings.update({
+            "n_lines_pre": 5,
+            "n_lines_post": 5,
+            "scale_mode": "mV",
+        })
         self.channel_bar.setParent(self)
         self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
         self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
@@ -154,8 +156,11 @@ class MultiTraceFixedView(QMatplotlib):
         if erp is None or len(erp) == 0 or erp.shape[0] == 0:
             return
         erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
-        ylim = float(np.std(np.abs(erp_mag)) or 1.0) * 8
-        self.settings["scale"] = float(np.round(1 / ylim, decimals=4))
+        if self.settings.get("scale_mode") == "std":
+            self.settings["scale"] = 1.0
+        else:
+            ylim = float(np.std(np.abs(erp_mag)) or 1.0) * 8
+            self.settings["scale"] = float(np.round(1 / ylim, decimals=4))
 
     def onLoadNewFile(self):
         super().onLoadNewFile()
@@ -182,8 +187,17 @@ class MultiTraceFixedView(QMatplotlib):
         scale_spinner.setMinimumSize(100, 1)
         self.scale_spinner = scale_spinner
 
+        self.scale_mode_combo = QComboBox()
+        self.scale_mode_combo.addItems(["mV", "std"])
+        cur_mode = self.get_settings().get("scale_mode", "mV")
+        self.scale_mode_combo.setCurrentText(cur_mode)
+        self.scale_mode_combo.currentTextChanged.connect(
+            lambda mode: self.set_settings({"scale_mode": mode})
+        )
+
         scale_layout.addWidget(scale_label)
         scale_layout.addWidget(scale_spinner)
+        scale_layout.addWidget(self.scale_mode_combo)
         pre_label = QLabel("Pre:")
         pre_spinner = QSpinBox()
         pre_spinner.setRange(0, 100)
@@ -230,11 +244,22 @@ class MultiTraceFixedView(QMatplotlib):
     def set_settings(self, values, clear=False, update_spinners=True):
         super().set_settings(values, clear)
         if update_spinners:
-            self.post_spinner.setValue(self.get_settings().get("n_lines_post", 5))
-            self.pre_spinner.setValue(self.get_settings().get("n_lines_pre", 5))
-            self.scale_spinner.setValue(self.get_settings().get("scale", 1))
+            if hasattr(self, "post_spinner"):
+                self.post_spinner.setValue(self.get_settings().get("n_lines_post", 5))
+            if hasattr(self, "pre_spinner"):
+                self.pre_spinner.setValue(self.get_settings().get("n_lines_pre", 5))
+            if hasattr(self, "scale_spinner"):
+                self.scale_spinner.setValue(self.get_settings().get("scale", 1))
+            if hasattr(self, "scale_mode_combo") and "scale_mode" in self.settings:
+                idx = self.scale_mode_combo.findText(self.settings["scale_mode"])
+                if idx >= 0:
+                    self.scale_mode_combo.blockSignals(True)
+                    self.scale_mode_combo.setCurrentIndex(idx)
+                    self.scale_mode_combo.blockSignals(False)
 
     def get_settings(self):
+        if "scale_mode" not in self.settings:
+            self.settings["scale_mode"] = "mV"
         return self.settings
 
     def on_click(self, event):
@@ -316,6 +341,16 @@ class MultiTraceFixedView(QMatplotlib):
         if hasattr(dpts, "magnitude"):
             dpts = dpts.magnitude
 
+        scale_mode = self.get_settings().get("scale_mode", "mV")
+        if scale_mode == "std":
+            dpts_arr = np.asarray(dpts)
+            std_val = float(np.std(dpts_arr)) if dpts_arr.size > 0 else 1.0
+            if std_val <= 0 or not np.isfinite(std_val):
+                std_val = 1.0
+            eff_scale = scale / (std_val * 8.0)
+        else:
+            eff_scale = scale
+
         segments = []
         colors = []
         ch_palette = ["#4477AA", "#EE6677", "#228833", "#CCBB44", "#66CCEE", "#AA3377"]
@@ -335,7 +370,7 @@ class MultiTraceFixedView(QMatplotlib):
                         if hasattr(ch_d, "magnitude"):
                             ch_d = ch_d.magnitude
                         x = np.arange(len(ch_d)) / self.state.sampling_rate
-                        y = (ch_d * scale * -1) + i
+                        y = (ch_d * eff_scale * -1) + i
                         segments.append(np.column_stack([x, y]))
                         c = ch_palette[ch_i % len(ch_palette)]
                         if i == stimno - start:
@@ -345,7 +380,7 @@ class MultiTraceFixedView(QMatplotlib):
         else:
             for i in range(len(dpts)):
                 x = np.arange(erp.shape[-1]) / self.state.sampling_rate
-                y = (dpts[i] * scale * -1) + i
+                y = (dpts[i] * eff_scale * -1) + i
                 segments.append(np.column_stack([x, y]))
                 if i == stimno - start:
                     colors.append("purple")
@@ -366,10 +401,10 @@ class MultiTraceFixedView(QMatplotlib):
                     continue
                 r = 20
                 x = np.arange(sample_no - r, sample_no + r)
-                y = ((dpts[i][x] * scale) * -1) + i
+                y = ((dpts[i][x] * eff_scale) * -1) + i
                 segments.append(np.column_stack([x / self.state.sampling_rate, y]))
                 colors.append("red")
-                x_ys.append((float(l.magnitude), (dpts[i][sample_no] * scale * -1) + i))
+                x_ys.append((float(l.magnitude), (dpts[i][sample_no] * eff_scale * -1) + i))
 
         if self.points is not None:
             self.points.remove()

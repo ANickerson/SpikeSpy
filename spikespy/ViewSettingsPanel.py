@@ -59,7 +59,34 @@ class ViewSettingsPanel(QWidget):
         self.lbl_view_sub.setStyleSheet("color: #666; font-size: 11px;")
         h_layout.addWidget(self.lbl_view_sub)
 
+        self.chk_hide_top_bars = QCheckBox("Remove Top Bars from Views", header_frame)
+        self.chk_hide_top_bars.setToolTip(
+            "Globally remove top bars from views so settings are controlled exclusively from this properties pane."
+        )
+        if self.state is not None:
+            self.chk_hide_top_bars.setChecked(getattr(self.state, "hide_view_top_bars", False))
+        self.chk_hide_top_bars.toggled.connect(self._on_hide_top_bars_toggled)
+        h_layout.addWidget(self.chk_hide_top_bars)
+
         main_layout.addWidget(header_frame)
+
+        # 1b. Unit Group Selector for Selected Window
+        self.grp_unit_selector = QGroupBox("Target Unit Group", self)
+        u_layout = QHBoxLayout(self.grp_unit_selector)
+        u_layout.setContentsMargins(6, 4, 6, 4)
+        u_layout.addWidget(QLabel("Unit:"))
+        self.combo_unit = QComboBox(self.grp_unit_selector)
+        self.combo_unit.setToolTip(
+            "Select target unit group for the active window.\n"
+            "When inside a channel group, changing this affects all views in the group."
+        )
+        self.combo_unit.currentIndexChanged.connect(self._on_unit_selection_changed)
+        u_layout.addWidget(self.combo_unit, 1)
+        main_layout.addWidget(self.grp_unit_selector)
+
+        if self.state is not None:
+            self._connect_state_signals()
+            self._refresh_unit_combo()
 
         # 2. Scroll area containing dynamic settings editors
         self.scroll = QScrollArea(self)
@@ -119,6 +146,11 @@ class ViewSettingsPanel(QWidget):
 
         # Min / Max Color scale multipliers/percentiles
         scale_form = QFormLayout()
+        self.combo_mt_scale_mode = QComboBox()
+        self.combo_mt_scale_mode.addItems(["std", "mV"])
+        self.combo_mt_scale_mode.currentTextChanged.connect(self._on_mt_scale_mode_changed)
+        scale_form.addRow("Scale Mode:", self.combo_mt_scale_mode)
+
         self.spin_mt_lower = QDoubleSpinBox()
         self.spin_mt_lower.setRange(0.0, 100.0)
         self.spin_mt_lower.setValue(0.5)
@@ -192,6 +224,11 @@ class ViewSettingsPanel(QWidget):
     def _create_fixed_group(self) -> QGroupBox:
         grp = QGroupBox("MultiTraceFixed Configuration")
         layout = QFormLayout(grp)
+
+        self.combo_fix_scale_mode = QComboBox()
+        self.combo_fix_scale_mode.addItems(["mV", "std"])
+        self.combo_fix_scale_mode.currentTextChanged.connect(self._on_fix_scale_mode_changed)
+        layout.addRow("Scale Mode:", self.combo_fix_scale_mode)
 
         self.spin_fix_scale = QDoubleSpinBox()
         self.spin_fix_scale.setRange(0.001, 100.0)
@@ -279,6 +316,146 @@ class ViewSettingsPanel(QWidget):
         if new is not None:
             self.setActiveView(new)
 
+    def set_state(self, state):
+        self.state = state
+        if self.state is not None:
+            self._connect_state_signals()
+            self._refresh_unit_combo()
+            if hasattr(self, "chk_hide_top_bars"):
+                self.chk_hide_top_bars.setChecked(getattr(self.state, "hide_view_top_bars", False))
+
+    def setState(self, state):
+        self.set_state(state)
+
+    def _connect_state_signals(self):
+        if self.state is None:
+            return
+        if not hasattr(self, "_state_connections"):
+            self._state_connections = []
+        for sig, slot in self._state_connections:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._state_connections.clear()
+
+        if hasattr(self.state, "onUnitGroupChange"):
+            self._state_connections.append((self.state.onUnitGroupChange, self._on_state_unit_changed))
+            self.state.onUnitGroupChange.connect(self._on_state_unit_changed)
+        if hasattr(self.state, "onActiveUnitChanged"):
+            self._state_connections.append((self.state.onActiveUnitChanged, self._on_state_unit_changed))
+            self.state.onActiveUnitChanged.connect(self._on_state_unit_changed)
+        if hasattr(self.state, "onUnitListChanged"):
+            self._state_connections.append((self.state.onUnitListChanged, self._refresh_unit_combo))
+            self.state.onUnitListChanged.connect(self._refresh_unit_combo)
+        if hasattr(self.state, "onLoadNewFile"):
+            self._state_connections.append((self.state.onLoadNewFile, self._refresh_unit_combo))
+            self.state.onLoadNewFile.connect(self._refresh_unit_combo)
+        if hasattr(self.state, "onHideViewTopBarsChanged"):
+            self._state_connections.append((self.state.onHideViewTopBarsChanged, self._on_hide_top_bars_state_changed))
+            self.state.onHideViewTopBarsChanged.connect(self._on_hide_top_bars_state_changed)
+
+    def _find_parent_container(self, view: Optional[QWidget]) -> Optional[Any]:
+        if view is None:
+            return None
+        if view.__class__.__name__ == "ChannelGroupContainerView":
+            return view
+        curr = view.parentWidget() if hasattr(view, "parentWidget") else None
+        while curr is not None:
+            if curr.__class__.__name__ == "ChannelGroupContainerView":
+                return curr
+            curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
+        win = self.window()
+        if win is not None:
+            for cgc in win.findChildren(QWidget):
+                if cgc.__class__.__name__ == "ChannelGroupContainerView":
+                    if hasattr(cgc, "sub_views") and view in cgc.sub_views:
+                        return cgc
+        return None
+
+    def _refresh_unit_combo(self):
+        curr_data = self.combo_unit.currentData()
+        with QSignalBlocker(self.combo_unit):
+            self.combo_unit.clear()
+            self.combo_unit.addItem("(Follow Active Unit)", userData=None)
+            if self.state and hasattr(self.state, "spike_groups") and self.state.spike_groups:
+                for i, sg in enumerate(self.state.spike_groups):
+                    u_name = getattr(sg.event, "name", f"unit_{i}") or f"unit_{i}"
+                    ch = getattr(sg, "channel", "")
+                    ch_info = f" [{ch}]" if ch else ""
+                    self.combo_unit.addItem(f"Unit {i}: {u_name}{ch_info}", userData=i)
+            restored = False
+            if curr_data is not None:
+                for idx in range(self.combo_unit.count()):
+                    if self.combo_unit.itemData(idx) == curr_data:
+                        self.combo_unit.setCurrentIndex(idx)
+                        restored = True
+                        break
+            if not restored:
+                self.combo_unit.setCurrentIndex(0)
+
+    def _on_state_unit_changed(self, *args):
+        self._refresh_unit_combo()
+        if self.active_view is not None:
+            container = self._find_parent_container(self.active_view)
+            bound = None
+            if container is not None and hasattr(container, "channel_bar") and container.channel_bar is not None:
+                bound = container.channel_bar.get_bound_unit()
+            elif hasattr(self.active_view, "channel_bar") and self.active_view.channel_bar is not None:
+                bound = self.active_view.channel_bar.get_bound_unit()
+            with QSignalBlocker(self.combo_unit):
+                target_idx = 0
+                for idx in range(self.combo_unit.count()):
+                    if self.combo_unit.itemData(idx) == bound:
+                        target_idx = idx
+                        break
+                self.combo_unit.setCurrentIndex(target_idx)
+
+    def _on_unit_selection_changed(self, idx: int):
+        if self._block_updates or self.active_view is None:
+            return
+        selected_unit = self.combo_unit.itemData(idx)
+        container = self._find_parent_container(self.active_view)
+        if container is not None:
+            # When within a channel group, changing unit affects all groups
+            if hasattr(container, "channel_bar") and container.channel_bar is not None:
+                container.channel_bar.bind_to_unit(selected_unit)
+            if hasattr(container, "_sync_all_children"):
+                container._sync_all_children()
+
+            win = self.window()
+            if win is not None:
+                for cgc in win.findChildren(QWidget):
+                    if cgc is not container and cgc.__class__.__name__ == "ChannelGroupContainerView":
+                        if hasattr(cgc, "channel_bar") and cgc.channel_bar is not None:
+                            cgc.channel_bar.bind_to_unit(selected_unit)
+                        if hasattr(cgc, "_sync_all_children"):
+                            cgc._sync_all_children()
+
+            if hasattr(self.active_view, "channel_bar") and self.active_view.channel_bar is not None:
+                self.active_view.channel_bar.bind_to_unit(selected_unit)
+        else:
+            if hasattr(self.active_view, "channel_bar") and self.active_view.channel_bar is not None:
+                self.active_view.channel_bar.bind_to_unit(selected_unit)
+            elif hasattr(self.active_view, "bind_to_unit"):
+                self.active_view.bind_to_unit(selected_unit)
+        self.settingsChanged.emit()
+
+    def _on_hide_top_bars_toggled(self, checked: bool):
+        if self.state is not None:
+            self.state.set_hide_view_top_bars(checked)
+
+    def _on_hide_top_bars_state_changed(self, hide: bool):
+        if self.chk_hide_top_bars.isChecked() != hide:
+            with QSignalBlocker(self.chk_hide_top_bars):
+                self.chk_hide_top_bars.setChecked(hide)
+        from .helpers import apply_top_bars_visibility
+        app = QApplication.instance()
+        if app is not None:
+            for top_w in app.topLevelWidgets():
+                if top_w is not self:
+                    apply_top_bars_visibility(top_w, hide)
+
     def closeEvent(self, event):
         if getattr(self, "_focus_connected", False):
             app = QApplication.instance()
@@ -288,6 +465,13 @@ class ViewSettingsPanel(QWidget):
                 except (TypeError, RuntimeError):
                     pass
             self._focus_connected = False
+        if hasattr(self, "_state_connections"):
+            for sig, slot in self._state_connections:
+                try:
+                    sig.disconnect(slot)
+                except (TypeError, RuntimeError):
+                    pass
+            self._state_connections.clear()
         self._disconnect_current_view()
         super().closeEvent(event)
 
@@ -352,6 +536,7 @@ class ViewSettingsPanel(QWidget):
             self._disconnect_current_view()
             self.lbl_view_title.setText("<b>No View Selected</b>")
             self.lbl_view_sub.setText("Click any view window to edit its settings.")
+            self.grp_unit_selector.setVisible(False)
             self.grp_multitrace.setVisible(False)
             self.grp_singletrace.setVisible(False)
             self.grp_fixed.setVisible(False)
@@ -404,9 +589,29 @@ class ViewSettingsPanel(QWidget):
         if view is None:
             self.lbl_view_title.setText("<b>No View Selected</b>")
             self.lbl_view_sub.setText("Click any view window to edit its settings.")
+            self.grp_unit_selector.setVisible(False)
             self.placeholder.setVisible(True)
             self._block_updates = False
             return
+
+        self.grp_unit_selector.setVisible(True)
+        bound_unit = None
+        container = self._find_parent_container(view)
+        if container is not None and hasattr(container, "channel_bar") and container.channel_bar is not None:
+            bound_unit = container.channel_bar.get_bound_unit()
+        elif hasattr(view, "channel_bar") and view.channel_bar is not None:
+            bound_unit = view.channel_bar.get_bound_unit()
+        elif hasattr(view, "get_target_unit_idx") and callable(getattr(view, "get_target_unit_idx")):
+            if hasattr(view, "channel_bar") and hasattr(view.channel_bar, "is_unit_locked") and view.channel_bar.is_unit_locked():
+                bound_unit = view.get_target_unit_idx()
+
+        with QSignalBlocker(self.combo_unit):
+            target_idx = 0
+            for idx in range(self.combo_unit.count()):
+                if self.combo_unit.itemData(idx) == bound_unit:
+                    target_idx = idx
+                    break
+            self.combo_unit.setCurrentIndex(target_idx)
 
         c_name = view.__class__.__name__
         self.lbl_view_title.setText(f"<b>{c_name}</b>")
@@ -446,6 +651,17 @@ class ViewSettingsPanel(QWidget):
         self._block_updates = False
 
     def _populate_multitrace(self, view):
+        # Scale mode
+        cur_scale_mode = getattr(view, "scale_mode", "std")
+        if hasattr(view, "get_settings") and callable(getattr(view, "get_settings")):
+            try:
+                cur_scale_mode = view.get_settings().get("scale_mode", cur_scale_mode)
+            except Exception:
+                pass
+        idx = self.combo_mt_scale_mode.findText(cur_scale_mode)
+        if idx >= 0:
+            self.combo_mt_scale_mode.setCurrentIndex(idx)
+
         # Mode
         mode = getattr(view, "mode", "heatmap")
         if mode == "lines":
@@ -494,6 +710,19 @@ class ViewSettingsPanel(QWidget):
             self.spin_st_maxima.setValue(int(view.select_local_maxima_width))
 
     def _populate_fixed(self, view):
+        # Scale mode
+        cur_scale_mode = "mV"
+        if hasattr(view, "get_settings") and callable(getattr(view, "get_settings")):
+            try:
+                cur_scale_mode = view.get_settings().get("scale_mode", cur_scale_mode)
+            except Exception:
+                pass
+        elif hasattr(view, "settings") and isinstance(view.settings, dict):
+            cur_scale_mode = view.settings.get("scale_mode", cur_scale_mode)
+        idx = self.combo_fix_scale_mode.findText(cur_scale_mode)
+        if idx >= 0:
+            self.combo_fix_scale_mode.setCurrentIndex(idx)
+
         if hasattr(view, "scale_spinner"):
             self.spin_fix_scale.setValue(float(view.scale_spinner.value()))
         elif hasattr(view, "scale"):
@@ -524,6 +753,29 @@ class ViewSettingsPanel(QWidget):
     # ---------------------------------------------------------
     # Event Handlers to update active view
     # ---------------------------------------------------------
+    def _on_mt_scale_mode_changed(self, text: str):
+        if self._block_updates or not self.active_view:
+            return
+        if hasattr(self.active_view, "scale_mode_combo"):
+            self.active_view.scale_mode_combo.setCurrentText(text)
+        elif hasattr(self.active_view, "_on_scale_mode_changed"):
+            self.active_view.scale_mode = text
+            self.active_view._on_scale_mode_changed(text)
+        elif hasattr(self.active_view, "set_settings"):
+            self.active_view.set_settings({"scale_mode": text})
+        self.settingsChanged.emit()
+
+    def _on_fix_scale_mode_changed(self, text: str):
+        if self._block_updates or not self.active_view:
+            return
+        if hasattr(self.active_view, "scale_mode_combo"):
+            self.active_view.scale_mode_combo.setCurrentText(text)
+        elif hasattr(self.active_view, "set_scale_setting"):
+            self.active_view.set_scale_setting(text)
+        elif hasattr(self.active_view, "set_settings"):
+            self.active_view.set_settings({"scale_mode": text})
+        self.settingsChanged.emit()
+
     def _on_mt_mode_changed(self, idx: int):
         if self._block_updates or not self.active_view:
             return
