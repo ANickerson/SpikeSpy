@@ -295,6 +295,15 @@ class MdiView(QMainWindow):
             if w is not None and w is not getattr(self, "settings_panel", None):
                 apply_top_bars_visibility(w, hide)
 
+    def _on_dock_area_current_changed(self, index: int):
+        area = self.sender()
+        if area is not None and hasattr(area, "currentDockWidget") and callable(getattr(area, "currentDockWidget")):
+            dw = area.currentDockWidget()
+            if dw and hasattr(dw, "widget") and dw.widget():
+                w = dw.widget()
+                if hasattr(self, "settings_panel") and self.settings_panel is not None:
+                    self.settings_panel.setActiveView(w)
+
     def _on_focused_dock_widget_changed(self, old, new):
         if new and new.widget():
             w = new.widget()
@@ -986,6 +995,10 @@ class MdiView(QMainWindow):
             self.dock_manager.addDockWidget(QtAds.NoDockWidgetArea, w2)
         self.cur_windows.append(w2)
         w2.show()
+        area = w2.dockAreaWidget()
+        if area is not None and not getattr(area, "_spikespy_current_changed_connected", False):
+            area.currentChanged.connect(self._on_dock_area_current_changed)
+            area._spikespy_current_changed_connected = True
         if getattr(self.state, "hide_view_top_bars", False):
             apply_top_bars_visibility(w, True)
         if hasattr(self, "settings_panel") and self.settings_panel is not None:

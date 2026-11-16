@@ -262,11 +262,21 @@ def test_hide_view_top_bars_global_option(mock_state):
     assert container.channel_bar.isVisible()
     assert container.control_bar.isVisible()
 
+    # Test with MdiView to ensure main application toolbar is preserved
+    from spikespy.SpikeSpy import MdiView
+    win = MdiView(state=mock_state)
+    win.show()
+    app.processEvents()
+
+    assert win.toolbar.isVisible() is True
+
     # Enable remove top bars via panel checkbox
     panel.chk_hide_top_bars.setChecked(True)
     app.processEvents()
 
     assert mock_state.hide_view_top_bars is True
+    # Application toolbar must remain visible!
+    assert win.toolbar.isVisible() is True
     # All toolbars on standalone and container should be hidden
     assert all(not tb.isVisible() for tb in mt_view.findChildren(QToolBar))
     assert not container.channel_bar.isVisible()
@@ -278,6 +288,7 @@ def test_hide_view_top_bars_global_option(mock_state):
     app.processEvents()
 
     assert mock_state.hide_view_top_bars is False
+    assert win.toolbar.isVisible() is True
     assert any(tb.isVisible() for tb in mt_view.findChildren(QToolBar))
     assert container.channel_bar.isVisible()
     assert container.control_bar.isVisible()
@@ -287,6 +298,65 @@ def test_hide_view_top_bars_global_option(mock_state):
     panel.close()
     mt_view.close()
     container.close()
+    win.close()
+    app.processEvents()
+
+
+def test_settings_follows_selected_window_via_titlebar_and_tabs(mock_state):
+    from PySide6.QtCore import QPoint, Qt, QEvent
+    from PySide6.QtGui import QMouseEvent
+    from spikespy.SpikeSpy import MdiView
+    app = QApplication.instance() or QApplication([])
+
+    win = MdiView(state=mock_state)
+    win.show()
+    app.processEvents()
+
+    mt = win.newWindow("MultiTrace")
+    st = win.newWindow("SingleTraceView")
+    u = win.newWindow("UnitView")
+    app.processEvents()
+
+    # Find dock widgets
+    mt_dw = [dw for dw in win.dock_manager.dockWidgets() if dw.widget() == mt][0]
+    st_dw = [dw for dw in win.dock_manager.dockWidgets() if dw.widget() == st][0]
+    u_dw = [dw for dw in win.dock_manager.dockWidgets() if dw.widget() == u][0]
+
+    press = QMouseEvent(QEvent.MouseButtonPress, QPoint(10, 10), Qt.LeftButton, Qt.LeftButton, Qt.NoModifier)
+
+    # 1. Clicking dock title bars switches active view in settings panel
+    tb_mt = mt_dw.dockAreaWidget().titleBar()
+    win.eventFilter(tb_mt, press)
+    app.processEvents()
+    assert win.settings_panel.active_view == mt
+    assert win.settings_panel.grp_multitrace.isVisible()
+
+    tb_st = st_dw.dockAreaWidget().titleBar()
+    win.eventFilter(tb_st, press)
+    app.processEvents()
+    assert win.settings_panel.active_view == st
+    assert win.settings_panel.grp_singletrace.isVisible()
+
+    tb_u = u_dw.dockAreaWidget().titleBar()
+    win.eventFilter(tb_u, press)
+    app.processEvents()
+    assert win.settings_panel.active_view == u
+    assert win.settings_panel.grp_unit.isVisible()
+
+    # 2. Tab switching updates active view
+    area = mt_dw.dockAreaWidget()
+    win.dock_manager.addDockWidgetTabToArea(st_dw, area)
+    app.processEvents()
+
+    mt_dw.setAsCurrentTab()
+    app.processEvents()
+    assert win.settings_panel.active_view == mt
+
+    st_dw.setAsCurrentTab()
+    app.processEvents()
+    assert win.settings_panel.active_view == st
+
+    win.close()
     app.processEvents()
 
 

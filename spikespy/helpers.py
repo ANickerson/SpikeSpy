@@ -168,10 +168,22 @@ def apply_top_bars_visibility(widget, hide: bool):
     When hide is True, all QToolBar instances on the view are hidden so
     controls are managed exclusively from the properties pane.
     When hide is False, toolbars are restored (respecting channel bar deferral).
+    Does NOT hide the main application toolbar.
     """
     if widget is None:
         return
     from PySide6.QtWidgets import QToolBar
+
+    # If widget is the main application window (MdiView), delegate only to its docked views
+    if widget.__class__.__name__ == "MdiView" or (
+        hasattr(widget, "dock_manager") and hasattr(widget, "settings_panel")
+    ):
+        if hasattr(widget, "dock_manager") and widget.dock_manager is not None:
+            for dw in widget.dock_manager.dockWidgets():
+                w = dw.widget()
+                if w is not None and w is not getattr(widget, "settings_panel", None):
+                    apply_top_bars_visibility(w, hide)
+        return
 
     # If widget is a ChannelGroupContainerView
     if widget.__class__.__name__ == "ChannelGroupContainerView":
@@ -200,6 +212,10 @@ def apply_top_bars_visibility(widget, hide: bool):
         toolbars = []
 
     for tb in toolbars:
+        # Never hide application-level toolbars
+        win = tb.window()
+        if win is not None and win.__class__.__name__ == "MdiView" and tb.parent() is win:
+            continue
         # If inside a channel group container, child view's channel_bar was deferred and should stay hidden
         if is_inside_container and hasattr(widget, "channel_bar") and tb is widget.channel_bar:
             tb.setVisible(False)

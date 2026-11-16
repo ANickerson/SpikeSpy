@@ -619,7 +619,7 @@ class ViewSettingsPanel(QWidget):
                 )  # User is interacting with ViewSettingsPanel; do not switch view!
             curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
 
-        # Now search up for a view widget
+        # Now search up for a view widget or dock area
         curr = w
         found_view = None
         while curr is not None:
@@ -637,7 +637,8 @@ class ViewSettingsPanel(QWidget):
             ) or hasattr(curr, "populate_settings_panel"):
                 found_view = curr
                 break
-            # Check CDockWidget or CDockWidgetTab unwrapping
+
+            # Check CDockWidget unwrapping
             if (
                 c_name == "CDockWidget"
                 and hasattr(curr, "widget")
@@ -645,14 +646,15 @@ class ViewSettingsPanel(QWidget):
             ):
                 try:
                     inner = curr.widget()
-                    if inner is not None and (
-                        self._is_configurable_view(inner)
-                        or inner.__class__.__name__ == "ChannelGroupContainerView"
-                    ):
+                    if inner is self:
+                        return self.active_view
+                    if inner is not None:
                         found_view = inner
                         break
                 except TypeError:
                     pass
+
+            # Check CDockWidgetTab unwrapping
             elif (
                 c_name == "CDockWidgetTab"
                 and hasattr(curr, "dockWidget")
@@ -661,14 +663,42 @@ class ViewSettingsPanel(QWidget):
                 try:
                     dw = curr.dockWidget()
                     inner = dw.widget() if dw is not None else None
-                    if inner is not None and (
-                        self._is_configurable_view(inner)
-                        or inner.__class__.__name__ == "ChannelGroupContainerView"
-                    ):
+                    if inner is self:
+                        return self.active_view
+                    if inner is not None:
                         found_view = inner
                         break
                 except TypeError:
                     pass
+
+            # Check CDockAreaWidget or title bar / tab bar having dockAreaWidget()
+            if hasattr(curr, "dockAreaWidget") and callable(getattr(curr, "dockAreaWidget")):
+                try:
+                    area = curr.dockAreaWidget()
+                    if area and hasattr(area, "currentDockWidget") and callable(getattr(area, "currentDockWidget")):
+                        dw = area.currentDockWidget()
+                        inner = dw.widget() if dw and hasattr(dw, "widget") else None
+                        if inner is self:
+                            return self.active_view
+                        if inner is not None:
+                            found_view = inner
+                            break
+                except TypeError:
+                    pass
+
+            # Check if curr itself is a CDockAreaWidget
+            if hasattr(curr, "currentDockWidget") and callable(getattr(curr, "currentDockWidget")):
+                try:
+                    dw = curr.currentDockWidget()
+                    inner = dw.widget() if dw and hasattr(dw, "widget") else None
+                    if inner is self:
+                        return self.active_view
+                    if inner is not None:
+                        found_view = inner
+                        break
+                except TypeError:
+                    pass
+
             curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
 
         if found_view is not None:
@@ -684,7 +714,26 @@ class ViewSettingsPanel(QWidget):
                             if hasattr(temp, "parentWidget")
                             else None
                         )
+                # Check if w was in an area of container's dock_manager
+                if hasattr(found_view, "dock_manager") and found_view.dock_manager is not None:
+                    curr_d = w
+                    while curr_d is not None and curr_d is not found_view:
+                        if hasattr(curr_d, "dockAreaWidget") and callable(getattr(curr_d, "dockAreaWidget")):
+                            area = curr_d.dockAreaWidget()
+                            if area and hasattr(area, "currentDockWidget") and area.currentDockWidget():
+                                candidate = area.currentDockWidget().widget()
+                                if candidate in found_view.sub_views:
+                                    return candidate
+                        if hasattr(curr_d, "currentDockWidget") and callable(getattr(curr_d, "currentDockWidget")):
+                            candidate = curr_d.currentDockWidget().widget()
+                            if candidate in found_view.sub_views:
+                                return candidate
+                        curr_d = curr_d.parentWidget() if hasattr(curr_d, "parentWidget") else None
+                    focused = found_view.dock_manager.focusedDockWidget()
+                    if focused and hasattr(focused, "widget") and focused.widget() in found_view.sub_views:
+                        return focused.widget()
                 return found_view.sub_views[0]
+
             if self._is_configurable_view(found_view):
                 return found_view
             return None
@@ -744,97 +793,96 @@ class ViewSettingsPanel(QWidget):
         self.active_view = resolved
         view = resolved
         self._block_updates = True
+        try:
+            # Hide all groups first
+            self.placeholder.setVisible(False)
+            self.grp_multitrace.setVisible(False)
+            self.grp_singletrace.setVisible(False)
+            self.grp_fixed.setVisible(False)
+            self.grp_unit.setVisible(False)
+            self.grp_navigation.setVisible(False)
+            self._disconnect_navigation_signals()
+            if hasattr(self, "_custom_plugin_grp") and self._custom_plugin_grp is not None:
+                self._custom_plugin_grp.setVisible(False)
+                self._custom_plugin_grp.deleteLater()
+                self._custom_plugin_grp = None
 
-        # Hide all groups first
-        self.placeholder.setVisible(False)
-        self.grp_multitrace.setVisible(False)
-        self.grp_singletrace.setVisible(False)
-        self.grp_fixed.setVisible(False)
-        self.grp_unit.setVisible(False)
-        self.grp_navigation.setVisible(False)
-        self._disconnect_navigation_signals()
-        if hasattr(self, "_custom_plugin_grp") and self._custom_plugin_grp is not None:
-            self._custom_plugin_grp.setVisible(False)
-            self._custom_plugin_grp.deleteLater()
-            self._custom_plugin_grp = None
+            if view is None:
+                self.lbl_view_title.setText("<b>No View Selected</b>")
+                self.lbl_view_sub.setText("Click any view window to edit its settings.")
+                self.grp_unit_selector.setVisible(False)
+                self.placeholder.setVisible(True)
+                return
 
-        if view is None:
-            self.lbl_view_title.setText("<b>No View Selected</b>")
-            self.lbl_view_sub.setText("Click any view window to edit its settings.")
-            self.grp_unit_selector.setVisible(False)
-            self.placeholder.setVisible(True)
+            self.grp_unit_selector.setVisible(True)
+            bound_unit = None
+            container = self._find_parent_container(view)
+            if container is not None and hasattr(container, "channel_bar") and container.channel_bar is not None:
+                bound_unit = container.channel_bar.get_bound_unit()
+            elif hasattr(view, "channel_bar") and view.channel_bar is not None:
+                bound_unit = view.channel_bar.get_bound_unit()
+            elif hasattr(view, "get_target_unit_idx") and callable(getattr(view, "get_target_unit_idx")):
+                if hasattr(view, "channel_bar") and hasattr(view.channel_bar, "is_unit_locked") and view.channel_bar.is_unit_locked():
+                    bound_unit = view.get_target_unit_idx()
+
+            with QSignalBlocker(self.combo_unit):
+                target_idx = 0
+                for idx in range(self.combo_unit.count()):
+                    if self.combo_unit.itemData(idx) == bound_unit:
+                        target_idx = idx
+                        break
+                self.combo_unit.setCurrentIndex(target_idx)
+
+            c_name = view.__class__.__name__
+            self.lbl_view_title.setText(f"<b>{c_name}</b>")
+            self.lbl_view_sub.setText("Settings follow this active view.")
+
+            # Detect MultiTrace (Matplotlib or PG)
+            if "MultiTraceView" in c_name or "MultiTracePGView" in c_name:
+                self.grp_multitrace.setVisible(True)
+                self._populate_multitrace(view)
+
+            # Detect SingleTrace (Matplotlib or PG)
+            elif "SingleTraceView" in c_name or "SingleTracePGView" in c_name:
+                self.grp_singletrace.setVisible(True)
+                self._populate_singletrace(view)
+
+            # Detect MultiTraceFixed (Matplotlib or PG)
+            elif "MultiTraceFixed" in c_name:
+                self.grp_fixed.setVisible(True)
+                self._populate_fixed(view)
+
+            # Detect UnitView / UnitFootprint (Matplotlib or PG)
+            elif "UnitView" in c_name or "UnitFootprint" in c_name or "UnitPG" in c_name:
+                self.grp_unit.setVisible(True)
+                self._populate_unit(view)
+
+            elif hasattr(view, "populate_settings_panel") and callable(
+                getattr(view, "populate_settings_panel")
+            ):
+                self._custom_plugin_grp = QGroupBox(f"{c_name} Configuration")
+                custom_form = QFormLayout(self._custom_plugin_grp)
+                view.populate_settings_panel(self, custom_form)
+                self.container_layout.insertWidget(
+                    self.container_layout.count() - 1, self._custom_plugin_grp
+                )
+                self._custom_plugin_grp.setVisible(True)
+
+            else:
+                self.placeholder.setText(
+                    f"{c_name} has no view-specific visual parameters."
+                )
+                self.placeholder.setVisible(True)
+
+            # Show Navigation & Limits group if supported
+            if (
+                hasattr(view, "get_view_range")
+                and callable(getattr(view, "get_view_range"))
+            ) or hasattr(view, "ax"):
+                self.grp_navigation.setVisible(True)
+                self._populate_navigation(view)
+        finally:
             self._block_updates = False
-            return
-
-        self.grp_unit_selector.setVisible(True)
-        bound_unit = None
-        container = self._find_parent_container(view)
-        if container is not None and hasattr(container, "channel_bar") and container.channel_bar is not None:
-            bound_unit = container.channel_bar.get_bound_unit()
-        elif hasattr(view, "channel_bar") and view.channel_bar is not None:
-            bound_unit = view.channel_bar.get_bound_unit()
-        elif hasattr(view, "get_target_unit_idx") and callable(getattr(view, "get_target_unit_idx")):
-            if hasattr(view, "channel_bar") and hasattr(view.channel_bar, "is_unit_locked") and view.channel_bar.is_unit_locked():
-                bound_unit = view.get_target_unit_idx()
-
-        with QSignalBlocker(self.combo_unit):
-            target_idx = 0
-            for idx in range(self.combo_unit.count()):
-                if self.combo_unit.itemData(idx) == bound_unit:
-                    target_idx = idx
-                    break
-            self.combo_unit.setCurrentIndex(target_idx)
-
-        c_name = view.__class__.__name__
-        self.lbl_view_title.setText(f"<b>{c_name}</b>")
-        self.lbl_view_sub.setText("Settings follow this active view.")
-
-        # Detect MultiTrace (Matplotlib or PG)
-        if "MultiTraceView" in c_name or "MultiTracePGView" in c_name:
-            self.grp_multitrace.setVisible(True)
-            self._populate_multitrace(view)
-
-        # Detect SingleTrace (Matplotlib or PG)
-        elif "SingleTraceView" in c_name or "SingleTracePGView" in c_name:
-            self.grp_singletrace.setVisible(True)
-            self._populate_singletrace(view)
-
-        # Detect MultiTraceFixed (Matplotlib or PG)
-        elif "MultiTraceFixed" in c_name:
-            self.grp_fixed.setVisible(True)
-            self._populate_fixed(view)
-
-        # Detect UnitView / UnitFootprint (Matplotlib or PG)
-        elif "UnitView" in c_name or "UnitFootprint" in c_name or "UnitPG" in c_name:
-            self.grp_unit.setVisible(True)
-            self._populate_unit(view)
-
-        elif hasattr(view, "populate_settings_panel") and callable(
-            getattr(view, "populate_settings_panel")
-        ):
-            self._custom_plugin_grp = QGroupBox(f"{c_name} Configuration")
-            custom_form = QFormLayout(self._custom_plugin_grp)
-            view.populate_settings_panel(self, custom_form)
-            self.container_layout.insertWidget(
-                self.container_layout.count() - 1, self._custom_plugin_grp
-            )
-            self._custom_plugin_grp.setVisible(True)
-
-        else:
-            self.placeholder.setText(
-                f"{c_name} has no view-specific visual parameters."
-            )
-            self.placeholder.setVisible(True)
-
-        # Show Navigation & Limits group if supported
-        if (
-            hasattr(view, "get_view_range")
-            and callable(getattr(view, "get_view_range"))
-        ) or hasattr(view, "ax"):
-            self.grp_navigation.setVisible(True)
-            self._populate_navigation(view)
-
-        self._block_updates = False
 
     def _populate_multitrace(self, view):
         # Scale mode
