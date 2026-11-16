@@ -535,3 +535,59 @@ def test_view_settings_appears_on_clicking_component(mock_state):
     win.close()
     app.processEvents()
 
+
+def test_view_settings_panel_saved_layout_loading(mock_state):
+    """
+    Test that loading a saved layout/perspective:
+    1. Keeps or restores the View Settings panel in an open, visible state without needing manual reopening.
+    2. Automatically binds the settings panel and follows the active or first configurable view.
+    3. Clicking components in the restored layout switches the active view in View Settings.
+    """
+    from PySide6.QtCore import Qt, QPoint
+    from PySide6.QtTest import QTest
+    from spikespy.SpikeSpy import MdiView
+
+    app = QApplication.instance() or QApplication([])
+
+    win = MdiView(state=mock_state)
+    win.show()
+    app.processEvents()
+
+    mt = win.newWindow("MultiTrace")
+    st = win.newWindow("SingleTraceView")
+    app.processEvents()
+
+    # Save custom layout
+    layout_name = "TestSavedLayout"
+    win.save_perspective_as(layout_name)
+    app.processEvents()
+
+    # Load custom layout
+    loaded = win.load_perspective(layout_name)
+    assert loaded is True
+    app.processEvents()
+
+    # View Settings must be present, open/visible, and active_view set
+    assert win.dock_settings is not None
+    assert win.dock_settings.isClosed() is False
+    assert win.dock_settings.isVisible() is True
+    assert win.settings_panel is not None
+    assert win.settings_panel.active_view is not None
+
+    # Clicking components in the restored layout updates the settings panel
+    cur_st = [dw.widget() for dw in win.dock_manager.dockWidgets() if dw.windowTitle() == "SingleTraceView"][0]
+    QTest.mouseClick(cur_st.view, Qt.LeftButton, pos=QPoint(10, 10))
+    app.processEvents()
+    assert win.settings_panel.active_view == cur_st
+    assert win.settings_panel.grp_singletrace.isVisible()
+
+    cur_mt = [dw.widget() for dw in win.dock_manager.dockWidgets() if dw.windowTitle() == "MultiTrace"][0]
+    QTest.mouseClick(cur_mt.view, Qt.LeftButton, pos=QPoint(10, 10))
+    app.processEvents()
+    assert win.settings_panel.active_view == cur_mt
+    assert win.settings_panel.grp_multitrace.isVisible()
+
+    win.close()
+    app.processEvents()
+
+

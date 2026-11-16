@@ -171,9 +171,15 @@ class MdiView(QMainWindow):
         self.settings_file.beginGroup(group_key)
         self.dock_manager.savePerspectives(self.settings_file)
         class_to_str = {v: k for k, v in self.window_options.items()}
-        open_widgets = [x for x in self.dock_manager.dockWidgets()]
-        self.settings_file.beginWriteArray("window", len(open_widgets))
-        for i, x in enumerate(open_widgets):
+        view_widgets = [
+            x
+            for x in self.dock_manager.dockWidgets()
+            if not isinstance(x.widget(), ViewSettingsPanel)
+            and x is not getattr(self, "dock_settings", None)
+            and x.windowTitle() != "View Settings"
+        ]
+        self.settings_file.beginWriteArray("window", len(view_widgets))
+        for i, x in enumerate(view_widgets):
             self.settings_file.setArrayIndex(i)
             self.settings_file.setValue("name", x.windowTitle())
             w_widget = x.widget()
@@ -216,10 +222,28 @@ class MdiView(QMainWindow):
         self.settings_file.endArray()
         self.settings_file.endGroup()
 
+        opened = False
         if name in self.dock_manager.perspectiveNames():
             self.dock_manager.openPerspective(name)
-            return True
-        return False
+            opened = True
+
+        # Reconnect or open the view settings panel
+        self.open_or_show_view_settings_panel()
+
+        # Follow the active or first configurable view in the newly loaded layout
+        first_view = None
+        for dw in self.dock_manager.dockWidgets():
+            w = dw.widget()
+            if w is not None and w is not getattr(self, "settings_panel", None):
+                if hasattr(self, "settings_panel") and self.settings_panel is not None:
+                    resolved = self.settings_panel._resolve_view(w)
+                    if self.settings_panel._is_configurable_view(resolved):
+                        first_view = resolved
+                        break
+        if first_view is not None:
+            notify_view_selected(first_view, ensure_panel_visible=True)
+
+        return opened
 
     def savePerspectives(self):
         self.save_perspective_as("main")
@@ -283,6 +307,17 @@ class MdiView(QMainWindow):
                     dock_valid = True
             except RuntimeError:
                 self.dock_settings = None
+
+        if not dock_valid:
+            for dw in self.dock_manager.dockWidgets():
+                if dw.windowTitle() == "View Settings" or isinstance(dw.widget(), ViewSettingsPanel):
+                    self.dock_settings = dw
+                    if isinstance(dw.widget(), ViewSettingsPanel):
+                        self.settings_panel = dw.widget()
+                    else:
+                        self.dock_settings.setWidget(self.settings_panel)
+                    dock_valid = True
+                    break
 
         if not dock_valid:
             self.dock_settings = QtAds.CDockWidget("View Settings")

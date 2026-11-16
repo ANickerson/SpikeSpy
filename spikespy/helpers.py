@@ -258,12 +258,16 @@ def notify_view_selected(view_or_child, ensure_panel_visible: bool = True):
                     mdi = top_w
                     break
 
-    if mdi is not None and hasattr(mdi, "settings_panel") and mdi.settings_panel is not None:
-        try:
-            resolved = mdi.settings_panel._resolve_view(view_or_child)
-            if mdi.settings_panel._is_configurable_view(resolved):
-                mdi.settings_panel.setActiveView(resolved)
-                if ensure_panel_visible and hasattr(mdi, "open_or_show_view_settings_panel"):
-                    mdi.open_or_show_view_settings_panel()
-        except RuntimeError:
-            pass
+    if mdi is not None:
+        if getattr(mdi, "settings_panel", None) is None and hasattr(mdi, "open_or_show_view_settings_panel"):
+            mdi.open_or_show_view_settings_panel()
+
+        if hasattr(mdi, "settings_panel") and mdi.settings_panel is not None:
+            try:
+                resolved = mdi.settings_panel._resolve_view(view_or_child)
+                if mdi.settings_panel._is_configurable_view(resolved):
+                    mdi.settings_panel.setActiveView(resolved)
+                    if ensure_panel_visible and hasattr(mdi, "open_or_show_view_settings_panel"):
+                        mdi.open_or_show_view_settings_panel()
+            except RuntimeError:
+                pass
