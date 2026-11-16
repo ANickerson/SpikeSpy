@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QToolBar,
     QLabel,
+    QComboBox,
     QSpacerItem,
     QSizePolicy,
 )
@@ -279,6 +280,7 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
         self._user_hidden: bool = False
         self.messages = None
         self.legend = None
+        self.scale_mode = "std"
 
         # Throttled render timer (30 FPS or configured)
         self.render_timer = QTimer(self)
@@ -418,7 +420,12 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
         self.showLegend.clicked.connect(lambda x: self.render())
 
         toolbar2 = QToolBar("Controls", self)
-        toolbar2.addWidget(QLabel("Colour scale (std): "))
+        toolbar2.addWidget(QLabel("Colour scale: "))
+        self.scale_mode_combo = QComboBox(self)
+        self.scale_mode_combo.addItems(["std", "mV"])
+        self.scale_mode_combo.setCurrentText(getattr(self, "scale_mode", "std"))
+        self.scale_mode_combo.currentTextChanged.connect(self._on_scale_mode_changed)
+        toolbar2.addWidget(self.scale_mode_combo)
         toolbar2.addWidget(QLabel("Min"))
         toolbar2.addWidget(self.lowerSpinBox)
         toolbar2.addWidget(QLabel("Max"))
@@ -506,10 +513,15 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
             "include_all_units": self.includeAllUnitsCheckBox.isChecked(),
             "lock_to_stim": self.lock_to_stim,
             "percentiles": (self.lowerSpinBox.value(), self.upperSpinBox.value()),
+            "scale_mode": getattr(self, "scale_mode", "std"),
         }
         if hasattr(self, "channel_bar"):
             s["channel_bar"] = self.channel_bar.get_settings()
         return s
+
+    def _on_scale_mode_changed(self, mode: str):
+        self.scale_mode = mode
+        self.updateAll()
 
     def set_settings(self, values):
         if "channel_bar" in values and hasattr(self, "channel_bar"):
@@ -518,6 +530,14 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
             self.ax.set_xlim(values["xlim"])
         if "mode" in values:
             self.mode = values["mode"]
+        if "scale_mode" in values:
+            self.scale_mode = values["scale_mode"]
+            if hasattr(self, "scale_mode_combo"):
+                idx = self.scale_mode_combo.findText(self.scale_mode)
+                if idx >= 0:
+                    self.scale_mode_combo.blockSignals(True)
+                    self.scale_mode_combo.setCurrentIndex(idx)
+                    self.scale_mode_combo.blockSignals(False)
         if "include_all_units" in values:
             self.includeAllUnitsCheckBox.setChecked(values["include_all_units"])
         if "lock_to_stim" in values:
@@ -1278,8 +1298,8 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
             erp=erp,
             partial=False,
             clim=(
-                self.std * self.lowerSpinBox.value(),
-                self.std * self.upperSpinBox.value(),
+                (self.lowerSpinBox.value() if getattr(self, "scale_mode", "std") == "mV" else self.std * self.lowerSpinBox.value()),
+                (self.upperSpinBox.value() if getattr(self, "scale_mode", "std") == "mV" else self.std * self.upperSpinBox.value()),
             ),
         )
         xlim_init = abs(xlim[1] - xlim[0]) <= 1.0 or xlim == (0.0, 1.0)
@@ -1572,12 +1592,12 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
         if self.mode != "heatmap" or self.plotter.ax_track_cmap is None:
             pass
         else:
-            vmin = (
-                self.std * self.lowerSpinBox.value()
-            )  # self.percentiles[self.lowerSpinBox.value()]
-            vmax = (
-                self.std * self.upperSpinBox.value()
-            )  # self.percentiles[self.upperSpinBox.value()]
+            if getattr(self, "scale_mode", "std") == "mV":
+                vmin = self.lowerSpinBox.value()
+                vmax = self.upperSpinBox.value()
+            else:
+                vmin = self.std * self.lowerSpinBox.value()
+                vmax = self.std * self.upperSpinBox.value()
             self.plotter.ax_track_cmap.set_clim(
                 vmin,
                 max(vmin + 0.001, vmax),

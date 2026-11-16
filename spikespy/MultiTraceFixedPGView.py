@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QDoubleSpinBox,
     QSpinBox,
+    QComboBox,
     QApplication,
 )
 import pyqtgraph as pg
@@ -53,6 +54,7 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
             "n_lines_pre": 5,
             "n_lines_post": 5,
             "scale": 1.0,
+            "scale_mode": "mV",
         }
 
         # Graphics items
@@ -174,8 +176,16 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
         )
         self.post_spinner.setMinimumSize(80, 1)
 
+        self.scale_mode_combo = QComboBox()
+        self.scale_mode_combo.addItems(["mV", "std"])
+        self.scale_mode_combo.setCurrentText(self.settings.get("scale_mode", "mV"))
+        self.scale_mode_combo.currentTextChanged.connect(
+            lambda mode: self.set_settings({"scale_mode": mode})
+        )
+
         scale_layout.addWidget(scale_label)
         scale_layout.addWidget(self.scale_spinner)
+        scale_layout.addWidget(self.scale_mode_combo)
         scale_layout.addWidget(pre_label)
         scale_layout.addWidget(self.pre_spinner)
         scale_layout.addWidget(post_label)
@@ -327,10 +337,15 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
         erp = self.state.get_erp()
         if erp is not None and len(erp) > 0:
             erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
-            ylim = float(np.std(np.abs(erp_mag))) * 8
-            if ylim > 0:
-                self.settings["scale"] = float(np.round(1.0 / ylim, decimals=4))
-                self.scale_spinner.setValue(self.settings["scale"])
+            scale_mode = self.settings.get("scale_mode", "mV")
+            if scale_mode == "std":
+                self.settings["scale"] = 1.0
+                self.scale_spinner.setValue(1.0)
+            else:
+                ylim = float(np.std(np.abs(erp_mag))) * 8
+                if ylim > 0:
+                    self.settings["scale"] = float(np.round(1.0 / ylim, decimals=4))
+                    self.scale_spinner.setValue(self.settings["scale"])
 
     def _on_click(self, event):
         if event.button() != Qt.LeftButton or self.state is None:
@@ -373,13 +388,14 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
         n_lines_pre = self.settings.get("n_lines_pre", 5)
         n_lines_post = self.settings.get("n_lines_post", 5)
         scale = float(self.settings.get("scale", 1.0))
+        scale_mode = self.settings.get("scale_mode", "mV")
         stimno = self.state.stimno
         primary_ch = self.channel_bar.get_primary_channel() if hasattr(self, "channel_bar") else ""
         ug = self.get_target_unit()
         ug_spikes = len(ug.event) if ug and hasattr(ug, "event") and ug.event is not None else 0
         ug_idx = self.get_target_unit_idx()
 
-        render_key = (stimno, len(erp), scale, n_lines_pre, n_lines_post, primary_ch, ug_idx, ug_spikes)
+        render_key = (stimno, len(erp), scale, scale_mode, n_lines_pre, n_lines_post, primary_ch, ug_idx, ug_spikes)
         if not force and getattr(self, "_last_render_key", None) == render_key:
             return
         self._last_render_key = render_key
@@ -396,6 +412,15 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
         x = np.arange(erp.shape[-1]) / sr
         active_idx = stimno - start
 
+        if scale_mode == "std":
+            dpts_arr = np.asarray(dpts_mag)
+            std_val = float(np.std(dpts_arr)) if dpts_arr.size > 0 else 1.0
+            if std_val <= 0 or not np.isfinite(std_val):
+                std_val = 1.0
+            eff_scale = scale / (std_val * 8.0)
+        else:
+            eff_scale = scale
+
         # Background sweeps and active sweep
         bg_x_list = []
         bg_y_list = []
@@ -403,7 +428,7 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
         active_y = None
 
         for i in range(n_display):
-            y = (dpts_mag[i] * scale * -1.0) + i
+            y = (dpts_mag[i] * eff_scale * -1.0) + i
             if i == active_idx:
                 active_x = x
                 active_y = y
@@ -443,11 +468,11 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
                     r_start = max(0, sample_no - r)
                     r_end = min(len(dpts_mag[i]), sample_no + r)
                     seg_x = np.arange(r_start, r_end) / sr
-                    seg_y = (dpts_mag[i][r_start:r_end] * scale * -1.0) + i
+                    seg_y = (dpts_mag[i][r_start:r_end] * eff_scale * -1.0) + i
 
                     hl_x.append(np.append(seg_x, np.nan))
                     hl_y.append(np.append(seg_y, np.nan))
-                    scat_pts.append((l_sec, (dpts_mag[i][sample_no] * scale * -1.0) + i))
+                    scat_pts.append((l_sec, (dpts_mag[i][sample_no] * eff_scale * -1.0) + i))
             else:
                 latencies = ug.get_latencies(self.state.event_signal[start:stop])
                 for i, l in enumerate(latencies):
@@ -461,12 +486,12 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
                     r_start = max(0, sample_no - r)
                     r_end = min(len(dpts_mag[i]), sample_no + r)
                     seg_x = np.arange(r_start, r_end) / sr
-                    seg_y = (dpts_mag[i][r_start:r_end] * scale * -1.0) + i
+                    seg_y = (dpts_mag[i][r_start:r_end] * eff_scale * -1.0) + i
 
                     hl_x.append(np.append(seg_x, np.nan))
                     hl_y.append(np.append(seg_y, np.nan))
 
-                    scat_pts.append((l_sec, (dpts_mag[i][sample_no] * scale * -1.0) + i))
+                    scat_pts.append((l_sec, (dpts_mag[i][sample_no] * eff_scale * -1.0) + i))
 
         if hl_x:
             self.highlight_segments.setData(np.concatenate(hl_x), np.concatenate(hl_y))
@@ -524,6 +549,12 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
                 self.post_spinner.setValue(values["n_lines_post"])
             if "scale" in values:
                 self.scale_spinner.setValue(values["scale"])
+            if "scale_mode" in values and hasattr(self, "scale_mode_combo"):
+                idx = self.scale_mode_combo.findText(values["scale_mode"])
+                if idx >= 0:
+                    self.scale_mode_combo.blockSignals(True)
+                    self.scale_mode_combo.setCurrentIndex(idx)
+                    self.scale_mode_combo.blockSignals(False)
         self.update_figure()
 
     def closeEvent(self, event):
