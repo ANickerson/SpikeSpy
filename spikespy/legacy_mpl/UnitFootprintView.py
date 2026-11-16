@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 from ..ViewerState import ViewerState, tracked_neuron_unit
 from ..live_orchestrator import LiveFrameConsumerMixin
 from ..ChannelGroupBar import ChannelGroupBar
-from ..helpers import run_adaptive_render
+from ..helpers import run_adaptive_render, notify_view_selected
 
 mplstyle.use("fast")
 
@@ -889,8 +889,13 @@ class UnitFootprintView(LiveFrameConsumerMixin, QMainWindow):
 
         self.figure.tight_layout()
 
+    def mousePressEvent(self, event):
+        notify_view_selected(self)
+        super().mousePressEvent(event)
+
     def on_click(self, event):
         """Interactive click handler for channel selection and unit jumping."""
+        notify_view_selected(self)
         if getattr(event, "button", None) != 1:
             return
         if hasattr(self, "matplotlib_toolbar") and self.matplotlib_toolbar is not None:

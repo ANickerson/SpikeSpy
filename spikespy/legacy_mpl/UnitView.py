@@ -38,7 +38,7 @@ from ..ViewerState import ViewerState
 from .QMatplotlib import QMatplotlib
 from ..live_orchestrator import LiveFrameConsumerMixin
 from ..ChannelGroupBar import ChannelGroupBar
-from ..helpers import run_adaptive_render
+from ..helpers import run_adaptive_render, notify_view_selected
 
 mplstyle.use("fast")
 
@@ -458,6 +458,7 @@ class UnitView(QMatplotlib):
         pass  # return super().draw_figure()
 
     def on_click(self, event):
+        notify_view_selected(self)
         if event.inaxes != self.axes["main"]:
             return False
         if self.matplotlib_toolbar.mode != "":

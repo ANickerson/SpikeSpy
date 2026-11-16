@@ -221,3 +221,49 @@ def apply_top_bars_visibility(widget, hide: bool):
             tb.setVisible(False)
         else:
             tb.setVisible(not hide)
+
+
+def notify_view_selected(view_or_child, ensure_panel_visible: bool = True):
+    """Notifies the main MdiView's ViewSettingsPanel that a view (or one of its child widgets)
+    has been clicked or focused, and ensures the View Settings dock panel is opened/visible.
+    """
+    if view_or_child is None:
+        return
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    if not isinstance(view_or_child, QWidget):
+        return
+
+    # Find MdiView
+    mdi = None
+    curr = view_or_child
+    while curr is not None:
+        if curr.__class__.__name__ == "MdiView" or (
+            hasattr(curr, "settings_panel") and hasattr(curr, "dock_manager")
+        ):
+            mdi = curr
+            break
+        curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
+    if mdi is None:
+        win = view_or_child.window()
+        if win is not None and (
+            win.__class__.__name__ == "MdiView" or hasattr(win, "settings_panel")
+        ):
+            mdi = win
+    if mdi is None:
+        app = QApplication.instance()
+        if app is not None:
+            for top_w in app.topLevelWidgets():
+                if top_w.__class__.__name__ == "MdiView" or hasattr(top_w, "settings_panel"):
+                    mdi = top_w
+                    break
+
+    if mdi is not None and hasattr(mdi, "settings_panel") and mdi.settings_panel is not None:
+        try:
+            resolved = mdi.settings_panel._resolve_view(view_or_child)
+            if mdi.settings_panel._is_configurable_view(resolved):
+                mdi.settings_panel.setActiveView(resolved)
+                if ensure_panel_visible and hasattr(mdi, "open_or_show_view_settings_panel"):
+                    mdi.open_or_show_view_settings_panel()
+        except RuntimeError:
+            pass

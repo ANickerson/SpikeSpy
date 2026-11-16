@@ -22,7 +22,7 @@ import pyqtgraph as pg
 
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
-from .helpers import qsignal_throttle, quiet_fail, run_adaptive_render
+from .helpers import qsignal_throttle, quiet_fail, run_adaptive_render, notify_view_selected
 from .live_orchestrator import LiveFrameConsumerMixin
 from .PGNavigation import PGNavigationMixin
 
@@ -466,7 +466,12 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
         self._auto_scale()
         self.update_figure()
 
+    def mousePressEvent(self, event):
+        notify_view_selected(self)
+        super().mousePressEvent(event)
+
     def _on_click(self, event):
+        notify_view_selected(self)
         if self.is_nav_active() or event.button() != Qt.LeftButton or self.state is None:
             return
         if not hasattr(

@@ -16,7 +16,7 @@ import pyqtgraph as pg
 
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
-from .helpers import quiet_fail, run_adaptive_render, qsignal_throttle
+from .helpers import quiet_fail, run_adaptive_render, qsignal_throttle, notify_view_selected
 from .live_orchestrator import LiveFrameConsumerMixin
 from .viewer_worker import get_task_manager, TaskType, TaskPriority
 from .PGNavigation import PGNavigationMixin
@@ -1219,7 +1219,12 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         if ylim > 0:
             self.main_plot.setYRange(-ylim, ylim, padding=0)
 
+    def mousePressEvent(self, event):
+        notify_view_selected(self)
+        super().mousePressEvent(event)
+
     def _on_plot_clicked(self, event):
+        notify_view_selected(self)
         if self.is_nav_active() or event.button() != Qt.LeftButton or self.state is None:
             return
         plots = [self.main_plot] + list(self._aux_plot_by_channel.values())

@@ -35,7 +35,7 @@ import matplotlib.pyplot as plt
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
 from .MultiTraceView import DialogSignalSelect, DialogPolySelect, DialogDeleteRegion
-from .helpers import qsignal_throttle, quiet_fail
+from .helpers import qsignal_throttle, quiet_fail, notify_view_selected
 from .live_orchestrator import LiveFrameConsumerMixin
 from .viewer_worker import get_task_manager, TaskType, TaskPriority
 from .PGNavigation import PGNavigationMixin
@@ -951,8 +951,13 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     def reset_view(self):
         self.update_axis()
 
+    def mousePressEvent(self, event):
+        notify_view_selected(self)
+        super().mousePressEvent(event)
+
     def _on_plot_clicked(self, event):
         """Handle clicks on any channel plot for sweep navigation, channel context menu, or selector point placement."""
+        notify_view_selected(self)
         if self.is_nav_active():
             return
         scene_pos = event.scenePos()

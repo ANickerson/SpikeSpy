@@ -55,7 +55,7 @@ import time
 # mplstyle.use("fast")
 
 from matplotlib.axes import Axes
-from ..helpers import qsignal_throttle_wrapper, qsignal_throttle
+from ..helpers import qsignal_throttle_wrapper, qsignal_throttle, notify_view_selected
 from matplotlib.image import AxesImage
 from .CachedAxesImage import CachedAxesImage
 from ..viewer_worker import get_task_manager, TaskType, TaskPriority
@@ -1605,7 +1605,12 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
             # self.ax_track_cmap.axes.draw_artist(self.ax_track_cmap)
             self.view.draw_idle()
 
+    def mousePressEvent(self, event):
+        notify_view_selected(self)
+        super().mousePressEvent(event)
+
     def view_clicked(self, e: MouseEvent):
+        notify_view_selected(self)
         if self.toolbar.mode != "" or e.button != 1 or e.inaxes != self.ax or e.ydata is None:
             return
 

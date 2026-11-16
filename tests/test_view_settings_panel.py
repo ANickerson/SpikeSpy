@@ -434,3 +434,104 @@ def test_scale_mode_mv_and_std_scaling(mock_state):
     mt_pg.close()
     app.processEvents()
 
+
+def test_view_settings_appears_on_clicking_component(mock_state):
+    """
+    Test that clicking any component view:
+    1. Updates active view and shows its corresponding configuration in ViewSettingsPanel.
+    2. Opens and unhides View Settings if it was closed or hidden.
+    3. Raises and selects the View Settings tab if it was tabbed behind another panel.
+    4. Handles sub-views inside ChannelGroupContainerView.
+    """
+    from PySide6.QtCore import Qt, QPoint
+    from PySide6.QtTest import QTest
+    from spikespy.SpikeSpy import MdiView
+    import PySide6QtAds as QtAds
+
+    app = QApplication.instance() or QApplication([])
+
+    win = MdiView(state=mock_state)
+    win.show()
+    app.processEvents()
+
+    # 1. Create components
+    mt = win.newWindow("MultiTrace")
+    st = win.newWindow("SingleTraceView")
+    pg_mt = win.newWindow("MultiTrace (PyQtGraph)")
+    pg_st = win.newWindow("SingleTrace (PyQtGraph)")
+    app.processEvents()
+
+    # Click mt component (canvas)
+    QTest.mouseClick(mt.view, Qt.LeftButton, pos=QPoint(10, 10))
+    app.processEvents()
+    assert win.settings_panel.active_view == mt
+    assert win.settings_panel.grp_multitrace.isVisible()
+
+    # Click st component (canvas)
+    QTest.mouseClick(st.view, Qt.LeftButton, pos=QPoint(10, 10))
+    app.processEvents()
+    assert win.settings_panel.active_view == st
+    assert win.settings_panel.grp_singletrace.isVisible()
+
+    # Click pg_mt component (viewport)
+    QTest.mouseClick(pg_mt.glw.viewport(), Qt.LeftButton, pos=QPoint(10, 10))
+    app.processEvents()
+    assert win.settings_panel.active_view == pg_mt
+    assert win.settings_panel.grp_multitrace.isVisible()
+
+    # Click pg_st component (viewport)
+    QTest.mouseClick(pg_st.glw.viewport(), Qt.LeftButton, pos=QPoint(10, 10))
+    app.processEvents()
+    assert win.settings_panel.active_view == pg_st
+    assert win.settings_panel.grp_singletrace.isVisible()
+
+    # 2. If View Settings was closed, clicking a component makes it appear
+    win.dock_settings.toggleView(False)
+    app.processEvents()
+    assert win.dock_settings.isClosed() is True
+
+    QTest.mouseClick(mt.view, Qt.LeftButton, pos=QPoint(10, 10))
+    app.processEvents()
+    assert win.dock_settings.isClosed() is False
+    assert win.dock_settings.isVisible() is True
+    assert win.settings_panel.active_view == mt
+
+    # 3. If View Settings was tabbed behind another panel, clicking a component brings it to front
+    tbl = win.newWindow("SpikeGroupTable")
+    dw_tbl = [dw for dw in win.dock_manager.dockWidgets() if dw.widget() == tbl][0]
+    area = win.dock_settings.dockAreaWidget()
+    win.dock_manager.addDockWidgetTabToArea(dw_tbl, area)
+    dw_tbl.setAsCurrentTab()
+    app.processEvents()
+    assert area.currentDockWidget() == dw_tbl
+
+    # Clicking st component switches tab back to View Settings
+    QTest.mouseClick(st.view, Qt.LeftButton, pos=QPoint(10, 10))
+    app.processEvents()
+    assert area.currentDockWidget() == win.dock_settings
+    assert win.settings_panel.active_view == st
+
+    # 4. Clicking inside ChannelGroupContainer sub-view components updates settings panel
+    cgc = win.newWindow("ChannelGroupContainer")
+    cgc.add_view_by_key("MultiTrace")
+    cgc.add_view_by_key("SingleTrace (PyQtGraph)")
+    app.processEvents()
+
+    sub_mt = cgc.sub_views[0]
+    sub_pg_st = cgc.sub_views[1]
+
+    # Click sub_mt canvas
+    QTest.mouseClick(sub_mt.view, Qt.LeftButton, pos=QPoint(10, 10))
+    app.processEvents()
+    assert win.settings_panel.active_view == sub_mt
+    assert win.settings_panel.grp_multitrace.isVisible()
+
+    # Click sub_pg_st viewport
+    QTest.mouseClick(sub_pg_st.glw.viewport(), Qt.LeftButton, pos=QPoint(10, 10))
+    app.processEvents()
+    assert win.settings_panel.active_view == sub_pg_st
+    assert win.settings_panel.grp_singletrace.isVisible()
+
+    win.close()
+    app.processEvents()
+

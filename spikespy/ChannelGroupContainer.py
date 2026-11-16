@@ -26,7 +26,7 @@ import PySide6QtAds as QtAds
 
 from .ChannelGroupBar import ChannelGroupBar
 from .ViewerState import ViewerState
-from .helpers import qsignal_throttle
+from .helpers import qsignal_throttle, notify_view_selected
 from .live_orchestrator import LiveFrameConsumerMixin
 
 
@@ -111,6 +111,8 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
 
         # 1. Advanced Docking Manager for nested sub-windows
         self.dock_manager = QtAds.CDockManager(self)
+        self.dock_manager.dockAreaCreated.connect(self._on_dock_area_created)
+        self.dock_manager.focusedDockWidgetChanged.connect(self._on_focused_dock_widget_changed)
 
         # 2. Top Channel Group Bar
         self.channel_bar = ChannelGroupBar(parent=self, state=state)
@@ -404,14 +406,22 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
             from .helpers import apply_top_bars_visibility
             apply_top_bars_visibility(child, True)
 
+        notify_view_selected(child)
         self.viewAdded.emit(child)
+
+    def _on_dock_area_created(self, area):
+        if area is not None and not getattr(area, "_spikespy_current_changed_connected", False):
+            area.currentChanged.connect(lambda idx, a=area: self._on_subview_area_changed(a))
+            area._spikespy_current_changed_connected = True
+
+    def _on_focused_dock_widget_changed(self, old, new):
+        if new and hasattr(new, "widget") and new.widget():
+            notify_view_selected(new.widget())
 
     def _on_subview_area_changed(self, area):
         if area and hasattr(area, "currentDockWidget") and area.currentDockWidget():
             child = area.currentDockWidget().widget()
-            win = self.window()
-            if win is not None and hasattr(win, "settings_panel") and win.settings_panel is not None:
-                win.settings_panel.setActiveView(child)
+            notify_view_selected(child)
 
     def _on_dock_closed(self, child: QWidget):
         if child in self.sub_views:

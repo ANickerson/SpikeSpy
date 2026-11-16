@@ -17,7 +17,7 @@ import pyqtgraph as pg
 
 from .ViewerState import ViewerState
 from .ChannelGroupBar import ChannelGroupBar
-from .helpers import qsignal_throttle, quiet_fail, run_adaptive_render
+from .helpers import qsignal_throttle, quiet_fail, run_adaptive_render, notify_view_selected
 from .live_orchestrator import LiveFrameConsumerMixin
 from .viewer_worker import get_task_manager, TaskType, TaskPriority
 from .PGNavigation import PGNavigationMixin
@@ -456,7 +456,12 @@ class UnitPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     def reset_view(self):
         self.update_all()
 
+    def mousePressEvent(self, event):
+        notify_view_selected(self)
+        super().mousePressEvent(event)
+
     def _on_click(self, event):
+        notify_view_selected(self)
         if self.is_nav_active() or event.button() != Qt.LeftButton or not self.lines or self.state is None:
             return
         if not hasattr(self.main_plot, "vb") or not self.main_plot.sceneBoundingRect().contains(event.scenePos()):

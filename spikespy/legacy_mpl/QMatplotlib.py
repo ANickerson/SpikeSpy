@@ -7,6 +7,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvas, NavigationToolbar2QT
 
 from ..ViewerState import ViewerState
 from ..live_orchestrator import LiveFrameConsumerMixin
+from ..helpers import notify_view_selected
 
 
 class QMatplotlib(LiveFrameConsumerMixin, QMainWindow):
@@ -102,7 +103,12 @@ class QMatplotlib(LiveFrameConsumerMixin, QMainWindow):
         print(f"xlim changed to: {event_ax.get_xlim()}")
         print(f"ylim changed to: {event_ax.get_ylim()}")
 
+    def mousePressEvent(self, event):
+        notify_view_selected(self)
+        super().mousePressEvent(event)
+
     def on_click(self, event):
+        notify_view_selected(self)
         if event.inaxes:
             print(f"Clicked at x={event.xdata}, y={event.ydata}")
 

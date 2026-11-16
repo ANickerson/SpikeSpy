@@ -28,7 +28,7 @@ import pyqtgraph as pg
 from .ViewerState import ViewerState, tracked_neuron_unit
 from .live_orchestrator import LiveFrameConsumerMixin
 from .ChannelGroupBar import ChannelGroupBar
-from .helpers import quiet_fail, run_adaptive_render
+from .helpers import quiet_fail, run_adaptive_render, notify_view_selected
 from .PGNavigation import PGNavigationMixin
 
 logger = logging.getLogger(__name__)
@@ -833,8 +833,13 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow
     def reset_view(self):
         self._schedule_render()
 
+    def mousePressEvent(self, event):
+        notify_view_selected(self)
+        super().mousePressEvent(event)
+
     def _on_scene_clicked(self, event):
         """Unified click handler dispatching to composite or grid mode handler."""
+        notify_view_selected(self)
         if self.is_nav_active() or getattr(event, "button", None) != Qt.LeftButton:
             return
         if self.combo_mode.currentIndex() == 0:

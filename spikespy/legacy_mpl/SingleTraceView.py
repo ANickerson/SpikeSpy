@@ -23,7 +23,7 @@ from PySide6.QtCore import (
     QRunnable,
     QTimer,
 )
-from ..helpers import qsignal_throttle, run_adaptive_render
+from ..helpers import qsignal_throttle, run_adaptive_render, notify_view_selected
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -326,8 +326,13 @@ class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
         self.updateFigure()
 
 
+    def mousePressEvent(self, event):
+        notify_view_selected(self)
+        super().mousePressEvent(event)
+
     @Slot()
     def view_clicked(self, e: MouseEvent):
+        notify_view_selected(self)
         if self.toolbar.mode != "" or e.button != 1 or e.inaxes != self.ax or e.xdata is None:
             return
 

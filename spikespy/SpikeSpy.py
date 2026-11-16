@@ -84,7 +84,7 @@ from .ChannelGroupBar import ChannelGroupBar, ChannelGroupDialog
 from .SharedChannelPanel import SharedChannelPanel
 from .ChannelGroupContainer import ChannelGroupContainerView
 from .ViewSettingsPanel import ViewSettingsPanel
-from .helpers import apply_top_bars_visibility
+from .helpers import apply_top_bars_visibility, notify_view_selected
 from .dsp.detectors import (
     DetectorParamSpec,
     SpikeDetectorPlugin,
@@ -159,6 +159,8 @@ class MdiView(QMainWindow):
             dw.closeDockWidget()
             self.dock_manager.removeDockWidget(dw)
         self.cur_windows.clear()
+        self.dock_settings = None
+        self.settings_panel = None
 
     def save_perspective_as(self, name: str):
         if not name:
@@ -266,19 +268,44 @@ class MdiView(QMainWindow):
 
     def open_or_show_view_settings_panel(self):
         """Opens or brings to front the View Settings side panel on the left side."""
+        try:
+            if hasattr(self, "settings_panel") and self.settings_panel is not None:
+                self.settings_panel.isVisible()
+            else:
+                self.settings_panel = ViewSettingsPanel(parent=self, state=self.state)
+        except RuntimeError:
+            self.settings_panel = ViewSettingsPanel(parent=self, state=self.state)
+
+        dock_valid = False
         if hasattr(self, "dock_settings") and self.dock_settings is not None:
-            if self.dock_settings not in self.dock_manager.dockWidgets():
-                self.dock_settings = QtAds.CDockWidget("View Settings")
-                self.dock_settings.setWidget(self.settings_panel)
-                self.dock_settings.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
+            try:
+                if self.dock_settings in self.dock_manager.dockWidgets():
+                    dock_valid = True
+            except RuntimeError:
+                self.dock_settings = None
+
+        if not dock_valid:
+            self.dock_settings = QtAds.CDockWidget("View Settings")
+            self.dock_settings.setWidget(self.settings_panel)
+            self.dock_settings.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
+            self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
+        elif self.dock_settings.isClosed():
+            self.dock_settings.toggleView(True)
+            if self.dock_settings.dockAreaWidget() is None:
                 self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
-            elif self.dock_settings.isClosed() or not self.dock_settings.isVisible():
-                self.dock_settings.toggleView(True)
-                self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
-            self.dock_settings.show()
-            self.dock_settings.raise_()
-            return self.dock_settings.widget()
-        return None
+        self.dock_settings.show()
+        self.dock_settings.raise_()
+        if self.dock_settings.dockAreaWidget() is not None:
+            try:
+                self.dock_settings.dockAreaWidget().setCurrentDockWidget(self.dock_settings)
+            except Exception:
+                pass
+        if hasattr(self.dock_settings, "setAsCurrentTab") and callable(getattr(self.dock_settings, "setAsCurrentTab")):
+            try:
+                self.dock_settings.setAsCurrentTab()
+            except Exception:
+                pass
+        return self.dock_settings.widget()
 
     def _on_hide_top_bars_changed(self, hide: bool):
         if hasattr(self, "act_hide_top_bars") and self.act_hide_top_bars.isChecked() != hide:
@@ -295,30 +322,30 @@ class MdiView(QMainWindow):
             if w is not None and w is not getattr(self, "settings_panel", None):
                 apply_top_bars_visibility(w, hide)
 
+    def _on_dock_area_created(self, area):
+        if area is not None and not getattr(area, "_spikespy_current_changed_connected", False):
+            area.currentChanged.connect(self._on_dock_area_current_changed)
+            area._spikespy_current_changed_connected = True
+
     def _on_dock_area_current_changed(self, index: int):
         area = self.sender()
         if area is not None and hasattr(area, "currentDockWidget") and callable(getattr(area, "currentDockWidget")):
             dw = area.currentDockWidget()
             if dw and hasattr(dw, "widget") and dw.widget():
-                w = dw.widget()
-                if hasattr(self, "settings_panel") and self.settings_panel is not None:
-                    self.settings_panel.setActiveView(w)
+                notify_view_selected(dw.widget())
 
     def _on_focused_dock_widget_changed(self, old, new):
         if new and new.widget():
-            w = new.widget()
-            if hasattr(self, "settings_panel") and self.settings_panel is not None:
-                self.settings_panel.setActiveView(w)
+            notify_view_selected(new.widget())
 
     def _on_app_focus_changed(self, old, new):
-        if new is not None and hasattr(self, "settings_panel") and self.settings_panel is not None:
-            self.settings_panel.setActiveView(new)
+        if new is not None:
+            notify_view_selected(new, ensure_panel_visible=False)
 
     def eventFilter(self, obj, event):
         if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
             if isinstance(obj, QWidget):
-                if hasattr(self, "settings_panel") and self.settings_panel is not None:
-                    self.settings_panel.setActiveView(obj)
+                notify_view_selected(obj, ensure_panel_visible=(event.type() == QEvent.MouseButtonPress))
         return super().eventFilter(obj, event)
 
     def apply_default_layout(self, layout_name: str):
@@ -412,6 +439,10 @@ class MdiView(QMainWindow):
         self._open_ephys_live_dock = None
         self.dock_manager = QtAds.CDockManager(self)
         self.dock_manager.addPerspective("main")
+        self.dock_manager.dockAreaCreated.connect(self._on_dock_area_created)
+        if hasattr(self.dock_manager, "openedDockAreas"):
+            for da in self.dock_manager.openedDockAreas():
+                self._on_dock_area_created(da)
 
         # Active View Settings Side Panel (follows focused window)
         self.settings_panel = ViewSettingsPanel(parent=self, state=self.state)
@@ -1002,7 +1033,7 @@ class MdiView(QMainWindow):
         if getattr(self.state, "hide_view_top_bars", False):
             apply_top_bars_visibility(w, True)
         if hasattr(self, "settings_panel") and self.settings_panel is not None:
-            self.settings_panel.setActiveView(w)
+            notify_view_selected(w)
         return w
 
     def open_dual_unit_view(self):
