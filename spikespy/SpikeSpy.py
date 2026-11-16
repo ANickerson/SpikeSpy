@@ -19,6 +19,7 @@ from matplotlib.widgets import PolygonSelector
 from neo.io import NixIO, NixIOFr
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QEvent,
     QModelIndex,
     QObject,
     Qt,
@@ -45,6 +46,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QTableView,
+    QToolButton,
     QVBoxLayout,
     QWidget,
     QMessageBox,
@@ -58,13 +60,17 @@ from spikespy.processing import MultiAnalogSignal
 
 # import PySide6QtAds as QtAds
 from .mng_file_selector import QNeoSelector
-from .MultiTraceView import MultiTraceView
+from .legacy_mpl import (
+    MultiTraceView,
+    SingleTraceView,
+    UnitView,
+    UnitFootprintView,
+    EventView,
+    MultiTraceFixedView,
+)
 from .NeoSettingsView import NeoSettingsView
-from .SingleTraceView import SingleTraceView
 from .SpikeGroupTable import SpikeGroupTableView
 from .TrackingView import TrackingView
-from .UnitView import UnitView
-from .UnitFootprintView import UnitFootprintView
 from .ViewerState import ViewerState, prompt_for_neo_file, tracked_neuron_unit
 from .io_manager import (
     export_units_csv,
@@ -72,12 +78,31 @@ from .io_manager import (
     import_units_csv,
     save_state_to_nix,
 )
-from .EventView import EventView
-from .MultiTraceFixedView import MultiTraceFixedView
 from .UnitSuggestor import UnitSuggestor
 from .open_ephys_addin import OpenEphysLiveView
+from .ChannelGroupBar import ChannelGroupBar, ChannelGroupDialog
+from .SharedChannelPanel import SharedChannelPanel
+from .ChannelGroupContainer import ChannelGroupContainerView
+from .ViewSettingsPanel import ViewSettingsPanel
+from .dsp.detectors import (
+    DetectorParamSpec,
+    SpikeDetectorPlugin,
+    SpikeDetectorRegistry,
+    register_spike_detector,
+)
 import PySide6QtAds as QtAds
 from typing import Dict
+
+try:
+    from .MultiTracePGView import MultiTracePGView
+    from .MultiTraceFixedPGView import MultiTraceFixedPGView
+    from .SingleTracePGView import SingleTracePGView
+    from .UnitPGView import UnitPGView
+    from .UnitFootprintPGView import UnitFootprintPGView
+    _has_pg = True
+except Exception as _e:
+    logging.warning(f"PyQtGraph views not loaded: {_e}")
+    _has_pg = False
 
 mplstyle.use("fast")
 
@@ -94,7 +119,21 @@ window_options = {
     "Data": QNeoSelector,
     "Events": EventView,
     "OpenEphysLive": OpenEphysLiveView,
+    "SharedChannelPanel": SharedChannelPanel,
+    "ChannelGroupContainer": ChannelGroupContainerView,
+    "ViewSettings": ViewSettingsPanel,
 }
+if _has_pg:
+    window_options.update(
+        {
+            "MultiTrace (PyQtGraph)": MultiTracePGView,
+            "MultiTraceFixed (PyQtGraph)": MultiTraceFixedPGView,
+            "SingleTrace (PyQtGraph)": SingleTracePGView,
+            "UnitView (PyQtGraph)": UnitPGView,
+            "UnitFootprint (PyQtGraph)": UnitFootprintPGView,
+        }
+    )
+
 suggestors: Dict[str, UnitSuggestor] = {}
 
 
@@ -102,10 +141,31 @@ class MdiView(QMainWindow):
     # signals
     loadFile = Signal(str, str)
 
-    def savePerspectives(self):
-        logging.info(f"using settings file: {self.settings_file.fileName()}")
-        self.dock_manager.addPerspective("main")
-        self.settings_file.beginGroup("view")
+    def clear_dock_area(self):
+        """Closes all open dock widgets and clears the dock area."""
+        for dw in list(self.dock_manager.dockWidgets()):
+            w = dw.widget()
+            # Cancel pending idle draws on canvases before close/deletion
+            for target in ([w] + (w.get_child_views() if hasattr(w, "get_child_views") else [])):
+                for c_attr in ("view", "canvas", "figure_canvas"):
+                    cv = getattr(target, c_attr, None)
+                    if cv is not None:
+                        try:
+                            cv._draw_pending = False
+                            PySide6.QtCore.QCoreApplication.removePostedEvents(cv)
+                        except Exception:
+                            pass
+            dw.closeDockWidget()
+            self.dock_manager.removeDockWidget(dw)
+        self.cur_windows.clear()
+
+    def save_perspective_as(self, name: str):
+        if not name:
+            return
+        logging.info(f"Saving perspective '{name}' to settings file: {self.settings_file.fileName()}")
+        self.dock_manager.addPerspective(name)
+        group_key = f"perspective_{name}" if name != "main" else "view"
+        self.settings_file.beginGroup(group_key)
         self.dock_manager.savePerspectives(self.settings_file)
         class_to_str = {v: k for k, v in self.window_options.items()}
         open_widgets = [x for x in self.dock_manager.dockWidgets()]
@@ -113,42 +173,176 @@ class MdiView(QMainWindow):
         for i, x in enumerate(open_widgets):
             self.settings_file.setArrayIndex(i)
             self.settings_file.setValue("name", x.windowTitle())
-            self.settings_file.setValue("class", class_to_str[type(x.widget())])
+            w_widget = x.widget()
+            self.settings_file.setValue("class", class_to_str.get(type(w_widget), ""))
             try:
-                settings = x.widget().get_settings()
-            except:
+                settings = w_widget.get_settings()
+            except Exception:
                 settings = {}
             self.settings_file.setValue("settings", settings)
 
         self.settings_file.endArray()
         self.settings_file.endGroup()
+        self.settings_file.sync()
 
-    def loadPerspectives(self):
-        # self.settings_file.
+    def load_perspective(self, name: str) -> bool:
+        if not name:
+            return False
+        logging.info(f"Loading perspective '{name}' from settings file: {self.settings_file.fileName()}")
+        group_key = f"perspective_{name}"
+        if group_key not in self.settings_file.childGroups() and name == "main":
+            group_key = "view"
 
-        self.settings_file.beginGroup("view")
-        # TODO: Not sure, perhaps closing all open windows is the most rational.
-        # class_to_str = {v: k for k, v in self.window_options.items()}
-        # open_widgets = [
-        #     class_to_str[type(x.widget())] for x in self.dock_manager.dockWidgets()
-        # ]
-        logging.info(f"using settings file: {self.settings_file.fileName()}")
+        self.clear_dock_area()
+
+        self.settings_file.beginGroup(group_key)
         self.dock_manager.loadPerspectives(self.settings_file)
-        for x in range(self.settings_file.beginReadArray("window")):
+        n_windows = self.settings_file.beginReadArray("window")
+        for x in range(n_windows):
             self.settings_file.setArrayIndex(x)
-            w = self.newWindow(
-                self.settings_file.value("class"), name=self.settings_file.value("name")
-            )
+            cls_name = self.settings_file.value("class")
+            win_name = self.settings_file.value("name")
             settings = self.settings_file.value("settings")
-            try:
-                w.set_settings(settings)
-            except:
-                pass
+            if cls_name in self.window_options:
+                w = self.newWindow(cls_name, name=win_name)
+                if hasattr(w, "set_settings") and settings:
+                    try:
+                        w.set_settings(settings)
+                    except Exception:
+                        pass
         self.settings_file.endArray()
-
         self.settings_file.endGroup()
 
-        self.dock_manager.openPerspective("main")
+        if name in self.dock_manager.perspectiveNames():
+            self.dock_manager.openPerspective(name)
+            return True
+        return False
+
+    def savePerspectives(self):
+        self.save_perspective_as("main")
+
+    def loadPerspectives(self):
+        self.load_perspective("main")
+
+    def prompt_save_perspective(self):
+        default_name = "Custom Layout"
+        if QApplication.instance() and QApplication.instance().platformName() == "offscreen":
+            name = default_name
+            ok = True
+        else:
+            name, ok = QInputDialog.getText(self, "Save Current Layout", "Layout Name:", text=default_name)
+        if ok and name and name.strip():
+            self.save_perspective_as(name.strip())
+
+    def prompt_load_perspective(self):
+        names = list(self.dock_manager.perspectiveNames())
+        all_groups = self.settings_file.childGroups()
+        for g in all_groups:
+            if g.startswith("perspective_"):
+                p_name = g[len("perspective_") :]
+                if p_name not in names:
+                    names.append(p_name)
+        if not names:
+            if QApplication.instance() and QApplication.instance().platformName() != "offscreen":
+                QMessageBox.information(self, "No Layouts", "No saved layouts found.")
+            return
+        if QApplication.instance() and QApplication.instance().platformName() == "offscreen":
+            selected = names[0]
+            ok = True
+        else:
+            selected, ok = QInputDialog.getItem(self, "Load Layout", "Select Layout:", names, 0, False)
+        if ok and selected:
+            self.load_perspective(selected)
+
+    def open_or_show_shared_channel_panel(self):
+        """Opens or activates the SharedChannelPanel controller."""
+        for dw in self.dock_manager.dockWidgets():
+            if isinstance(dw.widget(), SharedChannelPanel):
+                dw.show()
+                dw.raise_()
+                return dw.widget()
+        return self.newWindow("SharedChannelPanel", pos=QtAds.BottomDockWidgetArea)
+
+    def open_or_show_view_settings_panel(self):
+        """Opens or brings to front the View Settings side panel on the left side."""
+        if hasattr(self, "dock_settings") and self.dock_settings is not None:
+            if self.dock_settings not in self.dock_manager.dockWidgets():
+                self.dock_settings = QtAds.CDockWidget("View Settings")
+                self.dock_settings.setWidget(self.settings_panel)
+                self.dock_settings.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
+                self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
+            elif self.dock_settings.isClosed() or not self.dock_settings.isVisible():
+                self.dock_settings.toggleView(True)
+                self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
+            self.dock_settings.show()
+            self.dock_settings.raise_()
+            return self.dock_settings.widget()
+        return None
+
+    def _on_focused_dock_widget_changed(self, old, new):
+        if new and new.widget():
+            w = new.widget()
+            if hasattr(self, "settings_panel") and self.settings_panel is not None:
+                self.settings_panel.setActiveView(w)
+
+    def _on_app_focus_changed(self, old, new):
+        if new is not None and hasattr(self, "settings_panel") and self.settings_panel is not None:
+            self.settings_panel.setActiveView(new)
+
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
+            if isinstance(obj, QWidget):
+                if hasattr(self, "settings_panel") and self.settings_panel is not None:
+                    self.settings_panel.setActiveView(obj)
+        return super().eventFilter(obj, event)
+
+    def apply_default_layout(self, layout_name: str):
+        """
+        Applies a predefined multi-panel dock layout.
+        Supported layouts:
+        - 'Shared Channel Group Suite' / 'Shared Channel Group Suite (Synced)':
+            MultiTrace on Left (bound to Shared Group A)
+            SingleTraceView on Right Top (bound to Shared Group A)
+            UnitView on Right Bottom (bound to Shared Group A)
+            SharedChannelPanel docked at Bottom
+        - 'Default Analysis Layout':
+            MultiTrace on Left
+            SingleTraceView on Right Top
+            UnitView on Right Bottom
+            SpikeGroupTable at Bottom
+        - 'Dual Unit Compare':
+            Unit 0 MultiTrace on Left
+            Unit 1 MultiTrace on Right
+        - 'Single Trace Inspector':
+            SingleTraceView on Left
+            UnitFootprintView on Right
+            SpikeGroupTable at Bottom
+        """
+        self.clear_dock_area()
+        layout_clean = layout_name.strip()
+
+        if "Shared Channel Group Suite" in layout_clean:
+            self.newWindow("MultiTrace", pos=QtAds.LeftDockWidgetArea, shared_set="Shared Group A")
+            self.newWindow("SingleTraceView", pos=QtAds.RightDockWidgetArea, shared_set="Shared Group A")
+            self.newWindow("UnitView", pos=QtAds.RightDockWidgetArea, shared_set="Shared Group A")
+            self.newWindow("SharedChannelPanel", pos=QtAds.BottomDockWidgetArea)
+
+        elif layout_clean in ("Default Analysis Layout", "Reset to Default Layout"):
+            self.newWindow("MultiTrace", pos=QtAds.LeftDockWidgetArea)
+            self.newWindow("SingleTraceView", pos=QtAds.RightDockWidgetArea)
+            self.newWindow("UnitView", pos=QtAds.RightDockWidgetArea)
+            self.newWindow("SpikeGroupTable", pos=QtAds.BottomDockWidgetArea)
+
+        elif "Dual Unit Compare" in layout_clean:
+            u0 = 0 if self.state and len(self.state.spike_groups) > 0 else None
+            u1 = 1 if self.state and len(self.state.spike_groups) > 1 else u0
+            self.newWindow("MultiTrace", pos=QtAds.LeftDockWidgetArea, target_unit=u0)
+            self.newWindow("MultiTrace", pos=QtAds.RightDockWidgetArea, target_unit=u1)
+
+        elif "Single Trace Inspector" in layout_clean:
+            self.newWindow("SingleTraceView", pos=QtAds.LeftDockWidgetArea)
+            self.newWindow("UnitFootprintView", pos=QtAds.RightDockWidgetArea)
+            self.newWindow("SpikeGroupTable", pos=QtAds.BottomDockWidgetArea)
 
     def handle_version_check_result(self, result):
         if result is not None:
@@ -190,8 +384,23 @@ class MdiView(QMainWindow):
                 f"SpikeSpy ({version}) - {Path(self.state.title).name}"
             )
         )
+        self._open_ephys_live_dock = None
         self.dock_manager = QtAds.CDockManager(self)
         self.dock_manager.addPerspective("main")
+
+        # Active View Settings Side Panel (follows focused window)
+        self.settings_panel = ViewSettingsPanel(parent=self, state=self.state)
+        self.dock_settings = QtAds.CDockWidget("View Settings")
+        self.dock_settings.setWidget(self.settings_panel)
+        self.dock_settings.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
+        self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
+        self.dock_manager.focusedDockWidgetChanged.connect(self._on_focused_dock_widget_changed)
+
+        app = QApplication.instance()
+        if app is not None:
+            app.focusChanged.connect(self._on_app_focus_changed)
+            app.installEventFilter(self)
+
         self.mdi = QMdiArea()
         # self.setCentralWidget(self.mdi)
 
@@ -204,10 +413,88 @@ class MdiView(QMainWindow):
         # ]:
         #     self.newWindow(k)
 
-        self.toolbar = self.addToolBar("")
-        for k in self.window_options.keys():
-            act = self.toolbar.addAction(k)
-            act.triggered.connect(lambda *args, k=k: self.newWindow(k))
+        self.toolbar = self.addToolBar("Main")
+
+        # 1. [+ Add Panel ▾] QToolButton with categorized popup menu
+        self.btn_add_panel = QToolButton(self)
+        self.btn_add_panel.setText("+ Add Panel ▾")
+        self.btn_add_panel.setPopupMode(QToolButton.InstantPopup)
+        add_panel_menu = QMenu(self.btn_add_panel)
+
+        menu_traces = add_panel_menu.addMenu("Trace & Heatmap Views")
+        menu_traces.addAction("MultiTrace (Matplotlib)", lambda: self.newWindow("MultiTrace"))
+        if "MultiTrace (PyQtGraph)" in self.window_options:
+            menu_traces.addAction("MultiTrace (PyQtGraph)", lambda: self.newWindow("MultiTrace (PyQtGraph)"))
+        menu_traces.addAction("MultiTraceFixedView (Matplotlib)", lambda: self.newWindow("MultiTraceFixedView"))
+        if "MultiTraceFixed (PyQtGraph)" in self.window_options:
+            menu_traces.addAction("MultiTraceFixed (PyQtGraph)", lambda: self.newWindow("MultiTraceFixed (PyQtGraph)"))
+        menu_traces.addAction("SingleTraceView (Matplotlib)", lambda: self.newWindow("SingleTraceView"))
+        if "SingleTrace (PyQtGraph)" in self.window_options:
+            menu_traces.addAction("SingleTrace (PyQtGraph)", lambda: self.newWindow("SingleTrace (PyQtGraph)"))
+        menu_traces.addAction("TrackingView", lambda: self.newWindow("TrackingView"))
+        menu_traces.addAction("OpenEphysLive", lambda: self.newWindow("OpenEphysLive"))
+
+        menu_unit = add_panel_menu.addMenu("Unit Analysis")
+        menu_unit.addAction("UnitView (Matplotlib)", lambda: self.newWindow("UnitView"))
+        if "UnitView (PyQtGraph)" in self.window_options:
+            menu_unit.addAction("UnitView (PyQtGraph)", lambda: self.newWindow("UnitView (PyQtGraph)"))
+        menu_unit.addAction("UnitFootprintView (Matplotlib)", lambda: self.newWindow("UnitFootprintView"))
+        if "UnitFootprint (PyQtGraph)" in self.window_options:
+            menu_unit.addAction("UnitFootprint (PyQtGraph)", lambda: self.newWindow("UnitFootprint (PyQtGraph)"))
+
+        menu_channels = add_panel_menu.addMenu("Channel Groups")
+        menu_channels.addAction("Channel Group Sub-Window", lambda: self.newWindow("ChannelGroupContainer"))
+        menu_channels.addAction("Shared Channel Controller", lambda: self.open_or_show_shared_channel_panel())
+
+        menu_tables = add_panel_menu.addMenu("Tables & Controllers")
+        menu_tables.addAction("View Settings Panel", lambda: self.open_or_show_view_settings_panel())
+        menu_tables.addAction("SharedChannelPanel", lambda: self.open_or_show_shared_channel_panel())
+        menu_tables.addAction("SpikeGroupTable", lambda: self.newWindow("SpikeGroupTable"))
+        menu_tables.addAction("Events", lambda: self.newWindow("Events"))
+        menu_tables.addAction("Data", lambda: self.newWindow("Data"))
+        menu_tables.addAction("Settings", lambda: self.newWindow("Settings"))
+
+        self.btn_add_panel.setMenu(add_panel_menu)
+        self.toolbar.addWidget(self.btn_add_panel)
+
+        # 2. [ 🎛 Shared Channel Controller ] QAction
+        self.act_shared_ctrl = QAction("🎛 Shared Channel Controller", self)
+        self.act_shared_ctrl.setToolTip("Open or bring to focus the Shared Channel Controller panel")
+        self.act_shared_ctrl.triggered.connect(self.open_or_show_shared_channel_panel)
+        self.toolbar.addAction(self.act_shared_ctrl)
+
+        # 3. [ 📐 Layouts ▾ ] QToolButton with popup menu
+        self.btn_layouts = QToolButton(self)
+        self.btn_layouts.setText("📐 Layouts ▾")
+        self.btn_layouts.setPopupMode(QToolButton.InstantPopup)
+        layout_menu = QMenu(self.btn_layouts)
+
+        layout_menu.addAction(
+            "Shared Channel Group Suite (Synced)",
+            lambda: self.apply_default_layout("Shared Channel Group Suite"),
+        )
+        layout_menu.addAction(
+            "Default Analysis Layout",
+            lambda: self.apply_default_layout("Default Analysis Layout"),
+        )
+        layout_menu.addAction(
+            "Dual Unit Compare",
+            lambda: self.apply_default_layout("Dual Unit Compare"),
+        )
+        layout_menu.addAction(
+            "Single Trace Inspector",
+            lambda: self.apply_default_layout("Single Trace Inspector"),
+        )
+        layout_menu.addSeparator()
+        layout_menu.addAction("Save Current Layout As...", self.prompt_save_perspective)
+        layout_menu.addAction("Load Saved Layout...", self.prompt_load_perspective)
+        layout_menu.addAction(
+            "Reset to Default Layout",
+            lambda: self.apply_default_layout("Default Analysis Layout"),
+        )
+
+        self.btn_layouts.setMenu(layout_menu)
+        self.toolbar.addWidget(self.btn_layouts)
 
         # Menu bar
         self.menubar = self.menuBar()
@@ -257,6 +544,36 @@ class MdiView(QMainWindow):
         )
         edit_menu.addAction(
             QAction("load perspective", self, triggered=self.loadPerspectives)
+        )
+
+        channels_menu = self.menubar.addMenu("&Channels")
+        channels_menu.addAction(
+            QAction(
+                "New Channel Group Sub-Window...",
+                self,
+                triggered=lambda: self.newWindow("ChannelGroupContainer"),
+            )
+        )
+        channels_menu.addAction(
+            QAction(
+                "Shared Channel Controller...",
+                self,
+                triggered=self.open_or_show_shared_channel_panel,
+            )
+        )
+        channels_menu.addAction(
+            QAction(
+                "Manage Channel Groups...",
+                self,
+                triggered=lambda: ChannelGroupDialog(parent=self, state=self.state).exec(),
+            )
+        )
+        channels_menu.addAction(
+            QAction(
+                "Open Dual Unit View (Unit 0 & Unit 1)...",
+                self,
+                triggered=self.open_dual_unit_view,
+            )
         )
 
         help_menu = self.menubar.addMenu("Help")
@@ -335,7 +652,8 @@ class MdiView(QMainWindow):
         self.shortcut_copylast = QShortcut(
             QKeySequence(Qt.Key_Space), self, context=Qt.ApplicationShortcut
         )
-        self.shortcut_copylast.activated.connect(lambda: self.state.setUnit(-1))
+        self.shortcut_copylast.activated.connect(self._on_space_pressed)
+        self.shortcut_follow_live = self.shortcut_copylast
 
         self.shortcut_copynext = QShortcut(
             QKeySequence(Qt.Modifier.SHIFT | Qt.Key.Key_Space),
@@ -464,6 +782,17 @@ class MdiView(QMainWindow):
         )
         self.shortcut_copy_previous.activated.connect(copy_previous)
 
+    def _toggle_follow_live(self):
+        if self.state is not None and getattr(self.state, "is_streaming", False):
+            self.state.set_follow_live(not bool(getattr(self.state, "follow_live", True)))
+            return True
+        return False
+
+    def _on_space_pressed(self):
+        if not self._toggle_follow_live():
+            if self.state is not None:
+                self.state.setUnit(-1)
+
     def export_csv(self):
         save_filename = QFileDialog.getSaveFileName(self, "Export")[0]
         if not save_filename:
@@ -516,10 +845,76 @@ class MdiView(QMainWindow):
         if imported_units:
             self.state.set_data(spike_groups=(self.state.spike_groups or []) + imported_units)
 
-    def newWindow(self, k, pos=QtAds.TopDockWidgetArea, name=None):
-        # TODO: this needs to be smarter. window names must be unique for perspectives. need to be able to recreate old windows by name
+    def newWindow(
+        self,
+        k,
+        pos=QtAds.TopDockWidgetArea,
+        name=None,
+        target_unit=None,
+        channels=None,
+        shared_set=None,
+        wrap_in_channel_group=None,
+    ):
+        # 1. Singleton OpenEphysLive view: reuse existing instance without re-instantiating
+        if k == "OpenEphysLive" and getattr(self, "_open_ephys_live_dock", None) is not None:
+            dock = self._open_ephys_live_dock
+            if dock.isClosed() or not dock.isVisible():
+                dock.toggleView(True)
+                if pos is not None and pos != QtAds.NoDockWidgetArea:
+                    self.dock_manager.addDockWidget(pos, dock)
+            dock.show()
+            dock.raise_()
+            return dock.widget()
 
-        w = self.window_options[k](parent=self, state=self.state)
+        # 2. Channel group container wrapping:
+        # If requested or if component is channel/unit specific, wrap into a ChannelGroupContainer
+        channel_specific_views = (
+            "MultiTrace",
+            "MultiTraceFixedView",
+            "UnitView",
+            "UnitFootprintView",
+            "SingleTraceView",
+            "MultiTrace (PyQtGraph)",
+            "MultiTraceFixed (PyQtGraph)",
+            "SingleTrace (PyQtGraph)",
+            "UnitView (PyQtGraph)",
+            "UnitFootprint (PyQtGraph)",
+        )
+        should_wrap = wrap_in_channel_group or (
+            wrap_in_channel_group is None and (target_unit is not None or channels is not None)
+        )
+
+        if should_wrap and k in channel_specific_views and k in self.window_options:
+            container = ChannelGroupContainerView(parent=self, state=self.state)
+            inner_w = self.window_options[k](parent=container, state=self.state)
+            container.add_view(inner_w, title=k)
+            if shared_set is not None:
+                container.channel_bar.bind_to_shared_set(shared_set)
+            if target_unit is not None:
+                container.channel_bar.bind_to_unit(target_unit)
+                if channels is not None:
+                    container.channel_bar.bind_to_channels(channels)
+                elif shared_set is None and hasattr(container.channel_bar, "set_channel_mode_unit"):
+                    container.channel_bar.set_channel_mode_unit()
+            elif channels is not None:
+                container.channel_bar.bind_to_channels(channels)
+            w = container
+        else:
+            w = self.window_options[k](parent=self, state=self.state)
+
+            # Apply target unit, channels, or shared set binding if component supports it
+            if hasattr(w, "channel_bar") and w.channel_bar is not None:
+                if shared_set is not None:
+                    w.channel_bar.bind_to_shared_set(shared_set)
+                if target_unit is not None:
+                    w.channel_bar.bind_to_unit(target_unit)
+                    if channels is not None:
+                        w.channel_bar.bind_to_channels(channels)
+                    elif shared_set is None and hasattr(w.channel_bar, "set_channel_mode_unit"):
+                        w.channel_bar.set_channel_mode_unit()
+                elif channels is not None:
+                    w.channel_bar.bind_to_channels(channels)
+
         window_no = len(
             [
                 x
@@ -529,16 +924,45 @@ class MdiView(QMainWindow):
         )
 
         if name is None:
-            name = k + (f" {window_no}" if window_no > 0 else "")
+            if isinstance(w, ChannelGroupContainerView):
+                prefix = f"Channel Group [{k}]"
+                if target_unit is not None:
+                    prefix += f" (Unit {target_unit})"
+                name = prefix
+            elif shared_set is not None:
+                name = f"{k} [{shared_set}]"
+            elif target_unit is not None and self.state and 0 <= target_unit < len(self.state.spike_groups):
+                u_name = getattr(self.state.spike_groups[target_unit].event, "name", f"unit_{target_unit}")
+                name = f"{k} [Unit {target_unit}: {u_name}]"
+            else:
+                name = k + (f" {window_no}" if window_no > 0 else "")
 
         w2 = QtAds.CDockWidget(name)
         w2.setWidget(w)
-        w2.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, True)
+        if k == "OpenEphysLive":
+            w2.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
+            self._open_ephys_live_dock = w2
+        else:
+            w2.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, True)
         w2.setFeature(QtAds.CDockWidget.DockWidgetForceCloseWithArea, True)
-        self.dock_manager.addDockWidget(QtAds.NoDockWidgetArea, w2)
+        if pos is not None and pos != QtAds.NoDockWidgetArea:
+            self.dock_manager.addDockWidget(pos, w2)
+        else:
+            self.dock_manager.addDockWidget(QtAds.NoDockWidgetArea, w2)
         self.cur_windows.append(w2)
         w2.show()
+        if hasattr(self, "settings_panel") and self.settings_panel is not None:
+            self.settings_panel.setActiveView(w)
         return w
+
+    def open_dual_unit_view(self):
+        """Convenience action to open comparison windows for Unit 0 and Unit 1 side-by-side."""
+        if not self.state or len(self.state.spike_groups) < 1:
+            QMessageBox.information(self, "No Units", "No tracked units available in state.")
+            return
+        w1 = self.newWindow("MultiTrace", target_unit=0)
+        if len(self.state.spike_groups) >= 2:
+            w2 = self.newWindow("MultiTrace", target_unit=1)
 
     @Slot()
     def open(self, type=None):

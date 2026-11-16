@@ -7,8 +7,12 @@ import logging
 
 @pytest.fixture()
 def state():
+    import os
+    fname = r"/Users/xs19785/Documents/Open Ephys/06-dec.h5"
+    if not os.path.exists(fname):
+        pytest.skip(f"Local test file {fname} not found")
     state = ViewerState()
-    state.loadFile(r"/Users/xs19785/Documents/Open Ephys/06-dec.h5")
+    state.loadFile(fname)
     return state
 
 

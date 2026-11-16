@@ -1,16 +1,16 @@
 import sys
 from dataclasses import dataclass, field
 from re import I
-from typing import Any, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
-import matplotlib.style as mplstyle
 import numpy as np
 import PySide6
+from PySide6.QtCore import QSignalBlocker, Slot
 import quantities as pq
-from matplotlib.path import Path
-from matplotlib.widgets import PolygonSelector
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
@@ -23,11 +23,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .basic_tracking import track_basic
+from .basic_tracking import track_basic, track_sweep_waveform
+from .dsp.detectors import DetectorParamSpec, SpikeDetectorRegistry
 from .ViewerState import ViewerState
+from .live_orchestrator import BatchingMode
+from .helpers import qsignal_throttle
 from neo import Event
 
-mplstyle.use("fast")
+_CORE_PARAM_NAMES = {"window_ms", "window_size", "threshold", "max_skip", "track_limit"}
 
 
 class TrackingView(QMainWindow):
@@ -37,8 +40,11 @@ class TrackingView(QMainWindow):
         state: ViewerState = None,
     ) -> None:
         super().__init__(parent)
-        self.state = state
+        self.state = None
         self._syncing = False
+        self._updating_ui = False
+        self._state_connections: list[tuple] = []
+        self.extra_param_controls: Dict[str, QWidget] = {}
 
         main_vbox = QVBoxLayout()
         header_layout = QHBoxLayout()
@@ -49,6 +55,11 @@ class TrackingView(QMainWindow):
         main_vbox.addLayout(header_layout)
 
         layout = QFormLayout()
+        self.form_layout = layout
+
+        self.qcb_algorithm = QComboBox(self)
+        self.refresh_algorithms()
+        layout.addRow(self.tr("Algorithm"), self.qcb_algorithm)
 
         qsb_window_size = QDoubleSpinBox(self)
         qsb_window_size.setMinimumWidth(100)
@@ -71,7 +82,7 @@ class TrackingView(QMainWindow):
 
         try:
             self.updateThresholdFromUnit()
-        except:
+        except Exception:
             pass
         ql = QHBoxLayout()
         ql.addWidget(qsb_threshold)
@@ -96,10 +107,18 @@ class TrackingView(QMainWindow):
         self.qsb_track_limit = qsb_track_limit
         layout.addRow(self.tr("Limit tracking"), qsb_track_limit)
 
-        self.qcb_auto_track = PySide6.QtWidgets.QCheckBox(self.tr("Live Auto-Track"), self)
+        # Dynamic container for algorithm-specific DetectorParamSpec parameters
+        self.extra_params_widget = QWidget(self)
+        self.extra_params_layout = QFormLayout(self.extra_params_widget)
+        self.extra_params_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addRow(self.extra_params_widget)
+
+        self.qcb_auto_track = QCheckBox(self.tr("Live Auto-Track"), self)
         layout.addRow(self.qcb_auto_track)
 
         qbut_go = QPushButton("Track")
+        self.qbut_go = qbut_go
+        self.qpb_track = qbut_go
         layout.addRow(qbut_go)
         qbut_go.clicked.connect(self.trackUnit)
 
@@ -126,23 +145,182 @@ class TrackingView(QMainWindow):
         w.setLayout(main_vbox)
         self.setCentralWidget(w)
 
+        # Build initial dynamic parameter controls
+        self._rebuild_extra_param_controls(self.get_selected_algorithm())
+
         # Connect control changes to update active unit
+        self.qcb_algorithm.currentIndexChanged.connect(self.on_algorithm_changed)
         self.qsb_window_size.valueChanged.connect(self._on_params_changed)
         self.qsb_threshold.valueChanged.connect(self._on_params_changed)
         self.qsb_max_skip.valueChanged.connect(self._on_params_changed)
+        self.qsb_track_limit.valueChanged.connect(self._on_params_changed)
         self.qcb_auto_track.toggled.connect(self._on_params_changed)
 
-        if self.state is not None:
-            if hasattr(self.state, "onUnitGroupChange"):
-                self.state.onUnitGroupChange.connect(self.sync_from_active_unit)
-            if hasattr(self.state, "onUnitChange"):
-                self.state.onUnitChange.connect(self.sync_from_active_unit)
-            if hasattr(self.state, "onNewSweep"):
-                self.state.onNewSweep.connect(self.on_new_sweep)
+        self._sync_throttled = qsignal_throttle(self.sync_from_active_unit, 200, parent=self, weight="heavy")
+
+        if state is not None:
+            self.set_state(state)
+
+    def unset_connections(self):
+        """Disconnect all tracked state signal connections."""
+        for sig, slot in getattr(self, "_state_connections", []):
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._state_connections = []
+
+    @Slot()
+    @Slot(int)
+    @Slot(int, int)
+    def _on_state_unit_sync(self, *args):
+        if self.state is not None and getattr(self.state, "is_streaming", False):
+            self._sync_throttled()
+        else:
+            self.sync_from_active_unit()
+
+    def set_state(self, state: ViewerState):
+        self.unset_connections()
+        self.state = state
+        if self.state is None:
+            return
+
+        for sig_name in (
+            "onUnitGroupChange",
+            "onActiveUnitChanged",
+            "onUnitListChanged",
+            "onUnitParamsChanged",
+        ):
+            if hasattr(self.state, sig_name):
+                sig = getattr(self.state, sig_name)
+                sig.connect(self._on_state_unit_sync)
+                self._state_connections.append((sig, self._on_state_unit_sync))
+
+        orch = getattr(self.state, "live_orchestrator", None)
+        if orch is not None:
+            orch.register(
+                f"trackingview_{id(self)}",
+                "auto_track",
+                self._live_tracking_fn,
+                self._on_live_tracking_result,
+                batching=BatchingMode.BATCH,
+            )
+
+        self.sync_from_active_unit()
+
+    def refresh_algorithms(self) -> None:
+        """Populate algorithm combo box from SpikeDetectorRegistry."""
+        current_algo = self.get_selected_algorithm()
+        with QSignalBlocker(self.qcb_algorithm):
+            self.qcb_algorithm.clear()
+            for plugin in SpikeDetectorRegistry.list_detectors():
+                self.qcb_algorithm.addItem(plugin.display_name, plugin.name)
+            idx = self.qcb_algorithm.findData(current_algo)
+            if idx >= 0:
+                self.qcb_algorithm.setCurrentIndex(idx)
+
+    def get_selected_algorithm(self) -> str:
+        if hasattr(self, "qcb_algorithm") and self.qcb_algorithm.count() > 0:
+            data = self.qcb_algorithm.currentData()
+            if data:
+                return str(data)
+        return "basic"
+
+    def _rebuild_extra_param_controls(self, algorithm: str) -> None:
+        while self.extra_params_layout.rowCount() > 0:
+            self.extra_params_layout.removeRow(0)
+        self.extra_param_controls.clear()
+
+        detector = SpikeDetectorRegistry.get(algorithm)
+        for spec in detector.param_schema():
+            if spec.name in _CORE_PARAM_NAMES:
+                continue
+            ctrl = self._create_param_widget(spec)
+            self.extra_param_controls[spec.name] = ctrl
+            self.extra_params_layout.addRow(spec.label, ctrl)
+
+        self.extra_params_widget.setVisible(len(self.extra_param_controls) > 0)
+
+    def _create_param_widget(self, spec: DetectorParamSpec) -> QWidget:
+        if spec.param_type == "bool":
+            w = QCheckBox(self.extra_params_widget)
+            w.setChecked(bool(spec.default))
+            w.toggled.connect(self._on_params_changed)
+            return w
+        if spec.param_type == "choice":
+            w = QComboBox(self.extra_params_widget)
+            for ch in spec.choices or []:
+                w.addItem(str(ch), ch)
+            idx = w.findData(spec.default)
+            if idx >= 0:
+                w.setCurrentIndex(idx)
+            w.currentIndexChanged.connect(self._on_params_changed)
+            return w
+        if spec.param_type == "int":
+            w = QSpinBox(self.extra_params_widget)
+            w.setRange(int(spec.min_val), int(spec.max_val))
+            w.setSingleStep(max(1, int(spec.step)))
+            w.setValue(int(spec.default))
+            w.valueChanged.connect(self._on_params_changed)
+            return w
+        w = QDoubleSpinBox(self.extra_params_widget)
+        w.setDecimals(int(spec.decimals))
+        w.setRange(float(spec.min_val), float(spec.max_val))
+        w.setSingleStep(float(spec.step))
+        w.setValue(float(spec.default))
+        w.valueChanged.connect(self._on_params_changed)
+        return w
+
+    def _read_extra_params(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for name, w in self.extra_param_controls.items():
+            if isinstance(w, QCheckBox):
+                out[name] = bool(w.isChecked())
+            elif isinstance(w, QComboBox):
+                out[name] = w.currentData() if w.currentData() is not None else w.currentText()
+            elif isinstance(w, QSpinBox):
+                out[name] = int(w.value())
+            elif isinstance(w, QDoubleSpinBox):
+                out[name] = float(w.value())
+        return out
+
+    def _write_extra_params(self, params: Dict[str, Any]) -> None:
+        for name, w in self.extra_param_controls.items():
+            if name not in params:
+                continue
+            val = params[name]
+            with QSignalBlocker(w):
+                if isinstance(w, QCheckBox):
+                    w.setChecked(bool(val))
+                elif isinstance(w, QComboBox):
+                    idx = w.findData(val)
+                    if idx < 0:
+                        idx = w.findText(str(val))
+                    if idx >= 0:
+                        w.setCurrentIndex(idx)
+                elif isinstance(w, QSpinBox):
+                    w.setValue(int(val))
+                elif isinstance(w, QDoubleSpinBox):
+                    w.setValue(float(val))
+
+    def on_algorithm_changed(self, *args) -> None:
+        if self._syncing:
+            return
+        algo = self.get_selected_algorithm()
+        self._rebuild_extra_param_controls(algo)
+        self._on_params_changed()
+
+    def updateView(self):
+        self.sync_from_active_unit()
+
+    def _on_unit_updated(self, *args):
+        if self.state is not None and getattr(self.state, "is_streaming", False):
+            self._sync_throttled()
+        else:
             self.sync_from_active_unit()
 
     def sync_from_active_unit(self):
-        if self.state is None:
+        if self._updating_ui or self.state is None:
             return
         sg = None
         try:
@@ -158,26 +336,37 @@ class TrackingView(QMainWindow):
             return
 
         self._syncing = True
-        self.qsb_window_size.blockSignals(True)
-        self.qsb_threshold.blockSignals(True)
-        self.qsb_max_skip.blockSignals(True)
-        self.qcb_auto_track.blockSignals(True)
+        try:
+            with (
+                QSignalBlocker(self.qcb_algorithm),
+                QSignalBlocker(self.qsb_window_size),
+                QSignalBlocker(self.qsb_threshold),
+                QSignalBlocker(self.qsb_max_skip),
+                QSignalBlocker(self.qsb_track_limit),
+                QSignalBlocker(self.qcb_auto_track),
+            ):
+                name = getattr(sg.event, "name", "") if (getattr(sg, "event", None) is not None and getattr(sg.event, "name", None)) else f"unit_{self.state.cur_spike_group}"
+                ch = getattr(sg, "tracking_channel", "") or getattr(sg, "channel", "") or "default"
+                self.lbl_active_unit.setText(f"Unit: {name}")
+                self.lbl_unit_channel.setText(f"Channel: {ch}")
 
-        name = getattr(sg.event, "name", "") if (getattr(sg, "event", None) is not None and getattr(sg.event, "name", None)) else f"unit_{self.state.cur_spike_group}"
-        ch = getattr(sg, "tracking_channel", "") or getattr(sg, "channel", "") or "default"
-        self.lbl_active_unit.setText(f"Unit: {name}")
-        self.lbl_unit_channel.setText(f"Channel: {ch}")
+                algo = getattr(sg, "tracking_algorithm", "basic") or "basic"
+                idx = self.qcb_algorithm.findData(algo)
+                if idx < 0:
+                    self.refresh_algorithms()
+                    idx = self.qcb_algorithm.findData(algo)
+                if idx >= 0 and self.qcb_algorithm.currentIndex() != idx:
+                    self.qcb_algorithm.setCurrentIndex(idx)
+                self._rebuild_extra_param_controls(algo)
+                self._write_extra_params(getattr(sg, "tracking_params", {}) or {})
 
-        self.qsb_window_size.setValue(float(getattr(sg, "tracking_window_ms", 5.0)))
-        self.qsb_threshold.setValue(float(getattr(sg, "tracking_threshold_mv", 0.01)))
-        self.qsb_max_skip.setValue(int(getattr(sg, "tracking_max_skips", 1)))
-        self.qcb_auto_track.setChecked(bool(getattr(sg, "auto_track", False)))
-
-        self.qsb_window_size.blockSignals(False)
-        self.qsb_threshold.blockSignals(False)
-        self.qsb_max_skip.blockSignals(False)
-        self.qcb_auto_track.blockSignals(False)
-        self._syncing = False
+                self.qsb_window_size.setValue(float(getattr(sg, "tracking_window_ms", 5.0)))
+                self.qsb_threshold.setValue(float(getattr(sg, "tracking_threshold_mv", 0.01)))
+                self.qsb_max_skip.setValue(int(getattr(sg, "tracking_max_skips", 1)))
+                self.qsb_track_limit.setValue(int(getattr(sg, "track_limit", 0)))
+                self.qcb_auto_track.setChecked(bool(getattr(sg, "auto_track", False)))
+        finally:
+            self._syncing = False
 
     def _on_params_changed(self, *args):
         if self._syncing or self.state is None:
@@ -192,43 +381,75 @@ class TrackingView(QMainWindow):
         if sg is None:
             return
 
+        algo_val = self.get_selected_algorithm()
         win_val = float(self.qsb_window_size.value())
         thresh_val = float(self.qsb_threshold.value())
         skip_val = int(self.qsb_max_skip.value())
+        limit_val = int(self.qsb_track_limit.value())
         track_val = bool(self.qcb_auto_track.isChecked())
+        extra_params = self._read_extra_params()
 
-        sg.tracking_window_ms = win_val
-        sg.tracking_threshold_mv = thresh_val
-        sg.tracking_max_skips = skip_val
-        sg.auto_track = track_val
+        self._updating_ui = True
+        try:
+            sg.tracking_algorithm = algo_val
+            sg.tracking_window_ms = win_val
+            sg.tracking_threshold_mv = thresh_val
+            sg.tracking_max_skips = skip_val
+            sg.track_limit = limit_val
+            sg.auto_track = track_val
+            if not hasattr(sg, "tracking_params") or sg.tracking_params is None:
+                sg.tracking_params = {}
+            sg.tracking_params.update(extra_params)
 
-        if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
-            sg.event.annotations["tracking_window_ms"] = win_val
-            sg.event.annotations["tracking_threshold_mv"] = thresh_val
-            sg.event.annotations["tracking_max_skips"] = skip_val
-            sg.event.annotations["auto_track"] = track_val
+            if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+                sg.event.annotations["tracking_algorithm"] = algo_val
+                sg.event.annotations["tracking_window_ms"] = win_val
+                sg.event.annotations["tracking_threshold_mv"] = thresh_val
+                sg.event.annotations["tracking_max_skips"] = skip_val
+                sg.event.annotations["track_limit"] = limit_val
+                sg.event.annotations["auto_track"] = track_val
+                sg.event.annotations["tracking_params"] = dict(sg.tracking_params)
 
-        if hasattr(self.state, "onUnitGroupChange"):
-            self.state.onUnitGroupChange.emit()
+            if hasattr(self.state, "onUnitParamsChanged"):
+                self.state.onUnitParamsChanged.emit(self.state.cur_spike_group)
+            elif hasattr(self.state, "onUnitGroupChange"):
+                self.state.onUnitGroupChange.emit()
+        finally:
+            self._updating_ui = False
 
     def apply_params_to_all_units(self):
         if self.state is None or not hasattr(self.state, "spike_groups"):
             return
+        algo_val = self.get_selected_algorithm()
         win_val = float(self.qsb_window_size.value())
         thresh_val = float(self.qsb_threshold.value())
         skip_val = int(self.qsb_max_skip.value())
-        for sg in self.state.spike_groups:
-            sg.tracking_window_ms = win_val
-            sg.tracking_threshold_mv = thresh_val
-            sg.tracking_max_skips = skip_val
-            if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
-                sg.event.annotations["tracking_window_ms"] = win_val
-                sg.event.annotations["tracking_threshold_mv"] = thresh_val
-                sg.event.annotations["tracking_max_skips"] = skip_val
-        if hasattr(self.state, "onUnitGroupChange"):
-            self.state.onUnitGroupChange.emit()
+        extra_params = self._read_extra_params()
+        self._updating_ui = True
+        try:
+            for sg in self.state.spike_groups:
+                sg.tracking_algorithm = algo_val
+                sg.tracking_window_ms = win_val
+                sg.tracking_threshold_mv = thresh_val
+                sg.tracking_max_skips = skip_val
+                if not hasattr(sg, "tracking_params") or sg.tracking_params is None:
+                    sg.tracking_params = {}
+                sg.tracking_params.update(extra_params)
+                if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+                    sg.event.annotations["tracking_algorithm"] = algo_val
+                    sg.event.annotations["tracking_window_ms"] = win_val
+                    sg.event.annotations["tracking_threshold_mv"] = thresh_val
+                    sg.event.annotations["tracking_max_skips"] = skip_val
+                    sg.event.annotations["tracking_params"] = dict(sg.tracking_params)
+            if hasattr(self.state, "onUnitParamsChanged"):
+                self.state.onUnitParamsChanged.emit(-1)
+            elif hasattr(self.state, "onUnitGroupChange"):
+                self.state.onUnitGroupChange.emit()
+        finally:
+            self._updating_ui = False
 
-    def enable_all_units(self):
+    def enable_all_units_tracking(self):
+        """Enable auto-tracking for all units and notify views."""
         if self.state is None or not hasattr(self.state, "spike_groups"):
             return
         for sg in self.state.spike_groups:
@@ -236,10 +457,16 @@ class TrackingView(QMainWindow):
             if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
                 sg.event.annotations["auto_track"] = True
         self.sync_from_active_unit()
-        if hasattr(self.state, "onUnitGroupChange"):
+        if hasattr(self.state, "onUnitParamsChanged"):
+            self.state.onUnitParamsChanged.emit(-1)
+        elif hasattr(self.state, "onUnitGroupChange"):
             self.state.onUnitGroupChange.emit()
 
-    def disable_all_units(self):
+    def enable_all_units(self):
+        return self.enable_all_units_tracking()
+
+    def disable_all_units_tracking(self):
+        """Disable auto-tracking for all units and notify views."""
         if self.state is None or not hasattr(self.state, "spike_groups"):
             return
         for sg in self.state.spike_groups:
@@ -247,8 +474,13 @@ class TrackingView(QMainWindow):
             if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
                 sg.event.annotations["auto_track"] = False
         self.sync_from_active_unit()
-        if hasattr(self.state, "onUnitGroupChange"):
+        if hasattr(self.state, "onUnitParamsChanged"):
+            self.state.onUnitParamsChanged.emit(-1)
+        elif hasattr(self.state, "onUnitGroupChange"):
             self.state.onUnitGroupChange.emit()
+
+    def disable_all_units(self):
+        return self.disable_all_units_tracking()
 
     def track_all_enabled_units(self):
         if self.state is None or self.state.event_signal is None:
@@ -260,8 +492,102 @@ class TrackingView(QMainWindow):
     def on_new_sweep(self, stimno: int):
         if self.state is None:
             return
+        # ViewerState.append_sweep already dispatches background tracking on QThreadPool.
+        # Under UI strain, skip duplicate synchronous main-thread tracking.
+        sched = getattr(self.state, "frame_scheduler", None)
+        if sched is not None and sched.should_skip_nonessential_work():
+            return
         self.state.track_stimulus_all_units(stimno)
 
+    def _live_tracking_fn(self, batch):
+        """Runs on the orchestrator worker thread for a batch of new sweeps."""
+        state = self.state
+        detections = []
+        if state is None or state.event_signal is None or not batch.items:
+            return detections
+
+        sr = float(
+            state.sampling_rate
+            if state.sampling_rate is not None
+            else 30000.0
+        )
+        window_size = state.window_size
+
+        units = [
+            (i, sg)
+            for i, sg in enumerate(state.spike_groups)
+            if getattr(sg, "auto_track", False)
+        ]
+        if not units:
+            return detections
+
+        for item in batch.items:
+            stimno = item.stim_index
+            if stimno < 0 or stimno >= len(state.event_signal):
+                continue
+            for unit_idx, sg in units:
+                if sg.get_sweep_sample(stimno, state.event_signal, sr, window_size) is not None:
+                    continue
+                ch = (
+                    getattr(sg, "tracking_channel", "")
+                    or getattr(sg, "channel", "")
+                )
+                row = item.erp_row(ch) if ch else None
+                if row is None or row.size == 0:
+                    continue
+                sig_units = getattr(getattr(state, "analog_signal", None), "units", None)
+                if sig_units is not None:
+                    row = row * sig_units
+
+                prev_latency = None
+                max_skips = getattr(sg, "tracking_max_skips", 1)
+                min_stim = max(0, stimno - 1 - max_skips)
+                for prev_s in range(stimno - 1, min_stim - 1, -1):
+                    prev_sample = sg.get_sweep_sample(
+                        prev_s, state.event_signal, sr, window_size
+                    )
+                    if prev_sample is not None:
+                        prev_latency = (prev_sample / sr) * pq.s
+                        break
+                    idx_arr = getattr(sg, "idx_arr", None)
+                    if idx_arr is not None and prev_s < len(idx_arr) and idx_arr[prev_s] is not None:
+                        prev_latency = (idx_arr[prev_s][0] / sr) * pq.s
+                        break
+                if prev_latency is None:
+                    continue
+
+                algo = getattr(sg, "tracking_algorithm", "basic") or "basic"
+                unit_params = getattr(sg, "tracking_params", {}) or {}
+                detected = track_sweep_waveform(
+                    row,
+                    sr,
+                    prev_latency,
+                    threshold=getattr(sg, "tracking_threshold_mv", 0.01),
+                    window_ms=getattr(sg, "tracking_window_ms", 5.0),
+                    algorithm=algo,
+                    params=unit_params,
+                    template_matcher=getattr(sg, "_template_matcher", None),
+                )
+                if detected is not None:
+                    detections.append((unit_idx, int(detected), int(stimno)))
+
+        return detections
+
+    def _on_live_tracking_result(self, detections, error):
+        """Applies orchestrator detections on the GUI thread."""
+        if error or not detections or self.state is None:
+            return
+        for unit_idx, detected_sample, stimno in detections:
+            self.state.setUnit(detected_sample, stimno=stimno, unit_idx=unit_idx, save_undo=False)
+
+    def closeEvent(self, event):
+        self.unset_connections()
+        state = getattr(self, "state", None)
+        if state is not None:
+            orch = getattr(state, "live_orchestrator", None)
+            if orch is not None:
+                orch.unregister(f"trackingview_{id(self)}")
+        super().closeEvent(event)
 
     def updateThresholdFromUnit(self):
         if self.state is None:
@@ -269,24 +595,27 @@ class TrackingView(QMainWindow):
         unit_events = self.state.getUnitGroup().event.rescale(pq.s)
         last_event = unit_events.searchsorted(
             (self.state.event_signal[self.state.stimno] + (0.5 * pq.s)).rescale(pq.s)
-        )  # find the most recent event
+        )
 
         starting_time = unit_events[max(last_event - 1, 0)]
         dat = self.state.analog_signal.time_slice(
             starting_time, starting_time + 0.1 * pq.ms
         )
-        threshold = (dat[0] * 0.8).rescale("mV")
+        threshold = float(np.asarray((dat[0] * 0.8).rescale("mV").magnitude).flat[0])
         self.qsb_threshold.setValue(threshold)
 
     def trackUnit(self):
-        unit_events = self.state.getUnitGroup().event.rescale(pq.s)
+        sg = self.state.getUnitGroup()
+        unit_events = sg.event.rescale(pq.s)
         last_event = unit_events.searchsorted(
             (self.state.event_signal[self.state.stimno] + (0.5 * pq.s)).rescale(pq.s)
-        )  # find the most recent event
+        )
 
         starting_time = unit_events[max(last_event - 1, 0)]
         window = self.qsb_window_size.value() * pq.ms
         threshold = self.qsb_threshold.value() * pq.mV
+        algo = self.get_selected_algorithm()
+        extra_params = self._read_extra_params()
 
         evt2 = track_basic(
             self.state.analog_signal,
@@ -295,12 +624,14 @@ class TrackingView(QMainWindow):
             window=window,
             threshold=threshold,
             max_skip=self.qsb_max_skip.value(),
-            track_limit=self.qsb_track_limit.value()
+            track_limit=self.qsb_track_limit.value(),
+            algorithm=algo,
+            params=extra_params,
         )
 
         self.state.updateUnit(
             event=evt2, merge=True
-        )  # Perhaps create new units to merge later?
+        )
 
 
 if __name__ == "__main__":

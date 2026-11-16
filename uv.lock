@@ -1078,6 +1078,18 @@ wheels = [
 ]
 
 [[package]]
+name = "pyqtgraph"
+version = "0.14.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama" },
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/36/4c242f81fdcbfa4fb62a5645f6af79191f4097a0577bd5460c24f19cc4ef/pyqtgraph-0.14.0-py3-none-any.whl", hash = "sha256:7abb7c3e17362add64f8711b474dffac5e7b0e9245abdf992e9a44119b7aa4f5", size = 1924755, upload-time = "2025-11-16T19:43:22.251Z" },
+]
+
+[[package]]
 name = "pyside6"
 version = "6.7.2"
 source = { registry = "https://pypi.org/simple" }
@@ -1555,6 +1567,7 @@ dependencies = [
     { name = "numpy" },
     { name = "open-ephys-python-tools" },
     { name = "pynwb" },
+    { name = "pyqtgraph" },
     { name = "pyside6" },
     { name = "pyside6-qtads" },
     { name = "pytest" },
@@ -1586,6 +1599,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.2.0,<2.3" },
     { name = "open-ephys-python-tools", specifier = ">=0.1.4,<0.1.5" },
     { name = "pynwb", specifier = ">=2.3.2,<2.4" },
+    { name = "pyqtgraph", specifier = ">=0.14.0" },
     { name = "pyside6", specifier = ">=6.7.0,<6.7.3" },
     { name = "pyside6-qtads", specifier = ">=4.3.0.2,<4.4" },
     { name = "pytest", specifier = ">=7.2.0,<7.3" },

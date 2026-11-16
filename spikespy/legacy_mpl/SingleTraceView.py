@@ -23,7 +23,7 @@ from PySide6.QtCore import (
     QRunnable,
     QTimer,
 )
-from .helpers import qsignal_throttle
+from ..helpers import qsignal_throttle, run_adaptive_render
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -47,8 +47,10 @@ from PySide6.QtWidgets import (
 )
 
 from scipy.signal import fftconvolve, find_peaks
-from .processing import create_erp_signals
-from .ViewerState import ViewerState
+from ..processing import create_erp_signals
+from ..ViewerState import ViewerState
+from ..live_orchestrator import LiveFrameConsumerMixin
+from ..ChannelGroupBar import ChannelGroupBar
 import quantities as pq
 from matplotlib.ticker import Formatter
 
@@ -88,7 +90,7 @@ class SweepConvProxy:
 # Custom formatter class
 
 
-class SingleTraceView(QMainWindow):
+class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
     def __init__(
         self,
         parent: Optional[PySide6.QtWidgets.QWidget] = None,
@@ -142,6 +144,12 @@ class SingleTraceView(QMainWindow):
         self.toolbar.addWidget(self.chk_unit_neighbors_only)
         self.toolbar.addWidget(self.spin_chan_spacing)
 
+        # Independent channel group and unit binding toolbar
+        self.channel_bar = ChannelGroupBar(parent=self, state=self.state)
+        self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
+        self.addToolBarBreak()
+        self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+
         self.aux_trace_lines = []
         self.aux_trace_labels = []
 
@@ -183,7 +191,7 @@ class SingleTraceView(QMainWindow):
         self.spin_chan_spacing.valueChanged.connect(self.updateFigure)
 
         if self.state is not None:
-            self.state.onLoadNewFile.connect(self.updateFigure)
+            self._register_data_reload(state, self.updateFigure)
 
             self.state.onUnitChange.connect(lambda *args: setattr(self, "_histogram_dirty", True))
             self.state.onUnitChange.connect(self.updateFigure)
@@ -194,8 +202,10 @@ class SingleTraceView(QMainWindow):
             self.state.onUnitGroupChange.connect(self.updateHistogram)
             self.state.onStimNoChange.connect(self.updateFigure)
 
-            if hasattr(self.state, "onNewSweep"):
-                self.state.onNewSweep.connect(self.on_new_sweep)
+            self._register_live_frames(
+                self.state,
+                lambda stimno: self.on_new_sweep(stimno),
+            )
             if hasattr(self.state, "onNewSpikeEvents"):
                 self.state.onNewSpikeEvents.connect(lambda *args: setattr(self, "_histogram_dirty", True))
                 self.state.onNewSpikeEvents.connect(lambda *args: self.updateFigure())
@@ -232,10 +242,38 @@ class SingleTraceView(QMainWindow):
         self._templates = {}
         self.step = None
         self.setupFigure()
+        self.update_window_title()
+
+    def _on_channel_bar_changed(self):
+        if hasattr(self, "channel_bar"):
+            self.chk_multichannel.blockSignals(True)
+            self.chk_multichannel.setChecked(self.channel_bar.is_multichannel())
+            self.chk_multichannel.blockSignals(False)
+            self.update_window_title()
+            self._histogram_dirty = True
+            self.setupFigure()
+            self.updateFigure_core()
+
+    def update_window_title(self):
+        if hasattr(self, "channel_bar"):
+            summary = self.channel_bar.get_title_summary()
+            self.setWindowTitle(f"SingleTrace {summary}")
+            p = self.parentWidget()
+            if p is not None and hasattr(p, "setWindowTitle"):
+                p.setWindowTitle(f"SingleTrace {summary}")
 
     def get_overlay_channels(self) -> List[str]:
         if not self.chk_multichannel.isChecked() or self.state is None:
             return []
+
+        if hasattr(self, "channel_bar"):
+            all_chans = self.channel_bar.get_selected_channels()
+            primary_name = self.channel_bar.get_primary_channel()
+            # If explicit group or unit channels selected in bar, return them directly
+            mode, _ = self.channel_bar.get_channel_mode()
+            if mode in (self.channel_bar.MODE_FOLLOW_UNIT, self.channel_bar.MODE_GROUP) or (len(all_chans) > 1 and mode != self.channel_bar.MODE_FOLLOW_GLOBAL):
+                return [c for c in all_chans if c != primary_name]
+
         if hasattr(self.state, "get_available_channels"):
             chans = list(self.state.get_available_channels())
         elif getattr(self.state, "segment", None) is not None:
@@ -243,7 +281,11 @@ class SingleTraceView(QMainWindow):
         else:
             chans = []
 
-        sg = self.state.getUnitGroup() if hasattr(self.state, "getUnitGroup") else None
+        sg = (
+            self.channel_bar.get_target_unit()
+            if hasattr(self, "channel_bar")
+            else (self.state.getUnitGroup() if hasattr(self.state, "getUnitGroup") else None)
+        )
         unit_chans = []
         if sg is not None:
             if getattr(sg, "channel", ""):
@@ -264,7 +306,11 @@ class SingleTraceView(QMainWindow):
                 chans = [c for c in chans if c in unit_chans]
 
         # Exclude the primary active channel
-        primary_name = getattr(getattr(self.state, "analog_signal", None), "name", "")
+        primary_name = (
+            self.channel_bar.get_primary_channel()
+            if hasattr(self, "channel_bar")
+            else getattr(getattr(self.state, "analog_signal", None), "name", "")
+        )
         chans = [c for c in chans if c != primary_name]
         return chans
 
@@ -274,15 +320,24 @@ class SingleTraceView(QMainWindow):
         erp = self.state.get_erp()
         if erp is None or erp.shape[0] == 0:
             return
+        if not getattr(self, "_setup_done", False) or self.trace_line_cache is None:
+            self.setupFigure()
+            self._setup_done = True
         self.updateFigure()
+
 
     @Slot()
     def view_clicked(self, e: MouseEvent):
-        if self.toolbar.mode != "" or e.button != 1:
+        if self.toolbar.mode != "" or e.button != 1 or e.inaxes != self.ax or e.xdata is None:
             return
 
-        if e.inaxes == self.ax:
-            self.set_cur_pos(e.xdata * self.state.sampling_rate)
+        try:
+            if np.isnan(e.xdata):
+                return
+            sr = float(self.state.sampling_rate) if self.state and self.state.sampling_rate is not None else 10000.0
+            self.set_cur_pos(e.xdata * sr)
+        except Exception:
+            pass
 
     @Slot()
     def setupFigure(self):
@@ -301,6 +356,7 @@ class SingleTraceView(QMainWindow):
         if erp is None or erp.shape[0] == 0:
             return
 
+        self._setup_done = True
         self.ax.grid(True, which="both")
         if self.trace_line_cache is not None:
             self.trace_line_cache.remove()
@@ -370,9 +426,12 @@ class SingleTraceView(QMainWindow):
         loc = matplotlib.ticker.MultipleLocator(0.01)
         self.ax.xaxis.set_minor_locator(loc)
 
-        self.view.draw()
+        self.view.draw_idle()
         self.view.update()
-        self.toolbar.set_history_buttons()
+        try:
+            self.toolbar.set_history_buttons()
+        except Exception:
+            pass
         self.step = None
         self._histogram_dirty = True
         self.updateHistogram()
@@ -603,7 +662,11 @@ class SingleTraceView(QMainWindow):
         if not getattr(self, "_histogram_dirty", True) and self.step is not None:
             return
 
-        sg = self.state.getUnitGroup()
+        sg = (
+            self.channel_bar.get_target_unit()
+            if hasattr(self, "channel_bar")
+            else (self.state.getUnitGroup() if hasattr(self.state, "getUnitGroup") else None)
+        )
         if self.step is not None:
             try:
                 self.step[0].remove()
@@ -640,29 +703,28 @@ class SingleTraceView(QMainWindow):
         self._dirty = True
 
     def is_view_culled(self) -> bool:
-        if getattr(self, "_user_hidden", False):
-            return True
-        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
-            return True
-        curr = self
-        while curr.parentWidget() is not None:
-            curr = curr.parentWidget()
-            if curr.isMinimized():
+        try:
+            if getattr(self, "_user_hidden", False):
                 return True
-        if self.parentWidget() is not None and not self.isVisible():
-            return True
-        if getattr(self, "_was_shown", False) and not self.isVisible():
-            return True
-        return False
+            win = self.window()
+            if win is not None and win.isMinimized():
+                return True
+            if self.parentWidget() is not None and not self.isVisible():
+                return True
+            if getattr(self, "_was_shown", False) and not self.isVisible():
+                return True
+            return False
+        except Exception:
+            return False
 
     def _on_render_timer_tick(self):
         try:
-            if not self.isVisible():
+            if self.is_view_culled():
                 return
             if not getattr(self, "_dirty", False):
                 return
             self._dirty = False
-            self.updateFigure_core()
+            run_adaptive_render(self, self.updateFigure_core, weight="heavy")
         except RuntimeError:
             pass
 
@@ -680,6 +742,13 @@ class SingleTraceView(QMainWindow):
     def hideEvent(self, event):
         super().hideEvent(event)
         self._user_hidden = True
+        if hasattr(self, "view") and self.view is not None:
+            try:
+                self.view._draw_pending = False
+                from PySide6.QtCore import QCoreApplication
+                QCoreApplication.removePostedEvents(self.view)
+            except Exception:
+                pass
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -698,12 +767,23 @@ class SingleTraceView(QMainWindow):
             return
         if self.state.analog_signal is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
             return
-        erp = self.state.get_erp()
+
+        if not getattr(self, "_setup_done", False) or self.trace_line_cache is None:
+            self.setupFigure()
+            self._setup_done = True
+
+        if hasattr(self, "channel_bar"):
+            primary_ch = self.channel_bar.get_primary_channel()
+            erp = self.state.get_channel_erp(primary_ch)
+            sg = self.channel_bar.get_target_unit()
+        else:
+            erp = self.state.get_erp()
+            sg = self.state.getUnitGroup()
+
         if erp is None or erp.shape[0] == 0:
             return
         if self.state.stimno >= erp.shape[0] or self.state.stimno >= len(self.state.event_signal):
             return
-        sg = self.state.getUnitGroup()
         dpts = erp[self.state.stimno]  # this should only happen once.
         if hasattr(dpts, "magnitude"):
             dpts = dpts.magnitude
@@ -768,15 +848,27 @@ class SingleTraceView(QMainWindow):
             self.aux_trace_lines[idx_c].set_visible(False)
             self.aux_trace_labels[idx_c].set_visible(False)
 
-        lats_all = sg.get_latencies(self.state.event_signal) if sg is not None else np.array([])
-        valid_mask = ~np.isnan(lats_all) if len(lats_all) > 0 else np.array([], dtype=bool)
-        idxs = np.where(valid_mask)[0] if len(valid_mask) > 0 else np.array([], dtype=int)
-        values = [(float(lats_all[i].rescale(pq.s).magnitude) if hasattr(lats_all[i], "rescale") else float(lats_all[i])) for i in idxs]
-
-        lat = (
-            sg.get_latencies(np.array([cur_event_time]) * cur_event_time.units)[0].rescale("s")
-            if sg is not None else np.nan * pq.s
-        )
+        sr_val = float(self.state.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(self.state.sampling_rate, "rescale") else float(self.state.sampling_rate)
+        if sg is not None and getattr(sg, "idx_arr", None) is not None and len(sg.idx_arr) == len(self.state.event_signal):
+            idx_list = []
+            val_list = []
+            for s_i, entry in enumerate(sg.idx_arr):
+                if entry is not None:
+                    idx_list.append(s_i)
+                    val_list.append(entry[0] / sr_val)
+            idxs = np.array(idx_list, dtype=int)
+            values = val_list
+            cur_entry = sg.idx_arr[self.state.stimno] if self.state.stimno < len(sg.idx_arr) else None
+            lat = (cur_entry[0] / sr_val) * pq.s if cur_entry is not None else np.nan * pq.s
+        else:
+            lats_all = sg.get_latencies(self.state.event_signal) if sg is not None else np.array([])
+            valid_mask = ~np.isnan(lats_all) if len(lats_all) > 0 else np.array([], dtype=bool)
+            idxs = np.where(valid_mask)[0] if len(valid_mask) > 0 else np.array([], dtype=int)
+            values = [(float(lats_all[i].rescale(pq.s).magnitude) if hasattr(lats_all[i], "rescale") else float(lats_all[i])) for i in idxs]
+            lat = (
+                sg.get_latencies(np.array([cur_event_time]) * cur_event_time.units)[0].rescale("s")
+                if sg is not None else np.nan * pq.s
+            )
 
         if not np.isnan(lat) and lat < self.state.window_size:
             cur_point = int(lat * self.state.sampling_rate)
@@ -872,24 +964,42 @@ class SingleTraceView(QMainWindow):
                 self.topax.draw_artist(x)
         for x in self.topax_lines:
             self.topax.draw_artist(x)
-        # for x in self.topax.lines:
-        #     self.topax.draw_artist(x)
         self.view.update()
+        if getattr(self, "blit_data", None) is None:
+            try:
+                self.blit()
+            except Exception:
+                pass
 
     def blit(self):
         self.blit_data = self.fig.canvas.copy_from_bbox(self.ax.bbox)
         self.blit_data_topax = self.fig.canvas.copy_from_bbox(self.topax.bbox)
 
     def set_cur_pos(self, x):
-        x = round(x)
-        dpts = self.state.get_erp()[self.state.stimno]
-        if self.select_local_maxima_width > 1:
-            w = self.select_local_maxima_width
-            if x < 0 + w or x > self.state.analog_signal_erp.shape[1] - w:
-                return
+        if x is None or np.isnan(x) or self.state is None:
+            return
+        erp = self.state.get_erp()
+        if erp is None or self.state.stimno < 0 or self.state.stimno >= len(erp):
+            return
+        dpts = erp[self.state.stimno]
+        if hasattr(dpts, "magnitude"):
+            dpts = dpts.magnitude
+        n_pts = len(dpts)
+        if n_pts == 0:
+            return
 
-            x += np.argmax(np.abs(dpts[x - w : x + w])) - w
-        self.state.setUnit(x)
+        x_idx = max(0, min(n_pts - 1, int(round(x))))
+        w = int(self.select_local_maxima_width)
+        if w > 1:
+            start_w = max(0, x_idx - w)
+            end_w = min(n_pts, x_idx + w + 1)
+            if end_w > start_w:
+                sub_slice = np.abs(dpts[start_w:end_w])
+                if len(sub_slice) > 0:
+                    x_idx = start_w + int(np.argmax(sub_slice))
+
+        target_unit_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group
+        self.state.setUnit(x_idx, unitid=target_unit_idx)
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Z:  # Although the zoom works, it can't be undone...
@@ -955,10 +1065,8 @@ class SingleTraceView(QMainWindow):
                 closest_idx += 1
             if e.key() == Qt.Key_Left:
                 closest_idx -= 1
-            if closest_idx < 0 or closest_idx >= len(idx):
-                return
-
-            self.state.setUnit(idx[closest_idx])
+            target_unit_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group
+            self.state.setUnit(idx[closest_idx], unitid=target_unit_idx)
         elif e.key() == Qt.Key_BracketLeft:  # Zoom out
             # get current xlim & ylim
             x_limits = [self.ax.get_xlim()[0], self.ax.get_xlim()[1]]

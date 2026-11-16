@@ -24,11 +24,110 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import zmq
 from PySide6.QtCore import QObject, QThread, Signal, Slot
-from scipy import signal
+
+try:
+    from numba import njit
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+    def njit(*args, **kwargs):
+        def wrapper(func):
+            return func
+        return wrapper if args else wrapper
 
 from spikespy.processing import OnlineBandpassFilter, OnlineTTLDetector
 
 logger = logging.getLogger(__name__)
+
+
+if _HAS_NUMBA:
+    @njit(cache=True)
+    def _ring_buffer_slice_core(buffer, write_idx, capacity, n_channels,
+                                 buf_start_idx, requested_len, channel):
+        """Numba-accelerated ring buffer slice for single channel or all channels."""
+        if channel >= 0:
+            # Single channel
+            if buf_start_idx + requested_len <= capacity:
+                return buffer[channel, buf_start_idx:buf_start_idx + requested_len].copy()
+            else:
+                first_part = capacity - buf_start_idx
+                second_part = requested_len - first_part
+                out = np.empty(requested_len, dtype=np.float32)
+                out[:first_part] = buffer[channel, buf_start_idx:]
+                out[first_part:] = buffer[channel, :second_part]
+                return out
+        else:
+            # All channels
+            if buf_start_idx + requested_len <= capacity:
+                return buffer[:, buf_start_idx:buf_start_idx + requested_len].copy()
+            else:
+                first_part = capacity - buf_start_idx
+                second_part = requested_len - first_part
+                out = np.empty((n_channels, requested_len), dtype=np.float32)
+                out[:, :first_part] = buffer[:, buf_start_idx:]
+                out[:, first_part:] = buffer[:, :second_part]
+                return out
+
+    @njit(cache=True)
+    def _ring_buffer_slice_channels_core(buffer, write_idx, capacity, n_channels,
+                                          buf_start_idx, requested_len, rows):
+        """Numba-accelerated ring buffer slice for specific channels."""
+        n_rows = rows.shape[0]
+        if buf_start_idx + requested_len <= capacity:
+            out = np.empty((n_rows, requested_len), dtype=np.float32)
+            for i in range(n_rows):
+                out[i, :] = buffer[rows[i], buf_start_idx:buf_start_idx + requested_len]
+            return out
+        else:
+            first_part = capacity - buf_start_idx
+            second_part = requested_len - first_part
+            out = np.empty((n_rows, requested_len), dtype=np.float32)
+            for i in range(n_rows):
+                out[i, :first_part] = buffer[rows[i], buf_start_idx:]
+                out[i, first_part:] = buffer[rows[i], :second_part]
+            return out
+else:
+    def _ring_buffer_slice_core(buffer, write_idx, capacity, n_channels,
+                                 buf_start_idx, requested_len, channel):
+        """Fallback pure Python implementation."""
+        if channel >= 0:
+            if buf_start_idx + requested_len <= capacity:
+                return buffer[channel, buf_start_idx:buf_start_idx + requested_len].copy()
+            else:
+                first_part = capacity - buf_start_idx
+                second_part = requested_len - first_part
+                out = np.empty(requested_len, dtype=np.float32)
+                out[:first_part] = buffer[channel, buf_start_idx:]
+                out[first_part:] = buffer[channel, :second_part]
+                return out
+        else:
+            if buf_start_idx + requested_len <= capacity:
+                return buffer[:, buf_start_idx:buf_start_idx + requested_len].copy()
+            else:
+                first_part = capacity - buf_start_idx
+                second_part = requested_len - first_part
+                out = np.empty((n_channels, requested_len), dtype=np.float32)
+                out[:, :first_part] = buffer[:, buf_start_idx:]
+                out[:, first_part:] = buffer[:, :second_part]
+                return out
+
+    def _ring_buffer_slice_channels_core(buffer, write_idx, capacity, n_channels,
+                                          buf_start_idx, requested_len, rows):
+        """Fallback pure Python implementation."""
+        n_rows = rows.shape[0]
+        if buf_start_idx + requested_len <= capacity:
+            out = np.empty((n_rows, requested_len), dtype=np.float32)
+            for i in range(n_rows):
+                out[i, :] = buffer[rows[i], buf_start_idx:buf_start_idx + requested_len]
+            return out
+        else:
+            first_part = capacity - buf_start_idx
+            second_part = requested_len - first_part
+            out = np.empty((n_rows, requested_len), dtype=np.float32)
+            for i in range(n_rows):
+                out[i, :first_part] = buffer[rows[i], buf_start_idx:]
+                out[i, first_part:] = buffer[rows[i], :second_part]
+            return out
 
 
 class RingBuffer:
@@ -38,11 +137,33 @@ class RingBuffer:
         self.n_channels = n_channels
         self.capacity = capacity_samples
         self.buffer = np.zeros((n_channels, capacity_samples), dtype=np.float32)
-        self.timestamps = np.zeros(capacity_samples, dtype=np.int64)
         self.write_idx = 0
         self.total_samples_written = 0
         self.first_sample_index: Optional[int] = None
+        self._latest_sample: Optional[int] = None
         self.lock = threading.Lock()
+
+    @property
+    def latest_sample(self) -> Optional[int]:
+        """Sample index of the most recently written sample (None when empty)."""
+        return self._latest_sample
+
+    @property
+    def earliest_sample(self) -> Optional[int]:
+        """Oldest sample index still retained in the ring buffer (None when empty)."""
+        if self._latest_sample is None or self.first_sample_index is None:
+            return None
+        if self.total_samples_written >= self.capacity:
+            return self._latest_sample - self.capacity + 1
+        return self.first_sample_index
+
+    def clear(self):
+        """Discard all buffered samples without reallocating the backing array."""
+        with self.lock:
+            self.write_idx = 0
+            self.total_samples_written = 0
+            self.first_sample_index = None
+            self._latest_sample = None
 
     def append(self, samples: np.ndarray, start_sample_index: int):
         """Append samples of shape (n_channels, n_samples) or (n_samples, n_channels)."""
@@ -75,25 +196,15 @@ class RingBuffer:
 
             if w + n_samples <= cap:
                 self.buffer[:n_ch, w : w + n_samples] = samples
-                self.timestamps[w : w + n_samples] = np.arange(
-                    start_sample_index, start_sample_index + n_samples, dtype=np.int64
-                )
             else:
                 first_chunk = cap - w
                 second_chunk = n_samples - first_chunk
                 self.buffer[:n_ch, w:cap] = samples[:, :first_chunk]
-                self.timestamps[w:cap] = np.arange(
-                    start_sample_index, start_sample_index + first_chunk, dtype=np.int64
-                )
                 self.buffer[:n_ch, :second_chunk] = samples[:, first_chunk:]
-                self.timestamps[:second_chunk] = np.arange(
-                    start_sample_index + first_chunk,
-                    start_sample_index + n_samples,
-                    dtype=np.int64,
-                )
 
             self.write_idx = (w + n_samples) % cap
             self.total_samples_written += n_samples
+            self._latest_sample = int(start_sample_index + n_samples - 1)
 
     def slice(
         self, start_sample_index: int, end_sample_index: int, channel: Optional[int] = None
@@ -107,17 +218,10 @@ class RingBuffer:
             return np.empty((0,) if channel is not None else (self.n_channels, 0), dtype=np.float32)
 
         with self.lock:
-            if self.total_samples_written == 0 or self.first_sample_index is None:
+            latest_sample = self.latest_sample
+            if latest_sample is None:
                 return None
-
-            latest_sample = int(
-                self.timestamps[(self.write_idx - 1) % self.capacity]
-            )
-            earliest_sample = (
-                latest_sample - self.capacity + 1
-                if self.total_samples_written >= self.capacity
-                else self.first_sample_index
-            )
+            earliest_sample = self.earliest_sample
 
             # Check if data is within available window
             if end_sample_index - 1 > latest_sample or start_sample_index < earliest_sample:
@@ -128,22 +232,44 @@ class RingBuffer:
             dist_from_latest_start = latest_sample - start_sample_index
             buf_start_idx = (self.write_idx - 1 - dist_from_latest_start) % self.capacity
 
-            if buf_start_idx + requested_len <= self.capacity:
-                if channel is None:
-                    return self.buffer[:, buf_start_idx : buf_start_idx + requested_len].copy()
-                return self.buffer[channel, buf_start_idx : buf_start_idx + requested_len].copy()
-            else:
-                first_part = self.capacity - buf_start_idx
-                second_part = requested_len - first_part
-                if channel is None:
-                    out = np.empty((self.n_channels, requested_len), dtype=np.float32)
-                    out[:, :first_part] = self.buffer[:, buf_start_idx:]
-                    out[:, first_part:] = self.buffer[:, :second_part]
-                    return out
-                out = np.empty(requested_len, dtype=np.float32)
-                out[:first_part] = self.buffer[channel, buf_start_idx:]
-                out[first_part:] = self.buffer[channel, :second_part]
-                return out
+            ch = channel if channel is not None else -1
+            return _ring_buffer_slice_core(
+                self.buffer, self.write_idx, self.capacity, self.n_channels,
+                buf_start_idx, requested_len, ch
+            )
+
+    def slice_channels(
+        self, start_sample_index: int, end_sample_index: int, channels: List[int]
+    ) -> Optional[np.ndarray]:
+        """Extract selected channel rows for [start_sample_index, end_sample_index).
+
+        Allocates only ``(len(channels), n_samples)`` and copies just those rows.
+        Returns None if the requested range is not fully available anymore.
+        """
+        requested_len = end_sample_index - start_sample_index
+        rows = np.asarray(channels, dtype=np.intp)
+        if requested_len <= 0:
+            return np.empty((len(rows), 0), dtype=np.float32)
+        if rows.size == 0:
+            return np.empty((0, requested_len), dtype=np.float32)
+
+        with self.lock:
+            latest_sample = self.latest_sample
+            if latest_sample is None:
+                return None
+            earliest_sample = self.earliest_sample
+            if end_sample_index - 1 > latest_sample or start_sample_index < earliest_sample:
+                return None
+            if int(rows.min()) < 0 or int(rows.max()) >= self.buffer.shape[0]:
+                return None
+
+            dist_from_latest_start = latest_sample - start_sample_index
+            buf_start_idx = (self.write_idx - 1 - dist_from_latest_start) % self.capacity
+
+            return _ring_buffer_slice_channels_core(
+                self.buffer, self.write_idx, self.capacity, self.n_channels,
+                buf_start_idx, requested_len, rows
+            )
 
 
 
@@ -166,6 +292,7 @@ class OpenEphysStreamWorker(QThread):
     """
 
     sweepReady = Signal(dict)
+    sweepsReady = Signal(list)
     spikeEventsReady = Signal(str, object)
     protocolEventReady = Signal(str, float, dict)
     statsUpdated = Signal(dict)
@@ -216,6 +343,12 @@ class OpenEphysStreamWorker(QThread):
         self._pending_sweeps: List[PendingSweep] = []
         self._pending_lock = threading.Lock()
 
+        # Batched sweep delivery to the GUI (flush at most every ~20 ms or at cap)
+        self._pending_payloads: List[Dict[str, Any]] = []
+        self._last_sweep_flush = 0.0
+        self._sweep_flush_interval_s = 0.02
+        self._sweep_batch_max = 32
+
         # Ring buffer: default 16 channels, 15 seconds at sample_rate
         cap = int(sample_rate * 15.0)
         self.ring_buffer = RingBuffer(n_channels=16, capacity_samples=cap)
@@ -255,9 +388,36 @@ class OpenEphysStreamWorker(QThread):
             self.bandpass_filter.reset()
 
     def set_filtering(self, enabled: bool):
+        if enabled != self.apply_filter:
+            # Never mix filtered and unfiltered samples inside one pending sweep.
+            self.ring_buffer.clear()
+            with self._pending_lock:
+                self._pending_sweeps.clear()
         self.apply_filter = enabled
         if not enabled:
             self.bandpass_filter.reset()
+
+    def _queue_sweep_payload(self, payload: Dict[str, Any]):
+        """Accumulate a sweep payload and flush in batches to reduce GUI wakeups."""
+        self._sweeps_count += 1
+        self._pending_payloads.append(payload)
+        self._flush_sweep_payloads()
+
+    def _flush_sweep_payloads(self, force: bool = False):
+        """Emit accumulated sweep payloads respecting the batch interval/cap."""
+        if not self._pending_payloads:
+            return
+        now = time.time()
+        if (
+            not force
+            and len(self._pending_payloads) < self._sweep_batch_max
+            and (now - self._last_sweep_flush) < self._sweep_flush_interval_s
+        ):
+            return
+        payloads = self._pending_payloads
+        self._pending_payloads = []
+        self._last_sweep_flush = now
+        self.sweepsReady.emit(payloads)
 
     def run(self):
         """Thread execution loop."""
@@ -295,6 +455,7 @@ class OpenEphysStreamWorker(QThread):
                     heartbeat_req.setsockopt(zmq.SNDTIMEO, 500)
                     heartbeat_req.setsockopt(zmq.LINGER, 0)
                     heartbeat_req.connect(f"tcp://{self.host}:{self.heartbeat_port}")
+                    poller.register(heartbeat_req, zmq.POLLIN)
 
             self.connectionStatusChanged.emit(True, f"Connected to {self.host}:{self.data_port}")
             logger.info("OpenEphysStreamWorker connected to %s (mode=%s)", self.host, self.mode)
@@ -305,7 +466,7 @@ class OpenEphysStreamWorker(QThread):
             while self._running:
                 now = time.time()
 
-                # Heartbeat every 2.0 seconds
+                # Heartbeat every 2.0 seconds (non-blocking; reply drained by the main poller)
                 if self.mode == "zmq_raw" and heartbeat_req is not None:
                     if now - last_heartbeat_time >= 2.0:
                         try:
@@ -317,17 +478,35 @@ class OpenEphysStreamWorker(QThread):
                                 }
                             ).encode("utf-8")
                             heartbeat_req.send(hb_msg, zmq.NOBLOCK)
-                            # Non-blocking receive or ignore reply
-                            poller_hb = zmq.Poller()
-                            poller_hb.register(heartbeat_req, zmq.POLLIN)
-                            if poller_hb.poll(50):
-                                heartbeat_req.recv()
                         except Exception as e:
                             logger.debug("Heartbeat error: %s", e)
+                            try:
+                                poller.unregister(heartbeat_req)
+                            except Exception:
+                                pass
+                            try:
+                                heartbeat_req.close(linger=0)
+                            except Exception:
+                                pass
+                            try:
+                                heartbeat_req = context.socket(zmq.REQ)
+                                heartbeat_req.setsockopt(zmq.RCVTIMEO, 500)
+                                heartbeat_req.setsockopt(zmq.SNDTIMEO, 500)
+                                heartbeat_req.setsockopt(zmq.LINGER, 0)
+                                heartbeat_req.connect(f"tcp://{self.host}:{self.heartbeat_port}")
+                                poller.register(heartbeat_req, zmq.POLLIN)
+                            except Exception:
+                                heartbeat_req = None
                         last_heartbeat_time = now
 
                 # Poll sockets
                 socks = dict(poller.poll(20))
+
+                if heartbeat_req is not None and heartbeat_req in socks:
+                    try:
+                        heartbeat_req.recv(zmq.NOBLOCK)
+                    except Exception:
+                        pass
 
                 if data_sub in socks and socks[data_sub] == zmq.POLLIN:
                     self._handle_data_socket(data_sub)
@@ -337,6 +516,7 @@ class OpenEphysStreamWorker(QThread):
 
                 # Check pending sweeps
                 self._check_pending_sweeps()
+                self._flush_sweep_payloads()
 
                 # Emit stats every 1 second
                 if now - last_stats_time >= 1.0:
@@ -358,6 +538,7 @@ class OpenEphysStreamWorker(QThread):
             logger.exception("Error in stream worker: %s", e)
             self.connectionStatusChanged.emit(False, str(e))
         finally:
+            self._flush_sweep_payloads(force=True)
             if data_sub is not None:
                 data_sub.close(0)
             if event_sub is not None:
@@ -474,8 +655,7 @@ class OpenEphysStreamWorker(QThread):
                     "aux_sweeps": aux_sweeps,
                     "sample_rate": sample_rate,
                 }
-                self._sweeps_count += 1
-                self.sweepReady.emit(payload)
+                self._queue_sweep_payload(payload)
         except Exception as e:
             logger.error("Failed to parse sliced ERP packet: %s", e)
 
@@ -503,31 +683,33 @@ class OpenEphysStreamWorker(QThread):
 
                 if arr.size == n_chans * n_samples:
                     data = arr.reshape((n_chans, n_samples))
+                    transposed = False
                 elif arr.size == n_samples * n_chans:
-                    data = arr.reshape((n_samples, n_chans)).T
+                    data = arr.reshape((n_samples, n_chans))
+                    transposed = True
                 else:
                     return
 
-                # Convert int16 to microvolts if needed
+                # Convert int16 to microvolts if needed (single allocation, then in-place scale)
                 if dt == np.int16 and "bit_volts" in meta:
-                    bv = float(meta["bit_volts"])
-                    data = data.astype(np.float32) * bv
+                    data = data.astype(np.float32)
+                    data *= float(meta["bit_volts"])
+                if transposed:
+                    data = data.T
 
-                # Expand ring buffer channels if necessary
-                if data.shape[0] > self.ring_buffer.n_channels:
-                    new_cap = self.ring_buffer.capacity
-                    new_rb = RingBuffer(data.shape[0], new_cap)
-                    self.ring_buffer = new_rb
-
-                # Append to circular ring buffer
-                self.ring_buffer.append(data, start_sample)
-
-                # Check analog TTL trigger if configured
+                # Check analog TTL trigger if configured, using unfiltered samples
                 if self.trigger_source == "analog" and self.analog_trigger_channel < data.shape[0]:
                     adc_data = data[self.analog_trigger_channel, :]
                     triggers = self.analog_ttl_detector.process_chunk(adc_data, start_sample)
                     for t_sample in triggers:
                         self.queue_sweep_trigger(t_sample, t_sample / self.sample_rate)
+
+                # Filter the continuous stream exactly once per chunk (stateful, causal)
+                if self.apply_filter:
+                    data = self.bandpass_filter.process(data)
+
+                # Append to circular ring buffer (RingBuffer handles channel expansion thread-safely)
+                self.ring_buffer.append(data, start_sample)
 
             elif len(parts) == 1 and parts[0].startswith(b"{"):
                 # Single json event frame
@@ -574,15 +756,21 @@ class OpenEphysStreamWorker(QThread):
             sample_num = evt.get("sample_number", evt.get("sample_num", int(time.time() * self.sample_rate)))
             spike_ts = float(evt.get("timestamp", sample_num / self.sample_rate))
             self._spikes_count += 1
-            self.spikeEventsReady.emit(unit_name, np.array([spike_ts]))
 
-            # If there is a pending sweep covering sample_num, record spike latency
+            # If there is a pending sweep covering sample_num, record spike latency directly on the sweep
+            # so it is delivered atomically with sweepReady instead of flooding the GUI event loop.
+            matched_pending = False
             with self._pending_lock:
                 for sweep in self._pending_sweeps:
                     start_s = sweep.stim_sample - sweep.pre_samples
                     end_s = sweep.stim_sample + sweep.window_samples
                     if start_s <= sample_num <= end_s:
-                        sweep.spike_latencies[unit_name] = (sample_num - sweep.stim_sample) / self.sample_rate
+                        matched_pending = True
+                        if unit_name not in sweep.spike_latencies:
+                            sweep.spike_latencies[unit_name] = (sample_num - sweep.stim_sample) / self.sample_rate
+
+            if not matched_pending:
+                self.spikeEventsReady.emit(unit_name, np.array([spike_ts]))
 
         # 3. Protocol / MessageCenter text event (e.g. APTrack stimulus protocol, setStimVoltage)
         elif evt_type in ("message", "text", "protocol") or "text" in evt:
@@ -622,8 +810,8 @@ class OpenEphysStreamWorker(QThread):
         )
 
         with self._pending_lock:
-            # Keep queue manageable
-            if len(self._pending_sweeps) > 100:
+            # Bound pending queue to prevent unbounded memory growth in extreme stalls
+            if len(self._pending_sweeps) > 2000:
                 self._pending_sweeps.pop(0)
             self._pending_sweeps.append(pending)
 
@@ -632,68 +820,90 @@ class OpenEphysStreamWorker(QThread):
         with self._pending_lock:
             if not self._pending_sweeps:
                 return
+            sweeps_snapshot = list(self._pending_sweeps)
 
-            remaining = []
-            for sweep in self._pending_sweeps:
-                start_samp = sweep.stim_sample - sweep.pre_samples
-                end_samp = sweep.stim_sample + sweep.window_samples
+        latest_samp = self.ring_buffer.latest_sample
+        if latest_samp is None:
+            return
+        earliest_samp = self.ring_buffer.earliest_sample
+        if earliest_samp is None:
+            earliest_samp = latest_samp
+        n_avail = self.ring_buffer.n_channels
 
-                sliced_all = self.ring_buffer.slice(start_samp, end_samp, channel=None)
+        ready_items = []
+        finished_ids = set()
 
-                if sliced_all is not None:
-                    # Slicing complete!
-                    target_chans = sweep.aux_chans if sweep.aux_chans else list(self.active_channels)
-                    if sweep.rec_chan not in target_chans:
-                        target_chans = sorted(list(set(target_chans + [sweep.rec_chan])))
+        for sweep in sweeps_snapshot:
+            start_samp = sweep.stim_sample - sweep.pre_samples
+            end_samp = sweep.stim_sample + sweep.window_samples
 
-                    valid_chans = [ch for ch in target_chans if 0 <= ch < sliced_all.shape[0]]
-                    if valid_chans:
-                        active_matrix = sliced_all[valid_chans, :].copy()
-                    else:
-                        valid_chans = [min(sweep.rec_chan, sliced_all.shape[0] - 1)]
-                        active_matrix = sliced_all[valid_chans, :].copy()
-
-                    if self.apply_filter:
-                        active_matrix = self.bandpass_filter.process(active_matrix)
-
-                    if sweep.rec_chan in valid_chans:
-                        rec_idx = valid_chans.index(sweep.rec_chan)
-                        primary_waveform = active_matrix[rec_idx]
-                    else:
-                        primary_waveform = active_matrix[0]
-
-                    aux_sweeps = {
-                        f"CH{ch}": ch_waveform
-                        for ch, ch_waveform in zip(valid_chans, active_matrix)
-                    }
-
-                    payload = {
-                        "stim_timestamp_s": sweep.stim_timestamp_s,
-                        "waveform": primary_waveform,
-                        "pre_offset_s": sweep.pre_samples / self.sample_rate,
-                        "spike_latencies_s": sweep.spike_latencies,
-                        "aux_sweeps": aux_sweeps,
-                        "channel_waveforms": aux_sweeps,
-                        "sample_rate": self.sample_rate,
-                    }
-                    self._sweeps_count += 1
-                    self.sweepReady.emit(payload)
-                else:
-                    # Not yet available; check if it has expired (overwritten or before first_sample_index)
-                    if self.ring_buffer.total_samples_written == 0 or self.ring_buffer.first_sample_index is None:
-                        remaining.append(sweep)
-                        continue
-                    latest_samp = int(
-                        self.ring_buffer.timestamps[(self.ring_buffer.write_idx - 1) % self.ring_buffer.capacity]
+            # Cheap check first: do not copy data that cannot be complete yet.
+            if end_samp > latest_samp:
+                if start_samp < earliest_samp:
+                    logger.warning(
+                        "Sweep at sample %d dropped (before earliest_samp %d)",
+                        sweep.stim_sample,
+                        earliest_samp,
                     )
-                    earliest_samp = (
-                        latest_samp - self.ring_buffer.capacity + 1
-                        if self.ring_buffer.total_samples_written >= self.ring_buffer.capacity
-                        else self.ring_buffer.first_sample_index
-                    )
-                    if start_samp >= earliest_samp:
-                        remaining.append(sweep)
-                    else:
-                        logger.warning("Sweep at sample %d dropped (before earliest_samp %d)", sweep.stim_sample, earliest_samp)
+                    finished_ids.add(id(sweep))
+                continue
 
-            self._pending_sweeps = remaining
+            if start_samp < earliest_samp:
+                logger.warning(
+                    "Sweep at sample %d dropped (before earliest_samp %d)",
+                    sweep.stim_sample,
+                    earliest_samp,
+                )
+                finished_ids.add(id(sweep))
+                continue
+
+            target_chans = sweep.aux_chans if sweep.aux_chans else list(self.active_channels)
+            if sweep.rec_chan not in target_chans:
+                target_chans = sorted(list(set(target_chans + [sweep.rec_chan])))
+
+            valid_chans = [ch for ch in target_chans if 0 <= ch < n_avail]
+            if not valid_chans:
+                valid_chans = [min(sweep.rec_chan, n_avail - 1)]
+
+            active_matrix = self.ring_buffer.slice_channels(start_samp, end_samp, valid_chans)
+            if active_matrix is None:
+                logger.warning(
+                    "Sweep at sample %d dropped (before earliest_samp %d)",
+                    sweep.stim_sample,
+                    self.ring_buffer.earliest_sample,
+                )
+                finished_ids.add(id(sweep))
+                continue
+
+            ready_items.append((sweep, valid_chans, active_matrix))
+            finished_ids.add(id(sweep))
+
+        # Update pending list by identity, never by dataclass equality.
+        with self._pending_lock:
+            self._pending_sweeps = [
+                s for s in self._pending_sweeps if id(s) not in finished_ids
+            ]
+
+        # Process ready sweeps outside the lock; data is already filtered on ingest.
+        for sweep, valid_chans, active_matrix in ready_items:
+            if sweep.rec_chan in valid_chans:
+                rec_idx = valid_chans.index(sweep.rec_chan)
+                primary_waveform = active_matrix[rec_idx]
+            else:
+                primary_waveform = active_matrix[0]
+
+            aux_sweeps = {
+                f"CH{ch}": ch_waveform
+                for ch, ch_waveform in zip(valid_chans, active_matrix)
+            }
+
+            payload = {
+                "stim_timestamp_s": sweep.stim_timestamp_s,
+                "waveform": primary_waveform,
+                "pre_offset_s": sweep.pre_samples / self.sample_rate,
+                "spike_latencies_s": sweep.spike_latencies,
+                "aux_sweeps": aux_sweeps,
+                "channel_waveforms": aux_sweeps,
+                "sample_rate": self.sample_rate,
+            }
+            self._queue_sweep_payload(payload)

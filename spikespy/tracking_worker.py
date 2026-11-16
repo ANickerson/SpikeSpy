@@ -30,6 +30,8 @@ class AsyncTrackingWorker(QRunnable):
         prev_latency: float,
         threshold: float,
         window_ms: float,
+        algorithm: str = "basic",
+        tracking_params: Optional[Dict[str, Any]] = None,
         callback=None,
     ):
         super().__init__()
@@ -44,19 +46,45 @@ class AsyncTrackingWorker(QRunnable):
         self.prev_latency = float(prev_latency)
         self.threshold = float(threshold)
         self.window_ms = float(window_ms)
+        self.algorithm = str(algorithm or "basic")
+        self.tracking_params = dict(tracking_params) if tracking_params is not None else {}
         self.callback = callback
         self.signals = WorkerSignals()
 
     @Slot()
     def run(self):
         try:
-            detected_sample = basic_tracking.track_sweep_waveform(
-                self.sweep_waveform,
-                self.sampling_rate,
-                self.prev_latency,
-                threshold=self.threshold,
-                window_ms=self.window_ms,
-            )
+            detected_sample = None
+            if self.algorithm != "basic":
+                try:
+                    from .dsp.detectors import SpikeDetectorRegistry
+                    detector = SpikeDetectorRegistry.get(self.algorithm)
+                except Exception:
+                    detector = None
+
+                if detector is not None:
+                    params = {
+                        **detector.default_params(),
+                        "window_ms": float(self.window_ms),
+                        "threshold": float(self.threshold),
+                        **self.tracking_params,
+                    }
+                    detected_sample = detector.detect_sweep(
+                        sweep_wf=self.sweep_waveform,
+                        sampling_rate=self.sampling_rate,
+                        prev_latency=self.prev_latency * pq.s,
+                        params=params,
+                    )
+
+            if detected_sample is None:
+                detected_sample = basic_tracking.track_sweep_waveform(
+                    self.sweep_waveform,
+                    self.sampling_rate,
+                    self.prev_latency,
+                    threshold=self.threshold,
+                    window_ms=self.window_ms,
+                )
+
             if detected_sample is not None:
                 detected_sample = int(detected_sample)
                 self.signals.spike_detected.emit(
@@ -70,6 +98,10 @@ class AsyncTrackingWorker(QRunnable):
             self.signals.finished.emit()
 
 
+# Alias LiveTrackingWorker to AsyncTrackingWorker for compatibility
+LiveTrackingWorker = AsyncTrackingWorker
+
+
 class LiveTrackingManager(QObject):
     """Manages background tracking tasks for all auto_track enabled units.
     Dispatches tasks to QThreadPool.globalInstance() and marshals results
@@ -81,9 +113,13 @@ class LiveTrackingManager(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._active_workers: List[AsyncTrackingWorker] = []
+        self._active_task_count: int = 0
 
     def _on_spike_detected(self, unit_idx: int, detected_sample: int, stimno: int):
         self.spike_tracked.emit(unit_idx, detected_sample, stimno)
+
+    def _on_worker_finished(self):
+        self._active_task_count = max(0, getattr(self, "_active_task_count", 1) - 1)
 
     def track_stimulus_async(
         self,
@@ -94,6 +130,9 @@ class LiveTrackingManager(QObject):
         """Dispatches background tracking tasks for all enabled units for the given stimulus sweep.
         Returns the number of tracking tasks dispatched.
         """
+        if getattr(self, "_active_task_count", 0) >= 12:
+            return 0
+
         if (
             state is None
             or state.event_signal is None
@@ -172,8 +211,8 @@ class LiveTrackingManager(QObject):
                 sweep_wf = sweep_wf.magnitude
             sweep_wf = np.asarray(sweep_wf, dtype=np.float32).copy()
 
-            thresh_mv = float(getattr(sg, "tracking_threshold_mv", 0.01))
-            win_ms = float(getattr(sg, "tracking_window_ms", 5.0))
+            thresh_mv = float(getattr(sg, "threshold", getattr(sg, "tracking_threshold_mv", 0.01)))
+            win_ms = float(getattr(sg, "window_size", getattr(sg, "tracking_window_ms", 5.0)))
             prev_lat_s = float(
                 prev_latency.rescale(pq.s).magnitude
                 if hasattr(prev_latency, "rescale")
@@ -184,6 +223,8 @@ class LiveTrackingManager(QObject):
                 if getattr(sg, "event", None) is not None
                 else f"unit_{unit_idx}"
             )
+            algo = getattr(sg, "tracking_algorithm", "basic") or "basic"
+            params = getattr(sg, "tracking_params", {}) or {}
 
             worker = AsyncTrackingWorker(
                 unit_idx=unit_idx,
@@ -194,9 +235,13 @@ class LiveTrackingManager(QObject):
                 prev_latency=prev_lat_s,
                 threshold=thresh_mv,
                 window_ms=win_ms,
+                algorithm=algo,
+                tracking_params=params,
             )
             # Connect worker signal to manager slot
             worker.signals.spike_detected.connect(self._on_spike_detected)
+            worker.signals.finished.connect(self._on_worker_finished)
+            self._active_task_count = getattr(self, "_active_task_count", 0) + 1
             QThreadPool.globalInstance().start(worker)
             dispatched += 1
 

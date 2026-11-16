@@ -10,6 +10,16 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple, Union
 import neo
 
+try:
+    from numba import njit
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+    def njit(*args, **kwargs):
+        def wrapper(func):
+            return func
+        return wrapper if args else wrapper
+
 
 def wavelet_denoise(in_arr, threshold=0.4, level=None, wlet="sym7", noise_arr=None):
     """
@@ -331,6 +341,87 @@ class MultiAnalogSignal:
         return self.signals[item]
 
 
+class DiskRowStore:
+    """
+    Growable 2D (n_rows, row_len) array backed by a memory-mapped temp file.
+
+    Data lives in the OS page cache instead of process-private RAM, so the OS
+    can evict it under pressure. Growing re-maps the same (extended) file, so
+    previously returned row views stay valid without copying.
+    """
+
+    def __init__(self, row_len: int, dtype=np.float32, initial_capacity: int = 128, directory: Optional[str] = None):
+        import os
+        import tempfile
+        import weakref
+
+        self.row_len = int(row_len)
+        self.dtype = np.dtype(dtype)
+        self._capacity = max(int(initial_capacity), 16)
+        self._count = 0
+        directory = directory or live_cache_dir()
+        os.makedirs(directory, exist_ok=True)
+        fd, self.path = tempfile.mkstemp(prefix="live_", suffix=".f32", dir=directory)
+        os.close(fd)
+        self.array = np.memmap(self.path, dtype=self.dtype, mode="w+", shape=(self._capacity, self.row_len))
+        self._finalizer = weakref.finalize(self, DiskRowStore._remove_file, self.path)
+
+    @staticmethod
+    def _remove_file(path):
+        import os
+
+        try:
+            os.remove(path)
+        except OSError:
+            pass  # still mapped (Windows); cleaned up on next session start
+
+    @property
+    def capacity(self):
+        return self._capacity
+
+    def ensure_capacity(self, n_rows: int):
+        if n_rows <= self._capacity:
+            return
+        new_capacity = self._capacity
+        while new_capacity < n_rows:
+            new_capacity *= 2
+        self.array.flush()
+        # np.memmap extends the file in r+ mode when the requested shape is larger
+        self.array = np.memmap(self.path, dtype=self.dtype, mode="r+", shape=(new_capacity, self.row_len))
+        self._capacity = new_capacity
+
+    def append(self, row: np.ndarray) -> np.ndarray:
+        """Write a row and return a view of it (backed by the file)."""
+        self.ensure_capacity(self._count + 1)
+        self.array[self._count, :] = row
+        view = self.array[self._count]
+        self._count += 1
+        return view
+
+    def close(self):
+        self.array = None
+        self._finalizer()
+
+
+def live_cache_dir() -> str:
+    import os
+    import tempfile
+
+    return os.path.join(tempfile.gettempdir(), "spikespy_live_cache")
+
+
+def clear_live_cache_dir():
+    """Best-effort removal of cache files left over from previous sessions."""
+    import glob
+    import os
+
+    for f in glob.glob(os.path.join(live_cache_dir(), "live_*.f32")):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
 class LiveERPBuffer:
     """
     A growable 2D numpy buffer for storing stimulus-locked ERP sweeps
@@ -343,17 +434,49 @@ class LiveERPBuffer:
         initial_capacity: int = 128,
         units=pq.uV,
         dtype=np.float32,
+        disk_backed: bool = False,
     ):
         self.window_samples = int(window_samples)
         self.units = units
         self.dtype = dtype
+        self.disk_backed = disk_backed
         self._count = 0
         self._capacity = max(int(initial_capacity), 16)
-        self._buffer = np.zeros((self._capacity, self.window_samples), dtype=self.dtype)
-        self._clipped_buffer = np.zeros_like(self._buffer)
+        self._store = None
+        if disk_backed:
+            self._store = DiskRowStore(self.window_samples, self.dtype, self._capacity)
+            self._buffer = self._store.array
+        else:
+            self._buffer = np.zeros((self._capacity, self.window_samples), dtype=self.dtype)
         self._row_max = np.zeros(self._capacity, dtype=np.float32)
         self._row_mean = np.zeros(self._capacity, dtype=np.float32)
         self._row_std = np.zeros(self._capacity, dtype=np.float32)
+        self._running_std: float = 1.0
+        self._decimated_cols: int = min(self.window_samples, 2000)
+        self._decim_factor: int = max(1, self.window_samples // 2000)
+        self._decim_width: int = (
+            (self.window_samples + self._decim_factor - 1) // self._decim_factor
+            if self.window_samples > 0
+            else 0
+        )
+        self._heatmap_decimated = np.zeros(
+            (self._capacity, max(1, self._decim_width)), dtype=np.float32
+        )
+
+    def _compute_decimated_row(self, arr: np.ndarray) -> np.ndarray:
+        if len(arr) == 0 or self._decim_width == 0:
+            return np.zeros(max(1, self._decim_width), dtype=np.float32)
+        clipped = np.maximum(arr, 0.0)
+        if self._decim_factor <= 1:
+            return clipped[: self._decim_width]
+        n_full = (len(clipped) // self._decim_factor) * self._decim_factor
+        out = np.zeros(self._decim_width, dtype=np.float32)
+        if n_full > 0:
+            blocks = clipped[:n_full].reshape(-1, self._decim_factor)
+            out[: blocks.shape[0]] = np.max(blocks, axis=1)
+        if n_full < len(clipped):
+            out[-1] = float(np.max(clipped[n_full:]))
+        return out
 
     def append_sweep(self, sweep_1d: Union[np.ndarray, pq.Quantity]):
         if hasattr(sweep_1d, "magnitude"):
@@ -369,13 +492,13 @@ class LiveERPBuffer:
 
         if self._count >= self._capacity:
             new_capacity = self._capacity * 2
-            new_buffer = np.zeros((new_capacity, self.window_samples), dtype=self.dtype)
-            new_buffer[: self._count, :] = self._buffer[: self._count, :]
-            self._buffer = new_buffer
-
-            new_clipped = np.zeros((new_capacity, self.window_samples), dtype=self.dtype)
-            new_clipped[: self._count, :] = self._clipped_buffer[: self._count, :]
-            self._clipped_buffer = new_clipped
+            if self._store is not None:
+                self._store.ensure_capacity(new_capacity)
+                self._buffer = self._store.array
+            else:
+                new_buffer = np.zeros((new_capacity, self.window_samples), dtype=self.dtype)
+                new_buffer[: self._count, :] = self._buffer[: self._count, :]
+                self._buffer = new_buffer
 
             new_row_max = np.zeros(new_capacity, dtype=np.float32)
             new_row_max[: self._count] = self._row_max[: self._count]
@@ -389,22 +512,46 @@ class LiveERPBuffer:
             new_row_std[: self._count] = self._row_std[: self._count]
             self._row_std = new_row_std
 
+            new_hm = np.zeros(
+                (new_capacity, max(1, self._decim_width)), dtype=np.float32
+            )
+            new_hm[: self._count, :] = self._heatmap_decimated[: self._count, :]
+            self._heatmap_decimated = new_hm
+
             self._capacity = new_capacity
 
         self._buffer[self._count, :] = arr
-        self._clipped_buffer[self._count, :] = np.maximum(arr, 0.0)
+        self._heatmap_decimated[self._count, :] = self._compute_decimated_row(arr)
+        row_std_val = float(np.std(arr)) if len(arr) > 0 else 0.0
         self._row_max[self._count] = float(np.max(arr)) if len(arr) > 0 else 0.0
         self._row_mean[self._count] = float(np.mean(arr)) if len(arr) > 0 else 0.0
-        self._row_std[self._count] = float(np.std(arr)) if len(arr) > 0 else 0.0
+        self._row_std[self._count] = row_std_val
+        if self._count == 0 or self._running_std <= 0:
+            self._running_std = row_std_val if row_std_val > 0 else 1.0
+        else:
+            self._running_std = 0.95 * self._running_std + 0.05 * (
+                row_std_val if row_std_val > 0 else 1.0
+            )
         self._count += 1
 
     @property
+    def running_std(self) -> float:
+        return self._running_std if self._count > 0 else 1.0
+
+    @property
+    def heatmap_decimated_data(self) -> np.ndarray:
+        """Compact 2D clipped and max-pooled matrix (n_sweeps, <=2000) for fast GPU heatmap uploads."""
+        return self._heatmap_decimated[: self._count, : max(1, self._decim_width)]
+
+    @property
     def data(self):
-        return self._buffer[: self._count, : self.window_samples] * self.units
+        # Zero-copy view: multiplying by units would allocate a full copy on every call
+        return pq.Quantity(self._buffer[: self._count, : self.window_samples], self.units)
 
     @property
     def clipped_data(self):
-        return self._clipped_buffer[: self._count, : self.window_samples]
+        # Computed on demand instead of storing a permanent duplicate of every sweep
+        return np.maximum(self._buffer[: self._count, : self.window_samples], 0.0)
 
     @property
     def row_max(self):
@@ -420,26 +567,41 @@ class LiveERPBuffer:
 
     def clear(self):
         self._count = 0
+        self._running_std = 1.0
 
     def resize_window(self, window_samples: int):
         new_window = int(window_samples)
         if new_window == self.window_samples:
             return
-        new_buffer = np.zeros((self._capacity, new_window), dtype=self.dtype)
-        new_clipped = np.zeros((self._capacity, new_window), dtype=self.dtype)
+        new_store = DiskRowStore(new_window, self.dtype, self._capacity) if self.disk_backed else None
+        new_buffer = new_store.array if new_store is not None else np.zeros((self._capacity, new_window), dtype=self.dtype)
         min_w = min(self.window_samples, new_window)
+        self.window_samples = new_window
+        self._decimated_cols = min(self.window_samples, 2000)
+        self._decim_factor = max(1, self.window_samples // 2000)
+        self._decim_width = (
+            (self.window_samples + self._decim_factor - 1) // self._decim_factor
+            if self.window_samples > 0
+            else 0
+        )
+        new_hm = np.zeros(
+            (self._capacity, max(1, self._decim_width)), dtype=np.float32
+        )
         if self._count > 0:
             new_buffer[: self._count, :min_w] = self._buffer[: self._count, :min_w]
-            new_clipped[: self._count, :min_w] = self._clipped_buffer[: self._count, :min_w]
             # Recalculate stats for the resized window if count > 0
             for i in range(self._count):
                 row_arr = new_buffer[i, :new_window]
                 self._row_max[i] = float(np.max(row_arr)) if len(row_arr) > 0 else 0.0
                 self._row_mean[i] = float(np.mean(row_arr)) if len(row_arr) > 0 else 0.0
                 self._row_std[i] = float(np.std(row_arr)) if len(row_arr) > 0 else 0.0
-        self.window_samples = new_window
+                new_hm[i, :] = self._compute_decimated_row(row_arr)
         self._buffer = new_buffer
-        self._clipped_buffer = new_clipped
+        self._heatmap_decimated = new_hm
+        if new_store is not None:
+            if self._store is not None:
+                self._store.close()
+            self._store = new_store
 
     def __len__(self):
         return self._count
@@ -875,6 +1037,98 @@ class TriggerEvent(int):
         return iter(self.data)
 
 
+if _HAS_NUMBA:
+    @njit(cache=True)
+    def _ttl_detect_loop(chunk_arr, threshold, min_width_samples, refractory,
+                          in_pulse, pulse_start_sample, pulse_max_val, pulse_width,
+                          last_trigger_sample, start_sample):
+        """Numba-accelerated TTL detection loop."""
+        triggers_samples = []
+        triggers_timestamps = []
+        triggers_durations = []
+        triggers_max_vals = []
+        
+        n = chunk_arr.shape[0]
+        for i in range(n):
+            cur_sample = start_sample + i
+            val = chunk_arr[i]
+            
+            if val >= threshold:
+                if not in_pulse:
+                    in_pulse = True
+                    pulse_start_sample = cur_sample
+                    pulse_max_val = val
+                    pulse_width = 1
+                else:
+                    pulse_width += 1
+                    if val > pulse_max_val:
+                        pulse_max_val = val
+            else:
+                if in_pulse:
+                    duration_samples = cur_sample - pulse_start_sample
+                    if duration_samples >= min_width_samples:
+                        if (last_trigger_sample == -1 or 
+                            (pulse_start_sample - last_trigger_sample) >= refractory):
+                            last_trigger_sample = pulse_start_sample
+                            triggers_samples.append(pulse_start_sample)
+                            triggers_timestamps.append(pulse_start_sample)  # will divide by sample_rate later
+                            triggers_durations.append(duration_samples)
+                            triggers_max_vals.append(pulse_max_val)
+                    in_pulse = False
+                    pulse_start_sample = -1
+                    pulse_max_val = -1e30
+                    pulse_width = 0
+        
+        return (np.array(triggers_samples, dtype=np.int64),
+                np.array(triggers_timestamps, dtype=np.float64),
+                np.array(triggers_durations, dtype=np.int64),
+                np.array(triggers_max_vals, dtype=np.float64),
+                in_pulse, pulse_start_sample, pulse_max_val, pulse_width, last_trigger_sample)
+else:
+    def _ttl_detect_loop(chunk_arr, threshold, min_width_samples, refractory,
+                          in_pulse, pulse_start_sample, pulse_max_val, pulse_width,
+                          last_trigger_sample, start_sample):
+        """Fallback pure Python implementation."""
+        triggers = []
+        n = chunk_arr.shape[0]
+        for i in range(n):
+            cur_sample = start_sample + i
+            val = chunk_arr[i]
+            
+            if val >= threshold:
+                if not in_pulse:
+                    in_pulse = True
+                    pulse_start_sample = cur_sample
+                    pulse_max_val = val
+                    pulse_width = 1
+                else:
+                    pulse_width += 1
+                    if val > pulse_max_val:
+                        pulse_max_val = val
+            else:
+                if in_pulse:
+                    duration_samples = cur_sample - pulse_start_sample
+                    if duration_samples >= min_width_samples:
+                        if (last_trigger_sample is None or 
+                            (pulse_start_sample - last_trigger_sample) >= refractory):
+                            last_trigger_sample = pulse_start_sample
+                            info = {
+                                "sample_index": int(pulse_start_sample),
+                                "sample": int(pulse_start_sample),
+                                "timestamp_s": float(pulse_start_sample),  # will divide by sample_rate later
+                                "timestamp": float(pulse_start_sample),
+                                "duration_s": float(duration_samples),
+                                "max_val": float(pulse_max_val),
+                            }
+                            triggers.append(info)
+                    in_pulse = False
+                    pulse_start_sample = None
+                    pulse_max_val = -float("inf")
+                    pulse_width = 0
+        
+        return triggers, in_pulse, pulse_start_sample, pulse_max_val, pulse_width, last_trigger_sample
+
+
 class OnlineTTLDetector:
     """Stateful rising-edge detector for 1D streaming analog chunks.
     Detects threshold-crossing pulses and enforces min width and refractory period.
@@ -930,48 +1184,84 @@ class OnlineTTLDetector:
         else:
             refractory = int(self.refractory_s * sample_rate)
 
-        triggers = []
-        for i, val in enumerate(chunk_arr):
-            cur_sample = start_sample + i
-            if val >= self.threshold:
-                if not self.in_pulse:
-                    self.in_pulse = True
-                    self.pulse_start_sample = cur_sample
-                    self.pulse_max_val = float(val)
-                    self.pulse_width = 1
-                else:
-                    self.pulse_width += 1
-                    if val > self.pulse_max_val:
+        # Prepare state for numba function
+        in_pulse = self.in_pulse
+        pulse_start_sample = self.pulse_start_sample if self.pulse_start_sample is not None else -1
+        pulse_max_val = self.pulse_max_val
+        pulse_width = self.pulse_width
+        last_trigger_sample = self.last_trigger_sample if self.last_trigger_sample is not None else -1
+
+        if _HAS_NUMBA:
+            (trigger_samples, trigger_timestamps, trigger_durations, trigger_max_vals,
+             in_pulse, pulse_start_sample, pulse_max_val, pulse_width, last_trigger_sample) = _ttl_detect_loop(
+                chunk_arr, self.threshold, self.min_width_samples, refractory,
+                in_pulse, pulse_start_sample, pulse_max_val, pulse_width,
+                last_trigger_sample, start_sample
+            )
+
+            # Convert to TriggerEvent objects
+            triggers = []
+            for samp, ts, dur, maxv in zip(trigger_samples, trigger_timestamps, trigger_durations, trigger_max_vals):
+                info = {
+                    "sample_index": int(samp),
+                    "sample": int(samp),
+                    "timestamp_s": float(samp / sample_rate),
+                    "timestamp": float(samp / sample_rate),
+                    "duration_s": float(dur / sample_rate),
+                    "max_val": float(maxv),
+                }
+                triggers.append(TriggerEvent(int(samp), info))
+        else:
+            # Fallback to pure Python loop
+            triggers = []
+            for i, val in enumerate(chunk_arr):
+                cur_sample = start_sample + i
+                if val >= self.threshold:
+                    if not self.in_pulse:
+                        self.in_pulse = True
+                        self.pulse_start_sample = cur_sample
                         self.pulse_max_val = float(val)
-            else:
-                if self.in_pulse:
-                    duration_samples = cur_sample - self.pulse_start_sample
-                    if duration_samples >= self.min_width_samples:
-                        if (
-                            self.last_trigger_sample is None
-                            or (self.pulse_start_sample - self.last_trigger_sample)
-                            >= refractory
-                        ):
-                            self.last_trigger_sample = self.pulse_start_sample
-                            info = {
-                                "sample_index": int(self.pulse_start_sample),
-                                "sample": int(self.pulse_start_sample),
-                                "timestamp_s": float(
-                                    self.pulse_start_sample / sample_rate
-                                ),
-                                "timestamp": float(
-                                    self.pulse_start_sample / sample_rate
-                                ),
-                                "duration_s": float(duration_samples / sample_rate),
-                                "max_val": float(self.pulse_max_val),
-                            }
-                            triggers.append(
-                                TriggerEvent(self.pulse_start_sample, info)
-                            )
-                    self.in_pulse = False
-                    self.pulse_start_sample = None
-                    self.pulse_max_val = -float("inf")
-                    self.pulse_width = 0
+                        self.pulse_width = 1
+                    else:
+                        self.pulse_width += 1
+                        if val > self.pulse_max_val:
+                            self.pulse_max_val = float(val)
+                else:
+                    if self.in_pulse:
+                        duration_samples = cur_sample - self.pulse_start_sample
+                        if duration_samples >= self.min_width_samples:
+                            if (
+                                self.last_trigger_sample is None
+                                or (self.pulse_start_sample - self.last_trigger_sample)
+                                >= refractory
+                            ):
+                                self.last_trigger_sample = self.pulse_start_sample
+                                info = {
+                                    "sample_index": int(self.pulse_start_sample),
+                                    "sample": int(self.pulse_start_sample),
+                                    "timestamp_s": float(
+                                        self.pulse_start_sample / sample_rate
+                                    ),
+                                    "timestamp": float(
+                                        self.pulse_start_sample / sample_rate
+                                    ),
+                                    "duration_s": float(duration_samples / sample_rate),
+                                    "max_val": float(self.pulse_max_val),
+                                }
+                                triggers.append(
+                                    TriggerEvent(self.pulse_start_sample, info)
+                                )
+                        self.in_pulse = False
+                        self.pulse_start_sample = None
+                        self.pulse_max_val = -float("inf")
+                        self.pulse_width = 0
+
+        # Update state
+        self.in_pulse = in_pulse
+        self.pulse_start_sample = pulse_start_sample if pulse_start_sample != -1 else None
+        self.pulse_max_val = pulse_max_val
+        self.pulse_width = pulse_width
+        self.last_trigger_sample = last_trigger_sample if last_trigger_sample != -1 else None
 
         return triggers
 

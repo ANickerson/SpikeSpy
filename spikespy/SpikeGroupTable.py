@@ -3,7 +3,16 @@ from typing import Any, List, Optional, Union
 import PySide6
 
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QObject, Qt, Signal, Slot, QTimer
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QObject,
+    QSignalBlocker,
+    Qt,
+    Signal,
+    Slot,
+    QTimer,
+)
 from PySide6.QtGui import QAction, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -29,10 +38,12 @@ from PySide6.QtWidgets import (
 )
 
 from .ViewerState import ViewerState
+from .live_orchestrator import LiveFrameConsumerMixin
+from .ChannelGroupBar import ChannelGroupDialog
 from PySide6.QtWidgets import QComboBox
 
 
-class SpikeGroupTableView(QWidget):
+class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
     def __init__(
         self,
         parent: Optional[PySide6.QtWidgets.QWidget] = None,
@@ -42,6 +53,8 @@ class SpikeGroupTableView(QWidget):
         self.render_count: int = 0
         self._dirty: bool = False
         self._user_hidden: bool = False
+        self._state_connections: list[tuple] = []
+        self._last_unit_change_sync_token: Optional[tuple] = None
 
         self.update_timer = QTimer(self)
         interval = (
@@ -54,6 +67,7 @@ class SpikeGroupTableView(QWidget):
         self.update_timer.start()
 
         if state and hasattr(state, "onUIRefreshRateChange"):
+            self._state_connections.append((state.onUIRefreshRateChange, self.update_timer.setInterval))
             state.onUIRefreshRateChange.connect(self.update_timer.setInterval)
 
         self.spike_tablemodel = SpikeGroupTableModel(lambda: state.spike_groups)
@@ -62,13 +76,23 @@ class SpikeGroupTableView(QWidget):
         self.tbl.setModel(self.spike_tablemodel)
         self.state = state
         if state is not None:
-            state.onUnitChange.connect(self.update)
+            self._state_connections.append((state.onUnitChange, self._on_unit_change))
+            state.onUnitChange.connect(self._on_unit_change)
+            self._state_connections.append((state.onUnitGroupChange, self.update))
             state.onUnitGroupChange.connect(self.update)
-            state.onLoadNewFile.connect(self.update)
+            if hasattr(state, "onUnitParamsChanged"):
+                self._state_connections.append((state.onUnitParamsChanged, self._on_unit_params_changed))
+                state.onUnitParamsChanged.connect(self._on_unit_params_changed)
+            if hasattr(state, "onLoadNewFile"):
+                self._register_data_reload(state, self.update)
             if hasattr(state, "onNewSpikeEvents"):
-                state.onNewSpikeEvents.connect(self.update)
+                self._state_connections.append((state.onNewSpikeEvents, self._on_new_spike_events))
+                state.onNewSpikeEvents.connect(self._on_new_spike_events)
             if hasattr(state, "onNewSweep"):
-                state.onNewSweep.connect(self.update)
+                self._register_live_frames(
+                    state,
+                    lambda _stimno: self.update(),
+                )
 
         self.tbl.setSelectionBehavior(QTableView.SelectRows)
         # self.tbl.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -110,8 +134,15 @@ class SpikeGroupTableView(QWidget):
 
         self.addButton.clicked.disconnect()
         self.addButton.clicked.connect(self.add_row_and_select)
-        self.spike_tablemodel.dataChanged.connect(self.state.onUnitGroupChange)
+        self.spike_tablemodel.dataChanged.connect(self._on_model_data_changed)
         self.update()
+
+    def _on_model_data_changed(self, *args):
+        if (
+            not getattr(self.spike_tablemodel, "_in_model_update", False)
+            and self.state is not None
+        ):
+            self.state.onUnitGroupChange.emit()
 
     def on_table_context_menu(self, pos):
         index = self.tbl.indexAt(pos)
@@ -122,14 +153,45 @@ class SpikeGroupTableView(QWidget):
         if sg is None:
             return
         ch = getattr(sg, "channel", "")
-        if not ch and hasattr(sg, "event") and getattr(sg.event, "annotations", None):
+        if not ch and hasattr(sg.event, "annotations"):
             ch = sg.event.annotations.get("channel", "")
 
         menu = QMenu(self)
         if ch and hasattr(self.state, "set_active_channel"):
-            act_focus = menu.addAction(f"Focus Channel '{ch}'")
+            act_focus = menu.addAction(f"Focus Primary Channel '{ch}'")
             act_focus.triggered.connect(lambda: self.state.set_active_channel(ch))
+
+        menu.addSeparator()
+        act_edit_chans = menu.addAction(f"Configure Channels for Unit {row}...")
+        act_edit_chans.triggered.connect(lambda: self._open_channel_dialog_for_unit(row))
+
+        menu_shift = menu.addMenu("Shift Unit Channel Group")
+        menu_shift.addAction("Shift -1 Channel", lambda: self.state.shift_unit_channels(row, step=-1))
+        menu_shift.addAction("Shift +1 Channel", lambda: self.state.shift_unit_channels(row, step=1))
+        menu_shift.addAction("Shift -4 Channels (Tetrode)", lambda: self.state.shift_unit_channels(row, step=-4))
+        menu_shift.addAction("Shift +4 Channels (Tetrode)", lambda: self.state.shift_unit_channels(row, step=4))
+
+        menu.addSeparator()
+        menu_open = menu.addMenu(f"Open Pinned Window for Unit {row}")
+        menu_open.addAction("MultiTrace View", lambda: self._open_pinned_window("MultiTrace", row))
+        menu_open.addAction("SingleTrace View", lambda: self._open_pinned_window("SingleTraceView", row))
+        menu_open.addAction("UnitView", lambda: self._open_pinned_window("UnitView", row))
+        menu_open.addAction("MultiTraceFixed View", lambda: self._open_pinned_window("MultiTraceFixedView", row))
+
         menu.exec(self.tbl.viewport().mapToGlobal(pos))
+
+    def _open_channel_dialog_for_unit(self, unit_idx: int):
+        dlg = ChannelGroupDialog(parent=self, state=self.state, unit_idx=unit_idx)
+        if dlg.exec() == QDialog.Accepted:
+            selected = dlg.get_selected_channels()
+            if selected:
+                self.state.set_unit_channels(unit_idx, selected)
+                self.update()
+
+    def _open_pinned_window(self, window_key: str, unit_idx: int):
+        top_win = self.window()
+        if hasattr(top_win, "newWindow"):
+            top_win.newWindow(window_key, target_unit=unit_idx)
 
     def on_cell_double_clicked(self, index: QModelIndex):
         if not index.isValid():
@@ -146,29 +208,35 @@ class SpikeGroupTableView(QWidget):
                     self.state.set_active_channel(ch)
 
     def is_view_culled(self) -> bool:
-        if getattr(self, "_user_hidden", False):
-            return True
-        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
-            return True
-        curr = self
-        while curr.parentWidget() is not None:
-            curr = curr.parentWidget()
-            if curr.isMinimized():
+        try:
+            if getattr(self, "_user_hidden", False):
                 return True
-        if self.parentWidget() is not None and not self.isVisible():
-            return True
-        if getattr(self, "_was_shown", False) and not self.isVisible():
-            return True
-        return False
+            win = self.window()
+            if win is not None and win.isMinimized():
+                return True
+            if self.parentWidget() is not None and not self.isVisible():
+                return True
+            if getattr(self, "_was_shown", False) and not self.isVisible():
+                return True
+            return False
+        except Exception:
+            return False
 
     def _on_render_timer_tick(self):
         try:
-            if not self.isVisible() or not getattr(self, "_dirty", False):
+            if self.is_view_culled() or not getattr(self, "_dirty", False):
                 return
             self._dirty = False
-            self._do_update_core()
+            from .helpers import run_adaptive_render
+            run_adaptive_render(self, self._do_update_core, weight="heavy")
         except RuntimeError:
             pass
+
+    def schedule_update(self, *args):
+        if self.state is not None and not getattr(self.state, "is_streaming", False):
+            self.update()
+        else:
+            self._dirty = True
 
     def setVisible(self, visible: bool):
         if not visible:
@@ -193,12 +261,64 @@ class SpikeGroupTableView(QWidget):
             self._dirty = False
             self._do_update_core()
 
-    def update(self):
+    def unset_connections(self):
+        """Disconnect all tracked ViewerState signal connections cleanly."""
+        for sig, slot in self._state_connections:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._state_connections.clear()
+        self._unregister_live_frames()
+
+    def closeEvent(self, event):
+        self.unset_connections()
+        super().closeEvent(event)
+
+    @Slot()
+    def _on_unit_params_changed(self, *args):
+        self.update()
+
+    def _get_sync_token(self) -> Optional[tuple]:
+        if not self.state or not self.state.spike_groups:
+            return None
+        u_idx = getattr(self.state, "cur_spike_group", 0)
+        stim = getattr(self.state, "stimno", 0)
+        sg_len = len(self.state.spike_groups)
+        u_spikes_count = (
+            len(self.state.spike_groups[u_idx].event)
+            if 0 <= u_idx < sg_len and self.state.spike_groups[u_idx].event is not None
+            else 0
+        )
+        return (sg_len, stim, u_idx, u_spikes_count)
+
+    def _on_unit_change(self, *args):
+        self.update()
+        self._last_unit_change_sync_token = self._get_sync_token()
+
+    def _on_new_spike_events(self, unit_idx: int = -1):
+        if getattr(self.state, "is_streaming", False):
+            self.schedule_update()
+            return
+        curr_token = self._get_sync_token()
+        if (
+            self._last_unit_change_sync_token is not None
+            and curr_token == self._last_unit_change_sync_token
+        ):
+            # Already updated synchronously by onUnitChange right before this
+            return
+        self.update()
+
+    def schedule_update(self):
+        self._dirty = True
+
+    def update(self, *args):
         if self.is_view_culled():
             self._dirty = True
             return
         self._dirty = False
-        self._do_update_core()
+        from .helpers import run_adaptive_render
+        run_adaptive_render(self, self._do_update_core, weight="heavy")
 
     def _do_update_core(self):
         if self.is_view_culled():
@@ -220,9 +340,9 @@ class SpikeGroupTableView(QWidget):
                     self.tbl.model().index(row, 0), role="SPIKEGROUP_ROLE"
                 )
                 if sg is not None and current_group.event is not None and sg.event.name == current_group.event.name:
-                    self.tbl.selectionModel().blockSignals(True)
-                    self.tbl.selectRow(row)
-                    self.tbl.selectionModel().blockSignals(False)
+                    if self.tbl.currentIndex().row() != row:
+                        with QSignalBlocker(self.tbl.selectionModel()):
+                            self.tbl.selectRow(row)
                     break
         # self.tbl.selectionModel().disconnect(self.set_selection)
         # self.tbl.selectionModel().setCurrentIndex(
@@ -303,6 +423,8 @@ class SpikeGroupTableModel(QAbstractTableModel):
         )
         self.spikegroups_func = spikegroups_func
         self.spikegroups = self.spikegroups_func()
+        self._last_row_count = len(self.spikegroups or [])
+        self._in_model_update = False
         self.headers = ["name", "start", "end", "N", "type", "notes", "channel", "neighbors", "track", "win (ms)", "thresh (mV)"]
         self.annotations_to_show = {
             "notes": "notes",
@@ -328,9 +450,27 @@ class SpikeGroupTableModel(QAbstractTableModel):
 
     @Slot()
     def update(self):
-        self.modelAboutToBeReset.emit()
-        self.spikegroups = self.spikegroups_func()
-        self.modelReset.emit()
+        new_groups = self.spikegroups_func() or []
+        new_count = len(new_groups)
+        self.spikegroups = new_groups
+        self._row_windows = {}
+        for idx, sg in enumerate(self.spikegroups or []):
+            try:
+                self._row_windows[idx] = sg.get_window()
+            except Exception:
+                self._row_windows[idx] = None
+        self._in_model_update = True
+        try:
+            if new_count == self._last_row_count and new_count > 0:
+                top_left = self.index(0, 0)
+                bottom_right = self.index(new_count - 1, self.columnCount() - 1)
+                self.dataChanged.emit(top_left, bottom_right)
+            else:
+                self.modelAboutToBeReset.emit()
+                self._last_row_count = new_count
+                self.modelReset.emit()
+        finally:
+            self._in_model_update = False
 
     def data(
         self,
@@ -373,9 +513,11 @@ class SpikeGroupTableModel(QAbstractTableModel):
             if column == 0:  # name / SpikeID
                 return getattr(sg.event, "name", None) or row
             elif column in (1, 2):  # start/end
-                if sg.get_window() is None:
+                row_wins = getattr(self, "_row_windows", None)
+                win = row_wins.get(row) if row_wins is not None and row in row_wins else sg.get_window()
+                if win is None:
                     return ""
-                return sg.get_window()[column - 1]
+                return win[column - 1]
             elif column == 3:  # N (number of events)
                 if hasattr(sg, "event") and sg.event is not None and len(sg.event) > 0:
                     return len(sg.event)

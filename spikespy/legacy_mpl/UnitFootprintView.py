@@ -22,12 +22,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .ViewerState import ViewerState, tracked_neuron_unit
+from ..ViewerState import ViewerState, tracked_neuron_unit
+from ..live_orchestrator import LiveFrameConsumerMixin
+from ..ChannelGroupBar import ChannelGroupBar
+from ..helpers import run_adaptive_render
 
 mplstyle.use("fast")
 
 
-class UnitFootprintView(QMainWindow):
+class UnitFootprintView(LiveFrameConsumerMixin, QMainWindow):
     """
     Dockable view visualizing the spatiotemporal footprint of detected units across
     recording channels, displaying inter-channel conduction/propagation lag (Δt)
@@ -103,6 +106,12 @@ class UnitFootprintView(QMainWindow):
         self.control_toolbar.addWidget(self.btn_auto_assign_channels)
         self.addToolBar(self.control_toolbar)
 
+        # Independent channel group and unit binding toolbar
+        self.channel_bar = ChannelGroupBar(parent=self, state=state)
+        self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
+        self.addToolBarBreak()
+        self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+
         # Matplotlib navigation toolbar
         self.matplotlib_toolbar = NavigationToolbar2QT(self.canvas, self)
         self.addToolBar(self.matplotlib_toolbar)
@@ -144,29 +153,41 @@ class UnitFootprintView(QMainWindow):
 
         if state is not None:
             self.setState(state)
+        self.update_window_title()
+
+    def _on_channel_bar_changed(self):
+        self.update_window_title()
+        self.update_plot()
+
+    def update_window_title(self):
+        if hasattr(self, "channel_bar"):
+            summary = self.channel_bar.get_title_summary()
+            self.setWindowTitle(f"UnitFootprint {summary}")
+            p = self.parentWidget()
+            if p is not None and hasattr(p, "setWindowTitle"):
+                p.setWindowTitle(f"UnitFootprint {summary}")
 
     def is_view_culled(self) -> bool:
-        if getattr(self, "_user_hidden", False):
-            return True
-        if self.isMinimized() or (self.window() is not None and self.window().isMinimized()):
-            return True
-        curr = self
-        while curr.parentWidget() is not None:
-            curr = curr.parentWidget()
-            if curr.isMinimized():
+        try:
+            if getattr(self, "_user_hidden", False):
                 return True
-        if self.parentWidget() is not None and not self.isVisible():
-            return True
-        if getattr(self, "_was_shown", False) and not self.isVisible():
-            return True
-        return False
+            win = self.window()
+            if win is not None and win.isMinimized():
+                return True
+            if self.parentWidget() is not None and not self.isVisible():
+                return True
+            if getattr(self, "_was_shown", False) and not self.isVisible():
+                return True
+            return False
+        except Exception:
+            return False
 
     def _on_render_timer_tick(self):
         try:
-            if not self.isVisible() or not getattr(self, "_dirty", False):
+            if self.is_view_culled() or not getattr(self, "_dirty", False):
                 return
             self._dirty = False
-            self._do_update_plot()
+            run_adaptive_render(self, self._do_update_plot, weight="heavy")
         except RuntimeError:
             pass
 
@@ -195,22 +216,31 @@ class UnitFootprintView(QMainWindow):
 
     def setState(self, state: ViewerState):
         self.state = state
+        if hasattr(self, "channel_bar"):
+            self.channel_bar.setState(state)
         if self.state is not None:
             if hasattr(self.state, "onUnitChange"):
                 self.state.onUnitChange.connect(lambda *args: self.schedule_update())
             if hasattr(self.state, "onUnitGroupChange"):
                 self.state.onUnitGroupChange.connect(lambda *args: self.schedule_update())
             if hasattr(self.state, "onLoadNewFile"):
-                self.state.onLoadNewFile.connect(lambda *args: self.schedule_update())
+                self._register_data_reload(
+                    self.state,
+                    lambda: self.schedule_update(),
+                )
             if hasattr(self.state, "onNewSpikeEvents"):
                 self.state.onNewSpikeEvents.connect(lambda *args: self.schedule_update())
             if hasattr(self.state, "onChannelChange"):
                 self.state.onChannelChange.connect(lambda *args: self.schedule_update())
             if hasattr(self.state, "onNewSweep"):
-                self.state.onNewSweep.connect(lambda *args: self.schedule_update())
+                self._register_live_frames(
+                    self.state,
+                    lambda _stimno: self.schedule_update(),
+                )
             if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
                 self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
                 self.state.onUIRefreshRateChange.connect(self.render_timer.setInterval)
+        self.update_window_title()
         self.update_plot()
 
     def schedule_update(self):
@@ -302,17 +332,24 @@ class UnitFootprintView(QMainWindow):
         if self.state.event_signal is not None and hasattr(sg, "get_latencies"):
             lats = sg.get_latencies(self.state.event_signal)
             valid = ~np.isnan(lats)
-            valid_sweeps = np.where(valid)[0].tolist()
+            valid_sweeps = np.where(valid)[0]
+            if len(valid_sweeps) > last_n:
+                valid_sweeps = valid_sweeps[-last_n:]
             for s_i in valid_sweeps:
                 sec = float(lats[s_i].rescale(pq.s).magnitude) if hasattr(lats[s_i], "rescale") else float(lats[s_i])
-                sweep_sample_map[s_i] = int(round(sec * sr))
+                sweep_sample_map[int(s_i)] = int(round(sec * sr))
         elif getattr(sg, "idx_arr", None) is not None:
             valid_sweeps = []
-            for s_i, item in enumerate(sg.idx_arr):
+            idx_arr = list(sg.idx_arr)
+            for s_i in range(len(idx_arr) - 1, -1, -1):
+                item = idx_arr[s_i]
                 if item is not None:
                     c_s = int(item[0]) if isinstance(item, (tuple, list, np.ndarray)) else int(item)
                     valid_sweeps.append(s_i)
                     sweep_sample_map[s_i] = c_s
+                    if len(valid_sweeps) >= last_n:
+                        break
+            valid_sweeps.reverse()
         else:
             valid_sweeps = []
 
@@ -437,9 +474,10 @@ class UnitFootprintView(QMainWindow):
         spatiotemporal footprint amplitude and SNR, updating unit annotations.
         """
         if sg is None:
-            if self.state is None:
-                return
-            sg = self.state.getUnitGroup()
+            if hasattr(self, "channel_bar"):
+                sg = self.channel_bar.get_target_unit()
+            elif self.state is not None:
+                sg = self.state.getUnitGroup()
         if sg is None:
             return
 
@@ -482,24 +520,65 @@ class UnitFootprintView(QMainWindow):
         self._dirty = False
         self._do_update_plot()
 
-    def _do_update_plot(self):
-        if self.is_view_culled():
-            self._dirty = True
+    def _show_placeholder(self, text: str):
+        """Show a single-axis placeholder, reusing it when already displayed."""
+        axes = self.figure.axes
+        if len(axes) == 1 and getattr(axes[0], "_is_placeholder", False):
+            ax = axes[0]
+            for txt in list(ax.texts):
+                txt.remove()
+            ax.text(0.5, 0.5, text, ha="center", va="center", transform=ax.transAxes)
             return
-
-        self.render_count = getattr(self, "render_count", 0) + 1
         for ax in list(self.figure.axes):
             ax.remove()
         self.ax_heat = None
         self.ax_bar = None
         self.current_channels = []
         self.grid_axes = []
+        ax = self.figure.add_subplot(111)
+        ax._is_placeholder = True
+        ax.text(0.5, 0.5, text, ha="center", va="center", transform=ax.transAxes)
+
+    def _do_update_plot(self):
+        if self.is_view_culled():
+            self._dirty = True
+            return
+
+        if hasattr(self, "matplotlib_toolbar") and self.matplotlib_toolbar is not None and self.matplotlib_toolbar.mode != "":
+            self._dirty = True
+            return
+
+        self.render_count = getattr(self, "render_count", 0) + 1
 
         if self.state is None:
+            if self.figure.axes:
+                for ax in list(self.figure.axes):
+                    ax.remove()
+                self.ax_heat = None
+                self.ax_bar = None
+                self.current_channels = []
+                self.grid_axes = []
             self.canvas.draw_idle()
             return
 
         mode_idx = self.combo_mode.currentIndex()
+        reuse = (
+            mode_idx == getattr(self, "_built_mode", None)
+            and len(self.figure.axes) > 0
+            and not any(getattr(ax, "_is_placeholder", False) for ax in self.figure.axes)
+        )
+        if reuse:
+            for ax in self.figure.axes:
+                ax.clear()
+        else:
+            for ax in list(self.figure.axes):
+                ax.remove()
+            self.ax_heat = None
+            self.ax_bar = None
+            self.current_channels = []
+            self.grid_axes = []
+            self._built_mode = mode_idx
+
         if mode_idx == 0:
             self._plot_single_unit_composite()
         else:
@@ -508,30 +587,17 @@ class UnitFootprintView(QMainWindow):
         self.canvas.draw_idle()
 
     def _plot_single_unit_composite(self):
-        sg = self.state.getUnitGroup() if self.state is not None else None
+        if hasattr(self, "channel_bar"):
+            sg = self.channel_bar.get_target_unit()
+        else:
+            sg = self.state.getUnitGroup() if self.state is not None else None
         if sg is None:
-            ax = self.figure.add_subplot(111)
-            ax.text(
-                0.5,
-                0.5,
-                "No unit selected",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-            )
+            self._show_placeholder("No unit selected")
             return
 
         fp = self.compute_unit_footprint(sg)
         if fp is None:
-            ax = self.figure.add_subplot(111)
-            ax.text(
-                0.5,
-                0.5,
-                "Insufficient events or channel data for unit footprint",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-            )
+            self._show_placeholder("Insufficient events or channel data for unit footprint")
             return
 
         channels = fp["channels"]
@@ -546,10 +612,13 @@ class UnitFootprintView(QMainWindow):
         n_ch = len(channels)
 
         gs = GridSpec(1, 2, figure=self.figure, width_ratios=[3.5, 1.2], wspace=0.15)
-        ax_heat = self.figure.add_subplot(gs[0, 0])
-        ax_bar = self.figure.add_subplot(gs[0, 1], sharey=ax_heat)
-        self.ax_heat = ax_heat
-        self.ax_bar = ax_bar
+        if self.ax_heat is not None and self.ax_bar is not None:
+            ax_heat, ax_bar = self.ax_heat, self.ax_bar
+        else:
+            ax_heat = self.figure.add_subplot(gs[0, 0])
+            ax_bar = self.figure.add_subplot(gs[0, 1], sharey=ax_heat)
+            self.ax_heat = ax_heat
+            self.ax_bar = ax_bar
 
         vmax = (
             float(np.max(np.abs(mean_matrix)))
@@ -702,23 +771,26 @@ class UnitFootprintView(QMainWindow):
         if not units:
             units = [sg for sg in self.state.spike_groups if sg is not None]
         if not units:
-            ax = self.figure.add_subplot(111)
-            ax.text(
-                0.5,
-                0.5,
-                "No tracked units available",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-            )
+            self._show_placeholder("No tracked units available")
             return
 
+        self.grid_axes = []
         n_units = len(units)
         n_cols = min(n_units, 3)
         n_rows = int(np.ceil(n_units / n_cols))
+        reuse = len(self.figure.axes) == n_units and not any(
+            getattr(ax, "_is_placeholder", False) for ax in self.figure.axes
+        )
+        if not reuse:
+            for ax in list(self.figure.axes):
+                ax.remove()
 
         for u_idx, sg in enumerate(units):
-            ax = self.figure.add_subplot(n_rows, n_cols, u_idx + 1)
+            if reuse:
+                ax = self.figure.axes[u_idx]
+                ax.clear()
+            else:
+                ax = self.figure.add_subplot(n_rows, n_cols, u_idx + 1)
             fp = self.compute_unit_footprint(sg)
             if fp is None:
                 unit_title = (
@@ -819,6 +891,8 @@ class UnitFootprintView(QMainWindow):
 
     def on_click(self, event):
         """Interactive click handler for channel selection and unit jumping."""
+        if getattr(event, "button", None) != 1:
+            return
         if hasattr(self, "matplotlib_toolbar") and self.matplotlib_toolbar is not None:
             if self.matplotlib_toolbar.mode != "":
                 return
