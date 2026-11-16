@@ -38,6 +38,7 @@ from .MultiTraceView import DialogSignalSelect, DialogPolySelect, DialogDeleteRe
 from .helpers import qsignal_throttle, quiet_fail
 from .live_orchestrator import LiveFrameConsumerMixin
 from .viewer_worker import get_task_manager, TaskType, TaskPriority
+from .PGNavigation import PGNavigationMixin
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +109,7 @@ class ChannelPlotPanel:
         self.has_data: bool = False
 
 
-class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
+class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     """
     High-performance PyQtGraph port of MultiTraceView.
     Delivers 60 FPS GPU-accelerated waterfall heatmaps, multi-trace visualization,
@@ -384,6 +385,10 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         resetViewBtn = QPushButton("Reset View")
         resetViewBtn.clicked.connect(self.update_axis)
         toolbar.addWidget(resetViewBtn)
+
+        # Matplotlib-like navigation actions
+        self.add_navigation_actions(toolbar)
+        self.init_navigation()
 
         # Independent channel group and unit binding toolbar
         self.channel_bar = ChannelGroupBar(parent=self, state=self.state)
@@ -915,16 +920,16 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         return self.state.get_erp()
 
     def get_live_buffer(self):
-        if self.state is None or not getattr(self.state, "is_streaming", False):
+        if self.state is None:
             return None
         primary = (
             self.channel_bar.get_primary_channel()
             if hasattr(self, "channel_bar") and self.channel_bar is not None
             else getattr(getattr(self.state, "analog_signal", None), "name", None)
         )
-        if hasattr(self.state, "_live_aux_erp_buffers") and primary in self.state._live_aux_erp_buffers:
+        if hasattr(self.state, "_live_aux_erp_buffers") and self.state._live_aux_erp_buffers and primary in self.state._live_aux_erp_buffers:
             return self.state._live_aux_erp_buffers[primary]
-        if self.state.analog_signal is not None and primary == self.state.analog_signal.name:
+        if self.state.analog_signal is not None and primary == getattr(self.state.analog_signal, "name", None):
             return getattr(self.state, "_live_erp_buffer", None)
         return getattr(self.state, "_live_erp_buffer", None)
 
@@ -943,8 +948,13 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             if self.mode == "lines":
                 self.setup_figure()
 
+    def reset_view(self):
+        self.update_axis()
+
     def _on_plot_clicked(self, event):
         """Handle clicks on any channel plot for sweep navigation, channel context menu, or selector point placement."""
+        if self.is_nav_active():
+            return
         scene_pos = event.scenePos()
         target_panel = None
         for p in self.channel_panels:
@@ -1196,10 +1206,18 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
             self._register_live_frames(state, lambda _stimno: self.on_new_sweep_throttled())
         if hasattr(self.state, "onNewSpikeEvents"):
             self._connect_state(self.state.onNewSpikeEvents, self._on_new_spike_events)
+        if hasattr(self.state, "onStreamStateChanged"):
+            self._connect_state(self.state.onStreamStateChanged, self._on_stream_state_changed)
 
         self.update_axis()
         self._schedule_right_axis_update(force=True)
         self.update_window_title()
+
+    def _on_stream_state_changed(self, is_streaming: bool):
+        if not is_streaming and self.state is not None:
+            self._schedule_render(self.state.stimno)
+            self._schedule_right_axis_update(force=True)
+            self.plot_spikegroups()
 
     @quiet_fail
     def on_new_sweep(self, stimno: Optional[int] = None):
@@ -1273,7 +1291,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
 
     def _extract_channel_row_stats(self, ch_names: List[str], show_max: bool) -> Dict[str, np.ndarray]:
         stats: Dict[str, np.ndarray] = {}
-        if self.state is None or not getattr(self.state, "is_streaming", False):
+        if self.state is None:
             return stats
         for ch_name in ch_names:
             buf = None
@@ -1613,7 +1631,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, QMainWindow):
         if erp is None or len(erp) == 0:
             return
 
-        n_sweeps = len(self.state.event_signal) if not getattr(self.state, "is_streaming", False) else erp.shape[0]
+        n_sweeps = erp.shape[0] if (erp is not None and getattr(erp, "ndim", 0) >= 2) else (len(self.state.event_signal) if self.state and self.state.event_signal is not None else 1)
         n_samples = erp.shape[1]
 
         self.main_plot.setXRange(0, n_samples, padding=0)

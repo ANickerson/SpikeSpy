@@ -19,6 +19,7 @@ from .ChannelGroupBar import ChannelGroupBar
 from .helpers import quiet_fail, run_adaptive_render, qsignal_throttle
 from .live_orchestrator import LiveFrameConsumerMixin
 from .viewer_worker import get_task_manager, TaskType, TaskPriority
+from .PGNavigation import PGNavigationMixin
 
 
 class SingleTraceTimeAxisItem(pg.AxisItem):
@@ -61,7 +62,7 @@ class _SweepConvProxy:
         return erp.shape[0] if erp is not None else 0
 
 
-class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
+class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     """
     High-performance PyQtGraph port of SingleTraceView.
     Displays single-sweep waveform with peak snapping, template correlation,
@@ -134,10 +135,12 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
         self.separate_axes_check.setChecked(self._separate_axes)
         self.separate_axes_check.toggled.connect(self._on_axis_mode_changed)
         self.axis_bar.addWidget(self.separate_axes_check)
+        self.add_navigation_actions(self.axis_bar)
         self.addToolBarBreak(Qt.TopToolBarArea)
         self.addToolBar(Qt.TopToolBarArea, self.axis_bar)
 
         self._init_ui()
+        self.init_navigation()
 
         if state is not None:
             self.set_state(state)
@@ -1199,8 +1202,25 @@ class SingleTracePGView(LiveFrameConsumerMixin, QMainWindow):
             conv_row = self.conv[stimno] if self.conv is not None else None
             self._apply_conv_peaks(self._get_conv_peaks(conv_row))
 
+    def reset_view(self):
+        erp = self.get_erp_signal()
+        if erp is None or len(erp) == 0:
+            return
+        sr = self._sampling_rate_hz()
+        duration_sec = erp.shape[-1] / sr
+        self.main_plot.setXRange(0, duration_sec, padding=0)
+        erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
+        if getattr(erp_mag, "ndim", 1) == 2 and erp_mag.shape[0] > 0:
+            stimno = max(0, min(int(self.state.stimno), erp_mag.shape[0] - 1)) if self.state else 0
+            display_mag = np.asarray(erp_mag[stimno])
+        else:
+            display_mag = np.asarray(erp_mag)
+        ylim = float(np.std(np.abs(display_mag)) * 8)
+        if ylim > 0:
+            self.main_plot.setYRange(-ylim, ylim, padding=0)
+
     def _on_plot_clicked(self, event):
-        if event.button() != Qt.LeftButton or self.state is None:
+        if self.is_nav_active() or event.button() != Qt.LeftButton or self.state is None:
             return
         plots = [self.main_plot] + list(self._aux_plot_by_channel.values())
         plot = next(

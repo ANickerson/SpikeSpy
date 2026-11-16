@@ -5,6 +5,7 @@ import PySide6
 from PySide6.QtCore import QSignalBlocker, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -127,6 +128,11 @@ class ViewSettingsPanel(QWidget):
         self.grp_unit = self._create_unit_group()
         self.container_layout.addWidget(self.grp_unit)
         self.grp_unit.setVisible(False)
+
+        # Plot Navigation & Limits group
+        self.grp_navigation = self._create_navigation_group()
+        self.container_layout.addWidget(self.grp_navigation)
+        self.grp_navigation.setVisible(False)
 
         self.container_layout.addStretch()
         self.scroll.setWidget(self.container_widget)
@@ -295,6 +301,110 @@ class ViewSettingsPanel(QWidget):
 
         return grp
 
+    def _create_navigation_group(self) -> QGroupBox:
+        grp = QGroupBox("Plot Navigation & Limits")
+        layout = QVBoxLayout(grp)
+
+        # Mode row: Normal, Pan, Zoom, Reset
+        mode_box = QHBoxLayout()
+        mode_box.addWidget(QLabel("Mode:"))
+
+        self.btn_nav_normal = QPushButton("Normal")
+        self.btn_nav_normal.setCheckable(True)
+        self.btn_nav_normal.setChecked(True)
+        self.btn_nav_normal.setToolTip("Normal selection / annotation mode")
+
+        self.btn_nav_pan = QPushButton("Pan")
+        self.btn_nav_pan.setCheckable(True)
+        self.btn_nav_pan.setToolTip(
+            "Pan with left-drag, zoom with right-drag / scroll wheel"
+        )
+
+        self.btn_nav_zoom = QPushButton("Zoom")
+        self.btn_nav_zoom.setCheckable(True)
+        self.btn_nav_zoom.setToolTip("Zoom to rectangle (drag with left mouse)")
+
+        self.btn_nav_reset = QPushButton("Reset")
+        self.btn_nav_reset.setToolTip("Reset view range to default limits")
+
+        self.nav_button_group = QButtonGroup(self)
+        self.nav_button_group.addButton(self.btn_nav_normal)
+        self.nav_button_group.addButton(self.btn_nav_pan)
+        self.nav_button_group.addButton(self.btn_nav_zoom)
+        self.nav_button_group.setExclusive(True)
+
+        mode_box.addWidget(self.btn_nav_normal)
+        mode_box.addWidget(self.btn_nav_pan)
+        mode_box.addWidget(self.btn_nav_zoom)
+        mode_box.addWidget(self.btn_nav_reset)
+        layout.addLayout(mode_box)
+
+        self.btn_nav_normal.clicked.connect(lambda: self._on_nav_mode_btn_clicked(""))
+        self.btn_nav_pan.clicked.connect(lambda: self._on_nav_mode_btn_clicked("pan"))
+        self.btn_nav_zoom.clicked.connect(lambda: self._on_nav_mode_btn_clicked("zoom"))
+        self.btn_nav_reset.clicked.connect(self._on_nav_reset_clicked)
+
+        # Manual Limits Form
+        form = QFormLayout()
+
+        # X Range
+        x_layout = QHBoxLayout()
+        self.spin_xlim_min = QDoubleSpinBox()
+        self.spin_xlim_min.setRange(-1e9, 1e9)
+        self.spin_xlim_min.setDecimals(4)
+        self.spin_xlim_min.setSingleStep(1.0)
+        self.spin_xlim_min.setKeyboardTracking(False)
+
+        self.spin_xlim_max = QDoubleSpinBox()
+        self.spin_xlim_max.setRange(-1e9, 1e9)
+        self.spin_xlim_max.setDecimals(4)
+        self.spin_xlim_max.setSingleStep(1.0)
+        self.spin_xlim_max.setKeyboardTracking(False)
+
+        x_layout.addWidget(self.spin_xlim_min)
+        x_layout.addWidget(QLabel("to"))
+        x_layout.addWidget(self.spin_xlim_max)
+        form.addRow("X Limits:", x_layout)
+
+        # Y Range
+        y_layout = QHBoxLayout()
+        self.spin_ylim_min = QDoubleSpinBox()
+        self.spin_ylim_min.setRange(-1e9, 1e9)
+        self.spin_ylim_min.setDecimals(4)
+        self.spin_ylim_min.setSingleStep(1.0)
+        self.spin_ylim_min.setKeyboardTracking(False)
+
+        self.spin_ylim_max = QDoubleSpinBox()
+        self.spin_ylim_max.setRange(-1e9, 1e9)
+        self.spin_ylim_max.setDecimals(4)
+        self.spin_ylim_max.setSingleStep(1.0)
+        self.spin_ylim_max.setKeyboardTracking(False)
+
+        y_layout.addWidget(self.spin_ylim_min)
+        y_layout.addWidget(QLabel("to"))
+        y_layout.addWidget(self.spin_ylim_max)
+        form.addRow("Y Limits:", y_layout)
+
+        layout.addLayout(form)
+
+        # Action Buttons
+        btn_action_layout = QHBoxLayout()
+        self.btn_apply_limits = QPushButton("Apply Limits")
+        self.btn_apply_limits.clicked.connect(self._on_apply_limits_clicked)
+        btn_action_layout.addWidget(self.btn_apply_limits)
+
+        self.btn_auto_limits = QPushButton("Auto Range")
+        self.btn_auto_limits.clicked.connect(self._on_auto_limits_clicked)
+        btn_action_layout.addWidget(self.btn_auto_limits)
+        layout.addLayout(btn_action_layout)
+
+        self.spin_xlim_min.editingFinished.connect(self._on_apply_limits_clicked)
+        self.spin_xlim_max.editingFinished.connect(self._on_apply_limits_clicked)
+        self.spin_ylim_min.editingFinished.connect(self._on_apply_limits_clicked)
+        self.spin_ylim_max.editingFinished.connect(self._on_apply_limits_clicked)
+
+        return grp
+
     # ---------------------------------------------------------
     # Active View Tracking & Population
     # ---------------------------------------------------------
@@ -331,6 +441,7 @@ class ViewSettingsPanel(QWidget):
 
     def _disconnect_current_view(self):
         """Cleanly disconnect any signals from the previously active view."""
+        self._disconnect_navigation_signals()
         self.active_view = None
 
     def _on_focus_changed(self, old: Optional[QWidget], new: Optional[QWidget]):
@@ -592,6 +703,7 @@ class ViewSettingsPanel(QWidget):
             self.grp_singletrace.setVisible(False)
             self.grp_fixed.setVisible(False)
             self.grp_unit.setVisible(False)
+            self.grp_navigation.setVisible(False)
             if (
                 hasattr(self, "_custom_plugin_grp")
                 and self._custom_plugin_grp is not None
@@ -639,6 +751,8 @@ class ViewSettingsPanel(QWidget):
         self.grp_singletrace.setVisible(False)
         self.grp_fixed.setVisible(False)
         self.grp_unit.setVisible(False)
+        self.grp_navigation.setVisible(False)
+        self._disconnect_navigation_signals()
         if hasattr(self, "_custom_plugin_grp") and self._custom_plugin_grp is not None:
             self._custom_plugin_grp.setVisible(False)
             self._custom_plugin_grp.deleteLater()
@@ -711,6 +825,14 @@ class ViewSettingsPanel(QWidget):
                 f"{c_name} has no view-specific visual parameters."
             )
             self.placeholder.setVisible(True)
+
+        # Show Navigation & Limits group if supported
+        if (
+            hasattr(view, "get_view_range")
+            and callable(getattr(view, "get_view_range"))
+        ) or hasattr(view, "ax"):
+            self.grp_navigation.setVisible(True)
+            self._populate_navigation(view)
 
         self._block_updates = False
 
@@ -1058,4 +1180,224 @@ class ViewSettingsPanel(QWidget):
             return
         if hasattr(self.active_view, "spin_last_n"):
             self.active_view.spin_last_n.setValue(val)
+        self.settingsChanged.emit()
+
+    # ---------------------------------------------------------
+    # Navigation & Limits Handlers
+    # ---------------------------------------------------------
+    def _populate_navigation(self, view):
+        self._block_updates = True
+        try:
+            # Mode
+            mode = ""
+            if hasattr(view, "get_nav_mode") and callable(
+                getattr(view, "get_nav_mode")
+            ):
+                mode = view.get_nav_mode()
+            elif (
+                hasattr(view, "matplotlib_toolbar")
+                and view.matplotlib_toolbar is not None
+            ):
+                tb_mode = getattr(view.matplotlib_toolbar, "mode", "")
+                if "pan" in tb_mode.lower():
+                    mode = "pan"
+                elif "zoom" in tb_mode.lower():
+                    mode = "zoom"
+
+            if mode == "pan":
+                self.btn_nav_pan.setChecked(True)
+            elif mode == "zoom":
+                self.btn_nav_zoom.setChecked(True)
+            else:
+                self.btn_nav_normal.setChecked(True)
+
+            # Range
+            if hasattr(view, "get_view_range") and callable(
+                getattr(view, "get_view_range")
+            ):
+                (xmin, xmax), (ymin, ymax) = view.get_view_range()
+                self.spin_xlim_min.setValue(xmin)
+                self.spin_xlim_max.setValue(xmax)
+                self.spin_ylim_min.setValue(ymin)
+                self.spin_ylim_max.setValue(ymax)
+
+                plot = (
+                    view.get_primary_nav_plot()
+                    if hasattr(view, "get_primary_nav_plot")
+                    else None
+                )
+                if plot is not None and hasattr(plot, "vb") and plot.vb is not None:
+                    self._connected_vb = plot.vb
+                    plot.vb.sigRangeChanged.connect(self._on_plot_range_changed)
+
+                if hasattr(view, "register_nav_mode_callback"):
+                    self._connected_nav_view = view
+                    view.register_nav_mode_callback(self._on_view_nav_mode_changed)
+
+            elif hasattr(view, "ax"):
+                xlim = view.ax.get_xlim()
+                ylim = view.ax.get_ylim()
+                self.spin_xlim_min.setValue(float(min(xlim)))
+                self.spin_xlim_max.setValue(float(max(xlim)))
+                self.spin_ylim_min.setValue(float(min(ylim)))
+                self.spin_ylim_max.setValue(float(max(ylim)))
+        finally:
+            self._block_updates = False
+
+    def _disconnect_navigation_signals(self):
+        if hasattr(self, "_connected_vb") and self._connected_vb is not None:
+            try:
+                self._connected_vb.sigRangeChanged.disconnect(
+                    self._on_plot_range_changed
+                )
+            except Exception:
+                pass
+            self._connected_vb = None
+
+        if (
+            hasattr(self, "_connected_nav_view")
+            and self._connected_nav_view is not None
+        ):
+            try:
+                self._connected_nav_view.unregister_nav_mode_callback(
+                    self._on_view_nav_mode_changed
+                )
+            except Exception:
+                pass
+            self._connected_nav_view = None
+
+    def _on_plot_range_changed(self, *args):
+        if self._block_updates or not self._is_view_alive(self.active_view):
+            return
+        if (
+            self.spin_xlim_min.hasFocus()
+            or self.spin_xlim_max.hasFocus()
+            or self.spin_ylim_min.hasFocus()
+            or self.spin_ylim_max.hasFocus()
+        ):
+            return
+        if hasattr(self.active_view, "get_view_range") and callable(
+            getattr(self.active_view, "get_view_range")
+        ):
+            (xmin, xmax), (ymin, ymax) = self.active_view.get_view_range()
+            self._block_updates = True
+            try:
+                self.spin_xlim_min.setValue(xmin)
+                self.spin_xlim_max.setValue(xmax)
+                self.spin_ylim_min.setValue(ymin)
+                self.spin_ylim_max.setValue(ymax)
+            finally:
+                self._block_updates = False
+
+    def _on_view_nav_mode_changed(self, mode: str):
+        if self._block_updates:
+            return
+        self._block_updates = True
+        try:
+            if mode == "pan":
+                self.btn_nav_pan.setChecked(True)
+            elif mode == "zoom":
+                self.btn_nav_zoom.setChecked(True)
+            else:
+                self.btn_nav_normal.setChecked(True)
+        finally:
+            self._block_updates = False
+
+    def _on_nav_mode_btn_clicked(self, mode: str):
+        if self._block_updates or not self._is_view_alive(self.active_view):
+            return
+        if hasattr(self.active_view, "set_nav_mode") and callable(
+            getattr(self.active_view, "set_nav_mode")
+        ):
+            self.active_view.set_nav_mode(mode)
+        elif (
+            hasattr(self.active_view, "matplotlib_toolbar")
+            and self.active_view.matplotlib_toolbar is not None
+        ):
+            tb = self.active_view.matplotlib_toolbar
+            current_tb_mode = getattr(tb, "mode", "").lower()
+            if mode == "pan" and "pan" not in current_tb_mode:
+                tb.pan()
+            elif mode == "zoom" and "zoom" not in current_tb_mode:
+                tb.zoom()
+            elif mode == "" and current_tb_mode != "":
+                if "pan" in current_tb_mode:
+                    tb.pan()
+                elif "zoom" in current_tb_mode:
+                    tb.zoom()
+        self.settingsChanged.emit()
+
+    def _on_apply_limits_clicked(self):
+        if self._block_updates or not self._is_view_alive(self.active_view):
+            return
+        xmin = float(self.spin_xlim_min.value())
+        xmax = float(self.spin_xlim_max.value())
+        ymin = float(self.spin_ylim_min.value())
+        ymax = float(self.spin_ylim_max.value())
+        if xmin >= xmax:
+            xmax = xmin + 1.0
+            self.spin_xlim_max.setValue(xmax)
+        if ymin >= ymax:
+            ymax = ymin + 1.0
+            self.spin_ylim_max.setValue(ymax)
+
+        self._block_updates = True
+        try:
+            if hasattr(self.active_view, "set_view_range") and callable(
+                getattr(self.active_view, "set_view_range")
+            ):
+                self.active_view.set_view_range((xmin, xmax), (ymin, ymax))
+            elif hasattr(self.active_view, "ax"):
+                self.active_view.ax.set_xlim(xmin, xmax)
+                self.active_view.ax.set_ylim(ymin, ymax)
+                if hasattr(self.active_view, "view") and hasattr(
+                    self.active_view.view, "draw_idle"
+                ):
+                    self.active_view.view.draw_idle()
+                elif hasattr(self.active_view, "canvas") and hasattr(
+                    self.active_view.canvas, "draw_idle"
+                ):
+                    self.active_view.canvas.draw_idle()
+        finally:
+            self._block_updates = False
+        self.settingsChanged.emit()
+
+    def _on_auto_limits_clicked(self):
+        self._on_nav_reset_clicked()
+
+    def _on_nav_reset_clicked(self):
+        if self._block_updates or not self._is_view_alive(self.active_view):
+            return
+        if hasattr(self.active_view, "reset_view") and callable(
+            getattr(self.active_view, "reset_view")
+        ):
+            self.active_view.reset_view()
+        elif hasattr(self.active_view, "matplotlib_toolbar") and hasattr(
+            self.active_view.matplotlib_toolbar, "home"
+        ):
+            self.active_view.matplotlib_toolbar.home()
+
+        if hasattr(self.active_view, "get_view_range") and callable(
+            getattr(self.active_view, "get_view_range")
+        ):
+            (xmin, xmax), (ymin, ymax) = self.active_view.get_view_range()
+            self._block_updates = True
+            try:
+                self.spin_xlim_min.setValue(xmin)
+                self.spin_xlim_max.setValue(xmax)
+                self.spin_ylim_min.setValue(ymin)
+                self.spin_ylim_max.setValue(ymax)
+            finally:
+                self._block_updates = False
+        elif hasattr(self.active_view, "ax"):
+            xlim = self.active_view.ax.get_xlim()
+            ylim = self.active_view.ax.get_ylim()
+            self._block_updates = True
+            try:
+                self.spin_xlim_min.setValue(float(min(xlim)))
+                self.spin_xlim_max.setValue(float(max(xlim)))
+                self.spin_ylim_min.setValue(float(min(ylim)))
+                self.spin_ylim_max.setValue(float(max(ylim)))
+            finally:
+                self._block_updates = False
         self.settingsChanged.emit()

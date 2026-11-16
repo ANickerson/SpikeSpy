@@ -54,9 +54,16 @@ def expand_multichannel_segment(seg: neo.Segment) -> neo.Segment:
 
     new_analogsignals = []
     for asig in seg.analogsignals:
-        if asig.ndim == 2 and asig.shape[1] > 1:
+        if (
+            not isinstance(asig, MultiAnalogSignal)
+            and getattr(asig, "ndim", 1) == 2
+            and asig.shape[1] > 1
+        ):
             ch_names = []
-            if hasattr(asig, "array_annotations") and "channel_names" in asig.array_annotations:
+            if (
+                hasattr(asig, "array_annotations")
+                and "channel_names" in asig.array_annotations
+            ):
                 raw_names = asig.array_annotations["channel_names"]
                 ch_names = [str(n) for n in raw_names]
             if len(ch_names) != asig.shape[1]:
@@ -232,17 +239,29 @@ def load_file(data_path, type="h5", **kwargs):
 
     if isinstance(data, (list, ObjectList)):
         final_sig = next(
-            x
-            for x in data
-            if x.name != "ERP"
-            and x.annotations.get("class_", "") != "multianalogsignal"
+            (
+                x
+                for x in data
+                if not getattr(x, "name", "").startswith("ERP")
+                and x.annotations.get("class_", "") != "multianalogsignal"
+            ),
+            None,
         )
+        if final_sig is None and len(data) > 0:
+            final_sig = data[-1]
         for seg in data:
-            if (
-                seg.name == "ERP"
+            if seg is not final_sig and (
+                getattr(seg, "name", "").startswith("ERP")
                 or seg.annotations.get("class_", "") == "multianalogsignal"
             ):
                 erp = MultiAnalogSignal(seg.analogsignals)
+                ch_name = seg.annotations.get(
+                    "channel",
+                    seg.name.replace("ERP_", "")
+                    if seg.name.startswith("ERP_")
+                    else (seg.analogsignals[0].name if seg.analogsignals else "CH0"),
+                )
+                erp.name = ch_name
                 final_sig.analogsignals.append(erp)
         data = final_sig
 
@@ -281,29 +300,51 @@ def export_units_csv(save_filename: str, unit_evts, stim_evt: neo.Event):
     """Export unit spikes to CSV including Channel, Neighbor_channels, and Tracking metadata."""
     with open(save_filename, "w", newline="") as f:
         w = writer(f)
-        w.writerow([
-            "SpikeID",
-            "Stimulus_number",
-            "Latency_ms",
-            "Timestamp_ms",
-            "Channel",
-            "Neighbor_channels",
-            "auto_track",
-            "tracking_window_ms",
-            "tracking_threshold_mv",
-            "tracking_max_skips",
-            "tracking_channel",
-        ])
+        w.writerow(
+            [
+                "SpikeID",
+                "Stimulus_number",
+                "Latency_ms",
+                "Timestamp_ms",
+                "Channel",
+                "Neighbor_channels",
+                "auto_track",
+                "tracking_window_ms",
+                "tracking_threshold_mv",
+                "tracking_max_skips",
+                "tracking_channel",
+            ]
+        )
         for i, item in enumerate(unit_evts):
             if hasattr(item, "event"):
                 evt = item.event
-                channel = getattr(item, "channel", "") or evt.annotations.get("channel", "")
-                neighbors = getattr(item, "neighbor_channels", []) or evt.annotations.get("neighbor_channels", [])
-                auto_track = getattr(item, "auto_track", False) or evt.annotations.get("auto_track", False)
-                win_ms = getattr(item, "tracking_window_ms", 5.0) if hasattr(item, "tracking_window_ms") else evt.annotations.get("tracking_window_ms", 5.0)
-                thresh_mv = getattr(item, "tracking_threshold_mv", 0.01) if hasattr(item, "tracking_threshold_mv") else evt.annotations.get("tracking_threshold_mv", 0.01)
-                max_skips = getattr(item, "tracking_max_skips", 1) if hasattr(item, "tracking_max_skips") else evt.annotations.get("tracking_max_skips", 1)
-                trk_channel = getattr(item, "tracking_channel", "") or evt.annotations.get("tracking_channel", "")
+                channel = getattr(item, "channel", "") or evt.annotations.get(
+                    "channel", ""
+                )
+                neighbors = getattr(
+                    item, "neighbor_channels", []
+                ) or evt.annotations.get("neighbor_channels", [])
+                auto_track = getattr(item, "auto_track", False) or evt.annotations.get(
+                    "auto_track", False
+                )
+                win_ms = (
+                    getattr(item, "tracking_window_ms", 5.0)
+                    if hasattr(item, "tracking_window_ms")
+                    else evt.annotations.get("tracking_window_ms", 5.0)
+                )
+                thresh_mv = (
+                    getattr(item, "tracking_threshold_mv", 0.01)
+                    if hasattr(item, "tracking_threshold_mv")
+                    else evt.annotations.get("tracking_threshold_mv", 0.01)
+                )
+                max_skips = (
+                    getattr(item, "tracking_max_skips", 1)
+                    if hasattr(item, "tracking_max_skips")
+                    else evt.annotations.get("tracking_max_skips", 1)
+                )
+                trk_channel = getattr(
+                    item, "tracking_channel", ""
+                ) or evt.annotations.get("tracking_channel", "")
             else:
                 evt = item
                 channel = evt.annotations.get("channel", "")
@@ -315,7 +356,11 @@ def export_units_csv(save_filename: str, unit_evts, stim_evt: neo.Event):
                 trk_channel = evt.annotations.get("tracking_channel", "")
 
             nom = evt.name or f"unit_{i}"
-            neigh_str = ";".join(neighbors) if isinstance(neighbors, (list, tuple)) else str(neighbors)
+            neigh_str = (
+                ";".join(neighbors)
+                if isinstance(neighbors, (list, tuple))
+                else str(neighbors)
+            )
 
             if len(evt) == 0:
                 continue
@@ -334,19 +379,21 @@ def export_units_csv(save_filename: str, unit_evts, stim_evt: neo.Event):
                     lat_val = float("nan")
 
                 ts_ms = float(timestamp.rescale(pq.ms).magnitude)
-                w.writerow([
-                    nom,
-                    stim_no,
-                    lat_val,
-                    ts_ms,
-                    channel,
-                    neigh_str,
-                    auto_track,
-                    win_ms,
-                    thresh_mv,
-                    max_skips,
-                    trk_channel,
-                ])
+                w.writerow(
+                    [
+                        nom,
+                        stim_no,
+                        lat_val,
+                        ts_ms,
+                        channel,
+                        neigh_str,
+                        auto_track,
+                        win_ms,
+                        thresh_mv,
+                        max_skips,
+                        trk_channel,
+                    ]
+                )
 
 
 # Backward compatibility alias
@@ -370,7 +417,9 @@ def import_units_csv(open_filename: str):
             return []
 
         ch_key = fieldnames_lower.get("channel", None)
-        neigh_key = fieldnames_lower.get("neighbor_channels", fieldnames_lower.get("neighbors", None))
+        neigh_key = fieldnames_lower.get(
+            "neighbor_channels", fieldnames_lower.get("neighbors", None)
+        )
         id_key = fieldnames_lower.get("spikeid", "SpikeID")
         auto_track_key = fieldnames_lower.get("auto_track", None)
         win_ms_key = fieldnames_lower.get("tracking_window_ms", None)
@@ -385,7 +434,11 @@ def import_units_csv(open_filename: str):
                 auto_track_val = False
                 if auto_track_key and row.get(auto_track_key) is not None:
                     at_raw = row[auto_track_key]
-                    auto_track_val = at_raw.strip().lower() in ("true", "1", "t", "yes") if isinstance(at_raw, str) else bool(at_raw)
+                    auto_track_val = (
+                        at_raw.strip().lower() in ("true", "1", "t", "yes")
+                        if isinstance(at_raw, str)
+                        else bool(at_raw)
+                    )
 
                 win_ms_val = 5.0
                 if win_ms_key and row.get(win_ms_key):
@@ -425,7 +478,9 @@ def import_units_csv(open_filename: str):
                 if neigh_key and row.get(neigh_key):
                     raw_n = row[neigh_key]
                     sep = ";" if ";" in raw_n else ","
-                    units_dict[spikeid]["neighbor_channels"] = [x.strip() for x in raw_n.split(sep) if x.strip()]
+                    units_dict[spikeid]["neighbor_channels"] = [
+                        x.strip() for x in raw_n.split(sep) if x.strip()
+                    ]
 
             units_dict[spikeid]["timestamps"].append(float(row[ts_key]))
 
@@ -458,14 +513,21 @@ def import_units_csv(open_filename: str):
         return out
 
 
-def export_units_npz(save_filename: str, state, window_pre: pq.Quantity = -0.5 * pq.ms, window_post: pq.Quantity = 1.0 * pq.ms):
+def export_units_npz(
+    save_filename: str,
+    state,
+    window_pre: pq.Quantity = -0.5 * pq.ms,
+    window_post: pq.Quantity = 1.0 * pq.ms,
+):
     """Export units and signals to a condensed .npz file package."""
     timestamps = state.event_signal
     units_erps = {}
     for i, sg in enumerate(state.spike_groups):
         nom = sg.event.name or f"unit_{i}"
         if state.analog_signal is not None and len(sg.event) > 0:
-            erp = create_erp_signals(state.analog_signal, sg.event, window_pre, window_post)
+            erp = create_erp_signals(
+                state.analog_signal, sg.event, window_pre, window_post
+            )
             units_erps[nom] = np.asarray(erp.magnitude)
 
     signals_dict = {}
@@ -478,13 +540,17 @@ def export_units_npz(save_filename: str, state, window_pre: pq.Quantity = -0.5 *
     np.savez(
         save_filename,
         sampling_rate=float(state.sampling_rate or 30000.0),
-        window_size_s=float(state.window_size.rescale(pq.s).magnitude if state.window_size else 0.5),
+        window_size_s=float(
+            state.window_size.rescale(pq.s).magnitude if state.window_size else 0.5
+        ),
         **units_erps,
         **signals_dict,
     )
 
 
-def save_state_to_nix(filename: str, spike_groups, data: neo.Segment = None, metadata=None):
+def save_state_to_nix(
+    filename: str, spike_groups, data: neo.Segment = None, metadata=None
+):
     """Saves a file containing the spike groups and multi-channel signals to NIX/NWB format.
     Ensures MultiAnalogSignal is converted appropriately and saves channel/neighbor_channels in annotations.
     """
@@ -510,7 +576,10 @@ def save_state_to_nix(filename: str, spike_groups, data: neo.Segment = None, met
         remaining_sigs = []
         for x in data2.analogsignals:
             if isinstance(x, MultiAnalogSignal):
-                new_seg = neo.Segment("ERP")
+                ch_name = getattr(x, "name", "CH0") or "CH0"
+                new_seg = neo.Segment(f"ERP_{ch_name}")
+                new_seg.annotations["channel"] = ch_name
+                new_seg.annotations["class_"] = "multianalogsignal"
                 new_seg.analogsignals = x.signals
                 blk.segments.append(new_seg)
             else:
