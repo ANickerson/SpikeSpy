@@ -171,3 +171,266 @@ def test_view_settings_panel_unit_and_switching(mock_state):
     panel.close()
     u_view.close()
     app.processEvents()
+
+
+def test_unit_group_selector_standalone_and_channel_group(mock_state):
+    from spikespy.ChannelGroupContainer import ChannelGroupContainerView
+    app = QApplication.instance() or QApplication([])
+
+    # Add a second unit to mock_state for testing
+    times = np.arange(5) * 0.1 * pq.s
+    evt1 = neo.Event(times + 0.02 * pq.s, name="unit_1", units=pq.s)
+    evt1.annotations["channel"] = "CH1"
+    u1 = tracked_neuron_unit(event=evt1, channel="CH1", neighbor_channels=[])
+    mock_state.spike_groups.append(u1)
+    mock_state.onUnitGroupChange.emit()
+
+    panel = ViewSettingsPanel(state=mock_state)
+    panel.show()
+    app.processEvents()
+
+    # 1. Standalone view
+    st_view = SingleTraceView(state=mock_state)
+    st_view.show()
+    app.processEvents()
+
+    panel.setActiveView(st_view)
+    app.processEvents()
+
+    assert panel.grp_unit_selector.isVisible()
+    # By default, follows active unit (item 0)
+    assert panel.combo_unit.currentIndex() == 0
+
+    # Select Unit 1 in panel
+    u1_idx = panel.combo_unit.findData(1)
+    assert u1_idx >= 0
+    panel.combo_unit.setCurrentIndex(u1_idx)
+    app.processEvents()
+
+    assert st_view.channel_bar.get_bound_unit() == 1
+
+    # 2. View within ChannelGroupContainerView
+    container = ChannelGroupContainerView(state=mock_state)
+    c_child1 = SingleTraceView(parent=container, state=mock_state)
+    c_child2 = MultiTraceView(parent=container, state=mock_state)
+    container.add_view(c_child1, title="Child1")
+    container.add_view(c_child2, title="Child2")
+    container.show()
+    app.processEvents()
+
+    # Select child1 in settings panel
+    panel.setActiveView(c_child1)
+    app.processEvents()
+
+    # Change unit via panel to Unit 0
+    u0_idx = panel.combo_unit.findData(0)
+    assert u0_idx >= 0
+    panel.combo_unit.setCurrentIndex(u0_idx)
+    app.processEvents()
+
+    # Verify that changing it within a channel group affected all groups / children
+    assert container.channel_bar.get_bound_unit() == 0
+    assert c_child1.channel_bar.get_bound_unit() == 0
+    assert c_child2.channel_bar.get_bound_unit() == 0
+
+    panel.close()
+    st_view.close()
+    container.close()
+    app.processEvents()
+
+
+def test_hide_view_top_bars_global_option(mock_state):
+    from spikespy.ChannelGroupContainer import ChannelGroupContainerView
+    from PySide6.QtWidgets import QToolBar
+    app = QApplication.instance() or QApplication([])
+
+    panel = ViewSettingsPanel(state=mock_state)
+    panel.show()
+    app.processEvents()
+
+    mt_view = MultiTraceView(state=mock_state)
+    mt_view.show()
+    container = ChannelGroupContainerView(state=mock_state)
+    st_child = SingleTraceView(parent=container, state=mock_state)
+    container.add_view(st_child, title="ST Child")
+    container.show()
+    app.processEvents()
+
+    # Initially toolbars are visible
+    mt_toolbars = mt_view.findChildren(QToolBar)
+    assert any(tb.isVisible() for tb in mt_toolbars)
+    assert container.channel_bar.isVisible()
+    assert container.control_bar.isVisible()
+
+    # Test with MdiView to ensure main application toolbar is preserved
+    from spikespy.SpikeSpy import MdiView
+    win = MdiView(state=mock_state)
+    win.show()
+    app.processEvents()
+
+    assert win.toolbar.isVisible() is True
+
+    # Enable remove top bars via panel checkbox
+    panel.chk_hide_top_bars.setChecked(True)
+    app.processEvents()
+
+    assert mock_state.hide_view_top_bars is True
+    # Application toolbar must remain visible!
+    assert win.toolbar.isVisible() is True
+    # All toolbars on standalone and container should be hidden
+    assert all(not tb.isVisible() for tb in mt_view.findChildren(QToolBar))
+    assert not container.channel_bar.isVisible()
+    assert not container.control_bar.isVisible()
+    assert all(not tb.isVisible() for tb in st_child.findChildren(QToolBar))
+
+    # Disable remove top bars
+    panel.chk_hide_top_bars.setChecked(False)
+    app.processEvents()
+
+    assert mock_state.hide_view_top_bars is False
+    assert win.toolbar.isVisible() is True
+    assert any(tb.isVisible() for tb in mt_view.findChildren(QToolBar))
+    assert container.channel_bar.isVisible()
+    assert container.control_bar.isVisible()
+    # Child's channel bar remains hidden due to channel group container deferral rule
+    assert not st_child.channel_bar.isVisible()
+
+    panel.close()
+    mt_view.close()
+    container.close()
+    win.close()
+    app.processEvents()
+
+
+def test_settings_follows_selected_window_via_titlebar_and_tabs(mock_state):
+    from PySide6.QtCore import QPoint, Qt, QEvent
+    from PySide6.QtGui import QMouseEvent
+    from spikespy.SpikeSpy import MdiView
+    app = QApplication.instance() or QApplication([])
+
+    win = MdiView(state=mock_state)
+    win.show()
+    app.processEvents()
+
+    mt = win.newWindow("MultiTrace")
+    st = win.newWindow("SingleTraceView")
+    u = win.newWindow("UnitView")
+    app.processEvents()
+
+    # Find dock widgets
+    mt_dw = [dw for dw in win.dock_manager.dockWidgets() if dw.widget() == mt][0]
+    st_dw = [dw for dw in win.dock_manager.dockWidgets() if dw.widget() == st][0]
+    u_dw = [dw for dw in win.dock_manager.dockWidgets() if dw.widget() == u][0]
+
+    press = QMouseEvent(QEvent.MouseButtonPress, QPoint(10, 10), Qt.LeftButton, Qt.LeftButton, Qt.NoModifier)
+
+    # 1. Clicking dock title bars switches active view in settings panel
+    tb_mt = mt_dw.dockAreaWidget().titleBar()
+    win.eventFilter(tb_mt, press)
+    app.processEvents()
+    assert win.settings_panel.active_view == mt
+    assert win.settings_panel.grp_multitrace.isVisible()
+
+    tb_st = st_dw.dockAreaWidget().titleBar()
+    win.eventFilter(tb_st, press)
+    app.processEvents()
+    assert win.settings_panel.active_view == st
+    assert win.settings_panel.grp_singletrace.isVisible()
+
+    tb_u = u_dw.dockAreaWidget().titleBar()
+    win.eventFilter(tb_u, press)
+    app.processEvents()
+    assert win.settings_panel.active_view == u
+    assert win.settings_panel.grp_unit.isVisible()
+
+    # 2. Tab switching updates active view
+    area = mt_dw.dockAreaWidget()
+    win.dock_manager.addDockWidgetTabToArea(st_dw, area)
+    app.processEvents()
+
+    mt_dw.setAsCurrentTab()
+    app.processEvents()
+    assert win.settings_panel.active_view == mt
+
+    st_dw.setAsCurrentTab()
+    app.processEvents()
+    assert win.settings_panel.active_view == st
+
+    win.close()
+    app.processEvents()
+
+
+def test_scale_mode_mv_and_std_scaling(mock_state):
+    from spikespy.MultiTraceFixedPGView import MultiTraceFixedPGView
+    from spikespy.MultiTracePGView import MultiTracePGView
+    app = QApplication.instance() or QApplication([])
+
+    panel = ViewSettingsPanel(state=mock_state)
+    panel.show()
+    app.processEvents()
+
+    # 1. MultiTraceFixedView (MPL)
+    fix_view = MultiTraceFixedView(state=mock_state)
+    fix_view.show()
+    panel.setActiveView(fix_view)
+    app.processEvents()
+
+    assert fix_view.get_settings().get("scale_mode") == "mV"
+    assert panel.combo_fix_scale_mode.currentText() == "mV"
+
+    # Switch to std scaling
+    panel.combo_fix_scale_mode.setCurrentText("std")
+    app.processEvents()
+    assert fix_view.get_settings().get("scale_mode") == "std"
+    assert fix_view.scale_mode_combo.currentText() == "std"
+
+    # Switch back to mV
+    panel.combo_fix_scale_mode.setCurrentText("mV")
+    app.processEvents()
+    assert fix_view.get_settings().get("scale_mode") == "mV"
+
+    # 2. MultiTraceFixedPGView (PyQtGraph)
+    fix_pg = MultiTraceFixedPGView(state=mock_state)
+    fix_pg.show()
+    panel.setActiveView(fix_pg)
+    app.processEvents()
+
+    assert fix_pg.get_settings().get("scale_mode") == "mV"
+    panel.combo_fix_scale_mode.setCurrentText("std")
+    app.processEvents()
+    assert fix_pg.get_settings().get("scale_mode") == "std"
+    assert fix_pg.scale_mode_combo.currentText() == "std"
+
+    # 3. MultiTraceView (MPL)
+    mt_view = MultiTraceView(state=mock_state)
+    mt_view.show()
+    panel.setActiveView(mt_view)
+    app.processEvents()
+
+    assert mt_view.get_settings().get("scale_mode") == "std"
+    assert panel.combo_mt_scale_mode.currentText() == "std"
+
+    panel.combo_mt_scale_mode.setCurrentText("mV")
+    app.processEvents()
+    assert mt_view.get_settings().get("scale_mode") == "mV"
+    assert mt_view.scale_mode_combo.currentText() == "mV"
+
+    # 4. MultiTracePGView (PyQtGraph)
+    mt_pg = MultiTracePGView(state=mock_state)
+    mt_pg.show()
+    panel.setActiveView(mt_pg)
+    app.processEvents()
+
+    assert mt_pg.get_settings().get("scale_mode") == "std"
+    panel.combo_mt_scale_mode.setCurrentText("mV")
+    app.processEvents()
+    assert mt_pg.get_settings().get("scale_mode") == "mV"
+    assert mt_pg.scale_mode_combo.currentText() == "mV"
+
+    panel.close()
+    fix_view.close()
+    fix_pg.close()
+    mt_view.close()
+    mt_pg.close()
+    app.processEvents()
+

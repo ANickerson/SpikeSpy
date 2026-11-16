@@ -5,6 +5,7 @@ import PySide6
 from PySide6.QtCore import QSignalBlocker, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -47,7 +48,9 @@ class ViewSettingsPanel(QWidget):
         # 1. Header with Selected Window Name
         header_frame = QFrame(self)
         header_frame.setFrameShape(QFrame.StyledPanel)
-        header_frame.setStyleSheet("background: #eef2f7; border-radius: 4px; padding: 4px;")
+        header_frame.setStyleSheet(
+            "background: #eef2f7; border-radius: 4px; padding: 4px;"
+        )
         h_layout = QVBoxLayout(header_frame)
         h_layout.setContentsMargins(4, 4, 4, 4)
 
@@ -55,11 +58,40 @@ class ViewSettingsPanel(QWidget):
         self.lbl_view_title.setWordWrap(True)
         h_layout.addWidget(self.lbl_view_title)
 
-        self.lbl_view_sub = QLabel("Click any view window to edit its settings.", header_frame)
+        self.lbl_view_sub = QLabel(
+            "Click any view window to edit its settings.", header_frame
+        )
         self.lbl_view_sub.setStyleSheet("color: #666; font-size: 11px;")
         h_layout.addWidget(self.lbl_view_sub)
 
+        self.chk_hide_top_bars = QCheckBox("Remove Top Bars from Views", header_frame)
+        self.chk_hide_top_bars.setToolTip(
+            "Globally remove top bars from views so settings are controlled exclusively from this properties pane."
+        )
+        if self.state is not None:
+            self.chk_hide_top_bars.setChecked(getattr(self.state, "hide_view_top_bars", False))
+        self.chk_hide_top_bars.toggled.connect(self._on_hide_top_bars_toggled)
+        h_layout.addWidget(self.chk_hide_top_bars)
+
         main_layout.addWidget(header_frame)
+
+        # 1b. Unit Group Selector for Selected Window
+        self.grp_unit_selector = QGroupBox("Target Unit Group", self)
+        u_layout = QHBoxLayout(self.grp_unit_selector)
+        u_layout.setContentsMargins(6, 4, 6, 4)
+        u_layout.addWidget(QLabel("Unit:"))
+        self.combo_unit = QComboBox(self.grp_unit_selector)
+        self.combo_unit.setToolTip(
+            "Select target unit group for the active window.\n"
+            "When inside a channel group, changing this affects all views in the group."
+        )
+        self.combo_unit.currentIndexChanged.connect(self._on_unit_selection_changed)
+        u_layout.addWidget(self.combo_unit, 1)
+        main_layout.addWidget(self.grp_unit_selector)
+
+        if self.state is not None:
+            self._connect_state_signals()
+            self._refresh_unit_combo()
 
         # 2. Scroll area containing dynamic settings editors
         self.scroll = QScrollArea(self)
@@ -97,6 +129,11 @@ class ViewSettingsPanel(QWidget):
         self.container_layout.addWidget(self.grp_unit)
         self.grp_unit.setVisible(False)
 
+        # Plot Navigation & Limits group
+        self.grp_navigation = self._create_navigation_group()
+        self.container_layout.addWidget(self.grp_navigation)
+        self.grp_navigation.setVisible(False)
+
         self.container_layout.addStretch()
         self.scroll.setWidget(self.container_widget)
         main_layout.addWidget(self.scroll, 1)
@@ -119,6 +156,11 @@ class ViewSettingsPanel(QWidget):
 
         # Min / Max Color scale multipliers/percentiles
         scale_form = QFormLayout()
+        self.combo_mt_scale_mode = QComboBox()
+        self.combo_mt_scale_mode.addItems(["std", "mV"])
+        self.combo_mt_scale_mode.currentTextChanged.connect(self._on_mt_scale_mode_changed)
+        scale_form.addRow("Scale Mode:", self.combo_mt_scale_mode)
+
         self.spin_mt_lower = QDoubleSpinBox()
         self.spin_mt_lower.setRange(0.0, 100.0)
         self.spin_mt_lower.setValue(0.5)
@@ -193,6 +235,18 @@ class ViewSettingsPanel(QWidget):
         grp = QGroupBox("MultiTraceFixed Configuration")
         layout = QFormLayout(grp)
 
+        self.combo_fix_scale_mode = QComboBox()
+        self.combo_fix_scale_mode.addItems(["mV", "std"])
+        self.combo_fix_scale_mode.currentTextChanged.connect(self._on_fix_scale_mode_changed)
+        layout.addRow("Scale Mode:", self.combo_fix_scale_mode)
+
+        self.combo_fix_axis_mode = QComboBox()
+        self.combo_fix_axis_mode.addItems(["Sweep", "Time"])
+        self.combo_fix_axis_mode.currentIndexChanged.connect(
+            self._on_fix_axis_mode_changed
+        )
+        layout.addRow("Y-Axis Mode:", self.combo_fix_axis_mode)
+
         self.spin_fix_scale = QDoubleSpinBox()
         self.spin_fix_scale.setRange(0.001, 100.0)
         self.spin_fix_scale.setValue(1.0)
@@ -211,6 +265,14 @@ class ViewSettingsPanel(QWidget):
         self.spin_fix_post.setValue(5)
         self.spin_fix_post.valueChanged.connect(self._on_fix_sweeps_changed)
         layout.addRow("Post-Sweeps:", self.spin_fix_post)
+
+        self.spin_fix_time_window = QDoubleSpinBox()
+        self.spin_fix_time_window.setRange(0.1, 3600.0)
+        self.spin_fix_time_window.setValue(10.0)
+        self.spin_fix_time_window.setSingleStep(1.0)
+        self.spin_fix_time_window.setSuffix(" s")
+        self.spin_fix_time_window.valueChanged.connect(self._on_fix_time_window_changed)
+        layout.addRow("Time Window:", self.spin_fix_time_window)
 
         return grp
 
@@ -236,6 +298,110 @@ class ViewSettingsPanel(QWidget):
         self.spin_unit_last_n.valueChanged.connect(self._on_unit_last_n_changed)
         form.addRow("Last N Events:", self.spin_unit_last_n)
         layout.addLayout(form)
+
+        return grp
+
+    def _create_navigation_group(self) -> QGroupBox:
+        grp = QGroupBox("Plot Navigation & Limits")
+        layout = QVBoxLayout(grp)
+
+        # Mode row: Normal, Pan, Zoom, Reset
+        mode_box = QHBoxLayout()
+        mode_box.addWidget(QLabel("Mode:"))
+
+        self.btn_nav_normal = QPushButton("Normal")
+        self.btn_nav_normal.setCheckable(True)
+        self.btn_nav_normal.setChecked(True)
+        self.btn_nav_normal.setToolTip("Normal selection / annotation mode")
+
+        self.btn_nav_pan = QPushButton("Pan")
+        self.btn_nav_pan.setCheckable(True)
+        self.btn_nav_pan.setToolTip(
+            "Pan with left-drag, zoom with right-drag / scroll wheel"
+        )
+
+        self.btn_nav_zoom = QPushButton("Zoom")
+        self.btn_nav_zoom.setCheckable(True)
+        self.btn_nav_zoom.setToolTip("Zoom to rectangle (drag with left mouse)")
+
+        self.btn_nav_reset = QPushButton("Reset")
+        self.btn_nav_reset.setToolTip("Reset view range to default limits")
+
+        self.nav_button_group = QButtonGroup(self)
+        self.nav_button_group.addButton(self.btn_nav_normal)
+        self.nav_button_group.addButton(self.btn_nav_pan)
+        self.nav_button_group.addButton(self.btn_nav_zoom)
+        self.nav_button_group.setExclusive(True)
+
+        mode_box.addWidget(self.btn_nav_normal)
+        mode_box.addWidget(self.btn_nav_pan)
+        mode_box.addWidget(self.btn_nav_zoom)
+        mode_box.addWidget(self.btn_nav_reset)
+        layout.addLayout(mode_box)
+
+        self.btn_nav_normal.clicked.connect(lambda: self._on_nav_mode_btn_clicked(""))
+        self.btn_nav_pan.clicked.connect(lambda: self._on_nav_mode_btn_clicked("pan"))
+        self.btn_nav_zoom.clicked.connect(lambda: self._on_nav_mode_btn_clicked("zoom"))
+        self.btn_nav_reset.clicked.connect(self._on_nav_reset_clicked)
+
+        # Manual Limits Form
+        form = QFormLayout()
+
+        # X Range
+        x_layout = QHBoxLayout()
+        self.spin_xlim_min = QDoubleSpinBox()
+        self.spin_xlim_min.setRange(-1e9, 1e9)
+        self.spin_xlim_min.setDecimals(4)
+        self.spin_xlim_min.setSingleStep(1.0)
+        self.spin_xlim_min.setKeyboardTracking(False)
+
+        self.spin_xlim_max = QDoubleSpinBox()
+        self.spin_xlim_max.setRange(-1e9, 1e9)
+        self.spin_xlim_max.setDecimals(4)
+        self.spin_xlim_max.setSingleStep(1.0)
+        self.spin_xlim_max.setKeyboardTracking(False)
+
+        x_layout.addWidget(self.spin_xlim_min)
+        x_layout.addWidget(QLabel("to"))
+        x_layout.addWidget(self.spin_xlim_max)
+        form.addRow("X Limits:", x_layout)
+
+        # Y Range
+        y_layout = QHBoxLayout()
+        self.spin_ylim_min = QDoubleSpinBox()
+        self.spin_ylim_min.setRange(-1e9, 1e9)
+        self.spin_ylim_min.setDecimals(4)
+        self.spin_ylim_min.setSingleStep(1.0)
+        self.spin_ylim_min.setKeyboardTracking(False)
+
+        self.spin_ylim_max = QDoubleSpinBox()
+        self.spin_ylim_max.setRange(-1e9, 1e9)
+        self.spin_ylim_max.setDecimals(4)
+        self.spin_ylim_max.setSingleStep(1.0)
+        self.spin_ylim_max.setKeyboardTracking(False)
+
+        y_layout.addWidget(self.spin_ylim_min)
+        y_layout.addWidget(QLabel("to"))
+        y_layout.addWidget(self.spin_ylim_max)
+        form.addRow("Y Limits:", y_layout)
+
+        layout.addLayout(form)
+
+        # Action Buttons
+        btn_action_layout = QHBoxLayout()
+        self.btn_apply_limits = QPushButton("Apply Limits")
+        self.btn_apply_limits.clicked.connect(self._on_apply_limits_clicked)
+        btn_action_layout.addWidget(self.btn_apply_limits)
+
+        self.btn_auto_limits = QPushButton("Auto Range")
+        self.btn_auto_limits.clicked.connect(self._on_auto_limits_clicked)
+        btn_action_layout.addWidget(self.btn_auto_limits)
+        layout.addLayout(btn_action_layout)
+
+        self.spin_xlim_min.editingFinished.connect(self._on_apply_limits_clicked)
+        self.spin_xlim_max.editingFinished.connect(self._on_apply_limits_clicked)
+        self.spin_ylim_min.editingFinished.connect(self._on_apply_limits_clicked)
+        self.spin_ylim_max.editingFinished.connect(self._on_apply_limits_clicked)
 
         return grp
 
@@ -269,15 +435,158 @@ class ViewSettingsPanel(QWidget):
             )
         ):
             return True
-        return hasattr(w, "populate_settings_panel") and callable(getattr(w, "populate_settings_panel"))
+        return hasattr(w, "populate_settings_panel") and callable(
+            getattr(w, "populate_settings_panel")
+        )
 
     def _disconnect_current_view(self):
         """Cleanly disconnect any signals from the previously active view."""
+        self._disconnect_navigation_signals()
         self.active_view = None
 
     def _on_focus_changed(self, old: Optional[QWidget], new: Optional[QWidget]):
         if new is not None:
             self.setActiveView(new)
+
+    def set_state(self, state):
+        self.state = state
+        if self.state is not None:
+            self._connect_state_signals()
+            self._refresh_unit_combo()
+            if hasattr(self, "chk_hide_top_bars"):
+                self.chk_hide_top_bars.setChecked(getattr(self.state, "hide_view_top_bars", False))
+
+    def setState(self, state):
+        self.set_state(state)
+
+    def _connect_state_signals(self):
+        if self.state is None:
+            return
+        if not hasattr(self, "_state_connections"):
+            self._state_connections = []
+        for sig, slot in self._state_connections:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._state_connections.clear()
+
+        if hasattr(self.state, "onUnitGroupChange"):
+            self._state_connections.append((self.state.onUnitGroupChange, self._on_state_unit_changed))
+            self.state.onUnitGroupChange.connect(self._on_state_unit_changed)
+        if hasattr(self.state, "onActiveUnitChanged"):
+            self._state_connections.append((self.state.onActiveUnitChanged, self._on_state_unit_changed))
+            self.state.onActiveUnitChanged.connect(self._on_state_unit_changed)
+        if hasattr(self.state, "onUnitListChanged"):
+            self._state_connections.append((self.state.onUnitListChanged, self._refresh_unit_combo))
+            self.state.onUnitListChanged.connect(self._refresh_unit_combo)
+        if hasattr(self.state, "onLoadNewFile"):
+            self._state_connections.append((self.state.onLoadNewFile, self._refresh_unit_combo))
+            self.state.onLoadNewFile.connect(self._refresh_unit_combo)
+        if hasattr(self.state, "onHideViewTopBarsChanged"):
+            self._state_connections.append((self.state.onHideViewTopBarsChanged, self._on_hide_top_bars_state_changed))
+            self.state.onHideViewTopBarsChanged.connect(self._on_hide_top_bars_state_changed)
+
+    def _find_parent_container(self, view: Optional[QWidget]) -> Optional[Any]:
+        if view is None:
+            return None
+        if view.__class__.__name__ == "ChannelGroupContainerView":
+            return view
+        curr = view.parentWidget() if hasattr(view, "parentWidget") else None
+        while curr is not None:
+            if curr.__class__.__name__ == "ChannelGroupContainerView":
+                return curr
+            curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
+        win = self.window()
+        if win is not None:
+            for cgc in win.findChildren(QWidget):
+                if cgc.__class__.__name__ == "ChannelGroupContainerView":
+                    if hasattr(cgc, "sub_views") and view in cgc.sub_views:
+                        return cgc
+        return None
+
+    def _refresh_unit_combo(self):
+        curr_data = self.combo_unit.currentData()
+        with QSignalBlocker(self.combo_unit):
+            self.combo_unit.clear()
+            self.combo_unit.addItem("(Follow Active Unit)", userData=None)
+            if self.state and hasattr(self.state, "spike_groups") and self.state.spike_groups:
+                for i, sg in enumerate(self.state.spike_groups):
+                    u_name = getattr(sg.event, "name", f"unit_{i}") or f"unit_{i}"
+                    ch = getattr(sg, "channel", "")
+                    ch_info = f" [{ch}]" if ch else ""
+                    self.combo_unit.addItem(f"Unit {i}: {u_name}{ch_info}", userData=i)
+            restored = False
+            if curr_data is not None:
+                for idx in range(self.combo_unit.count()):
+                    if self.combo_unit.itemData(idx) == curr_data:
+                        self.combo_unit.setCurrentIndex(idx)
+                        restored = True
+                        break
+            if not restored:
+                self.combo_unit.setCurrentIndex(0)
+
+    def _on_state_unit_changed(self, *args):
+        self._refresh_unit_combo()
+        if self.active_view is not None:
+            container = self._find_parent_container(self.active_view)
+            bound = None
+            if container is not None and hasattr(container, "channel_bar") and container.channel_bar is not None:
+                bound = container.channel_bar.get_bound_unit()
+            elif hasattr(self.active_view, "channel_bar") and self.active_view.channel_bar is not None:
+                bound = self.active_view.channel_bar.get_bound_unit()
+            with QSignalBlocker(self.combo_unit):
+                target_idx = 0
+                for idx in range(self.combo_unit.count()):
+                    if self.combo_unit.itemData(idx) == bound:
+                        target_idx = idx
+                        break
+                self.combo_unit.setCurrentIndex(target_idx)
+
+    def _on_unit_selection_changed(self, idx: int):
+        if self._block_updates or self.active_view is None:
+            return
+        selected_unit = self.combo_unit.itemData(idx)
+        container = self._find_parent_container(self.active_view)
+        if container is not None:
+            # When within a channel group, changing unit affects all groups
+            if hasattr(container, "channel_bar") and container.channel_bar is not None:
+                container.channel_bar.bind_to_unit(selected_unit)
+            if hasattr(container, "_sync_all_children"):
+                container._sync_all_children()
+
+            win = self.window()
+            if win is not None:
+                for cgc in win.findChildren(QWidget):
+                    if cgc is not container and cgc.__class__.__name__ == "ChannelGroupContainerView":
+                        if hasattr(cgc, "channel_bar") and cgc.channel_bar is not None:
+                            cgc.channel_bar.bind_to_unit(selected_unit)
+                        if hasattr(cgc, "_sync_all_children"):
+                            cgc._sync_all_children()
+
+            if hasattr(self.active_view, "channel_bar") and self.active_view.channel_bar is not None:
+                self.active_view.channel_bar.bind_to_unit(selected_unit)
+        else:
+            if hasattr(self.active_view, "channel_bar") and self.active_view.channel_bar is not None:
+                self.active_view.channel_bar.bind_to_unit(selected_unit)
+            elif hasattr(self.active_view, "bind_to_unit"):
+                self.active_view.bind_to_unit(selected_unit)
+        self.settingsChanged.emit()
+
+    def _on_hide_top_bars_toggled(self, checked: bool):
+        if self.state is not None:
+            self.state.set_hide_view_top_bars(checked)
+
+    def _on_hide_top_bars_state_changed(self, hide: bool):
+        if self.chk_hide_top_bars.isChecked() != hide:
+            with QSignalBlocker(self.chk_hide_top_bars):
+                self.chk_hide_top_bars.setChecked(hide)
+        from .helpers import apply_top_bars_visibility
+        app = QApplication.instance()
+        if app is not None:
+            for top_w in app.topLevelWidgets():
+                if top_w is not self:
+                    apply_top_bars_visibility(top_w, hide)
 
     def closeEvent(self, event):
         if getattr(self, "_focus_connected", False):
@@ -288,6 +597,13 @@ class ViewSettingsPanel(QWidget):
                 except (TypeError, RuntimeError):
                     pass
             self._focus_connected = False
+        if hasattr(self, "_state_connections"):
+            for sig, slot in self._state_connections:
+                try:
+                    sig.disconnect(slot)
+                except (TypeError, RuntimeError):
+                    pass
+            self._state_connections.clear()
         self._disconnect_current_view()
         super().closeEvent(event)
 
@@ -298,35 +614,91 @@ class ViewSettingsPanel(QWidget):
         curr = w
         while curr is not None:
             if curr is self:
-                return self.active_view  # User is interacting with ViewSettingsPanel; do not switch view!
+                return (
+                    self.active_view
+                )  # User is interacting with ViewSettingsPanel; do not switch view!
             curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
 
-        # Now search up for a view widget
+        # Now search up for a view widget or dock area
         curr = w
         found_view = None
         while curr is not None:
             c_name = curr.__class__.__name__
-            if any(k in c_name for k in ("MultiTrace", "SingleTrace", "UnitView", "UnitFootprint", "UnitPG", "ChannelGroupContainer")) or hasattr(curr, "populate_settings_panel"):
+            if any(
+                k in c_name
+                for k in (
+                    "MultiTrace",
+                    "SingleTrace",
+                    "UnitView",
+                    "UnitFootprint",
+                    "UnitPG",
+                    "ChannelGroupContainer",
+                )
+            ) or hasattr(curr, "populate_settings_panel"):
                 found_view = curr
                 break
-            # Check CDockWidget or CDockWidgetTab unwrapping
-            if c_name == "CDockWidget" and hasattr(curr, "widget") and callable(getattr(curr, "widget")):
+
+            # Check CDockWidget unwrapping
+            if (
+                c_name == "CDockWidget"
+                and hasattr(curr, "widget")
+                and callable(getattr(curr, "widget"))
+            ):
                 try:
                     inner = curr.widget()
-                    if inner is not None and (self._is_configurable_view(inner) or inner.__class__.__name__ == "ChannelGroupContainerView"):
+                    if inner is self:
+                        return self.active_view
+                    if inner is not None:
                         found_view = inner
                         break
                 except TypeError:
                     pass
-            elif c_name == "CDockWidgetTab" and hasattr(curr, "dockWidget") and callable(getattr(curr, "dockWidget")):
+
+            # Check CDockWidgetTab unwrapping
+            elif (
+                c_name == "CDockWidgetTab"
+                and hasattr(curr, "dockWidget")
+                and callable(getattr(curr, "dockWidget"))
+            ):
                 try:
                     dw = curr.dockWidget()
                     inner = dw.widget() if dw is not None else None
-                    if inner is not None and (self._is_configurable_view(inner) or inner.__class__.__name__ == "ChannelGroupContainerView"):
+                    if inner is self:
+                        return self.active_view
+                    if inner is not None:
                         found_view = inner
                         break
                 except TypeError:
                     pass
+
+            # Check CDockAreaWidget or title bar / tab bar having dockAreaWidget()
+            if hasattr(curr, "dockAreaWidget") and callable(getattr(curr, "dockAreaWidget")):
+                try:
+                    area = curr.dockAreaWidget()
+                    if area and hasattr(area, "currentDockWidget") and callable(getattr(area, "currentDockWidget")):
+                        dw = area.currentDockWidget()
+                        inner = dw.widget() if dw and hasattr(dw, "widget") else None
+                        if inner is self:
+                            return self.active_view
+                        if inner is not None:
+                            found_view = inner
+                            break
+                except TypeError:
+                    pass
+
+            # Check if curr itself is a CDockAreaWidget
+            if hasattr(curr, "currentDockWidget") and callable(getattr(curr, "currentDockWidget")):
+                try:
+                    dw = curr.currentDockWidget()
+                    inner = dw.widget() if dw and hasattr(dw, "widget") else None
+                    if inner is self:
+                        return self.active_view
+                    if inner is not None:
+                        found_view = inner
+                        break
+                except TypeError:
+                    pass
+
             curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
 
         if found_view is not None:
@@ -337,8 +709,31 @@ class ViewSettingsPanel(QWidget):
                     while temp is not None and temp is not found_view:
                         if temp is sv:
                             return sv
-                        temp = temp.parentWidget() if hasattr(temp, "parentWidget") else None
+                        temp = (
+                            temp.parentWidget()
+                            if hasattr(temp, "parentWidget")
+                            else None
+                        )
+                # Check if w was in an area of container's dock_manager
+                if hasattr(found_view, "dock_manager") and found_view.dock_manager is not None:
+                    curr_d = w
+                    while curr_d is not None and curr_d is not found_view:
+                        if hasattr(curr_d, "dockAreaWidget") and callable(getattr(curr_d, "dockAreaWidget")):
+                            area = curr_d.dockAreaWidget()
+                            if area and hasattr(area, "currentDockWidget") and area.currentDockWidget():
+                                candidate = area.currentDockWidget().widget()
+                                if candidate in found_view.sub_views:
+                                    return candidate
+                        if hasattr(curr_d, "currentDockWidget") and callable(getattr(curr_d, "currentDockWidget")):
+                            candidate = curr_d.currentDockWidget().widget()
+                            if candidate in found_view.sub_views:
+                                return candidate
+                        curr_d = curr_d.parentWidget() if hasattr(curr_d, "parentWidget") else None
+                    focused = found_view.dock_manager.focusedDockWidget()
+                    if focused and hasattr(focused, "widget") and focused.widget() in found_view.sub_views:
+                        return focused.widget()
                 return found_view.sub_views[0]
+
             if self._is_configurable_view(found_view):
                 return found_view
             return None
@@ -352,11 +747,16 @@ class ViewSettingsPanel(QWidget):
             self._disconnect_current_view()
             self.lbl_view_title.setText("<b>No View Selected</b>")
             self.lbl_view_sub.setText("Click any view window to edit its settings.")
+            self.grp_unit_selector.setVisible(False)
             self.grp_multitrace.setVisible(False)
             self.grp_singletrace.setVisible(False)
             self.grp_fixed.setVisible(False)
             self.grp_unit.setVisible(False)
-            if hasattr(self, "_custom_plugin_grp") and self._custom_plugin_grp is not None:
+            self.grp_navigation.setVisible(False)
+            if (
+                hasattr(self, "_custom_plugin_grp")
+                and self._custom_plugin_grp is not None
+            ):
                 self._custom_plugin_grp.setVisible(False)
                 self._custom_plugin_grp.deleteLater()
                 self._custom_plugin_grp = None
@@ -371,7 +771,11 @@ class ViewSettingsPanel(QWidget):
             # Look through parent's dock_manager if available
             parent_widget = self.parent()
             found_fallback = None
-            if parent_widget is not None and hasattr(parent_widget, "dock_manager") and parent_widget.dock_manager is not None:
+            if (
+                parent_widget is not None
+                and hasattr(parent_widget, "dock_manager")
+                and parent_widget.dock_manager is not None
+            ):
                 for dw in parent_widget.dock_manager.dockWidgets():
                     if hasattr(dw, "widget") and callable(getattr(dw, "widget")):
                         candidate = self._resolve_view(dw.widget())
@@ -389,63 +793,109 @@ class ViewSettingsPanel(QWidget):
         self.active_view = resolved
         view = resolved
         self._block_updates = True
+        try:
+            # Hide all groups first
+            self.placeholder.setVisible(False)
+            self.grp_multitrace.setVisible(False)
+            self.grp_singletrace.setVisible(False)
+            self.grp_fixed.setVisible(False)
+            self.grp_unit.setVisible(False)
+            self.grp_navigation.setVisible(False)
+            self._disconnect_navigation_signals()
+            if hasattr(self, "_custom_plugin_grp") and self._custom_plugin_grp is not None:
+                self._custom_plugin_grp.setVisible(False)
+                self._custom_plugin_grp.deleteLater()
+                self._custom_plugin_grp = None
 
-        # Hide all groups first
-        self.placeholder.setVisible(False)
-        self.grp_multitrace.setVisible(False)
-        self.grp_singletrace.setVisible(False)
-        self.grp_fixed.setVisible(False)
-        self.grp_unit.setVisible(False)
-        if hasattr(self, "_custom_plugin_grp") and self._custom_plugin_grp is not None:
-            self._custom_plugin_grp.setVisible(False)
-            self._custom_plugin_grp.deleteLater()
-            self._custom_plugin_grp = None
+            if view is None:
+                self.lbl_view_title.setText("<b>No View Selected</b>")
+                self.lbl_view_sub.setText("Click any view window to edit its settings.")
+                self.grp_unit_selector.setVisible(False)
+                self.placeholder.setVisible(True)
+                return
 
-        if view is None:
-            self.lbl_view_title.setText("<b>No View Selected</b>")
-            self.lbl_view_sub.setText("Click any view window to edit its settings.")
-            self.placeholder.setVisible(True)
+            self.grp_unit_selector.setVisible(True)
+            bound_unit = None
+            container = self._find_parent_container(view)
+            if container is not None and hasattr(container, "channel_bar") and container.channel_bar is not None:
+                bound_unit = container.channel_bar.get_bound_unit()
+            elif hasattr(view, "channel_bar") and view.channel_bar is not None:
+                bound_unit = view.channel_bar.get_bound_unit()
+            elif hasattr(view, "get_target_unit_idx") and callable(getattr(view, "get_target_unit_idx")):
+                if hasattr(view, "channel_bar") and hasattr(view.channel_bar, "is_unit_locked") and view.channel_bar.is_unit_locked():
+                    bound_unit = view.get_target_unit_idx()
+
+            with QSignalBlocker(self.combo_unit):
+                target_idx = 0
+                for idx in range(self.combo_unit.count()):
+                    if self.combo_unit.itemData(idx) == bound_unit:
+                        target_idx = idx
+                        break
+                self.combo_unit.setCurrentIndex(target_idx)
+
+            c_name = view.__class__.__name__
+            self.lbl_view_title.setText(f"<b>{c_name}</b>")
+            self.lbl_view_sub.setText("Settings follow this active view.")
+
+            # Detect MultiTrace (Matplotlib or PG)
+            if "MultiTraceView" in c_name or "MultiTracePGView" in c_name:
+                self.grp_multitrace.setVisible(True)
+                self._populate_multitrace(view)
+
+            # Detect SingleTrace (Matplotlib or PG)
+            elif "SingleTraceView" in c_name or "SingleTracePGView" in c_name:
+                self.grp_singletrace.setVisible(True)
+                self._populate_singletrace(view)
+
+            # Detect MultiTraceFixed (Matplotlib or PG)
+            elif "MultiTraceFixed" in c_name:
+                self.grp_fixed.setVisible(True)
+                self._populate_fixed(view)
+
+            # Detect UnitView / UnitFootprint (Matplotlib or PG)
+            elif "UnitView" in c_name or "UnitFootprint" in c_name or "UnitPG" in c_name:
+                self.grp_unit.setVisible(True)
+                self._populate_unit(view)
+
+            elif hasattr(view, "populate_settings_panel") and callable(
+                getattr(view, "populate_settings_panel")
+            ):
+                self._custom_plugin_grp = QGroupBox(f"{c_name} Configuration")
+                custom_form = QFormLayout(self._custom_plugin_grp)
+                view.populate_settings_panel(self, custom_form)
+                self.container_layout.insertWidget(
+                    self.container_layout.count() - 1, self._custom_plugin_grp
+                )
+                self._custom_plugin_grp.setVisible(True)
+
+            else:
+                self.placeholder.setText(
+                    f"{c_name} has no view-specific visual parameters."
+                )
+                self.placeholder.setVisible(True)
+
+            # Show Navigation & Limits group if supported
+            if (
+                hasattr(view, "get_view_range")
+                and callable(getattr(view, "get_view_range"))
+            ) or hasattr(view, "ax"):
+                self.grp_navigation.setVisible(True)
+                self._populate_navigation(view)
+        finally:
             self._block_updates = False
-            return
-
-        c_name = view.__class__.__name__
-        self.lbl_view_title.setText(f"<b>{c_name}</b>")
-        self.lbl_view_sub.setText("Settings follow this active view.")
-
-        # Detect MultiTrace (Matplotlib or PG)
-        if "MultiTraceView" in c_name or "MultiTracePGView" in c_name:
-            self.grp_multitrace.setVisible(True)
-            self._populate_multitrace(view)
-
-        # Detect SingleTrace (Matplotlib or PG)
-        elif "SingleTraceView" in c_name or "SingleTracePGView" in c_name:
-            self.grp_singletrace.setVisible(True)
-            self._populate_singletrace(view)
-
-        # Detect MultiTraceFixed (Matplotlib or PG)
-        elif "MultiTraceFixed" in c_name:
-            self.grp_fixed.setVisible(True)
-            self._populate_fixed(view)
-
-        # Detect UnitView / UnitFootprint (Matplotlib or PG)
-        elif "UnitView" in c_name or "UnitFootprint" in c_name or "UnitPG" in c_name:
-            self.grp_unit.setVisible(True)
-            self._populate_unit(view)
-
-        elif hasattr(view, "populate_settings_panel") and callable(getattr(view, "populate_settings_panel")):
-            self._custom_plugin_grp = QGroupBox(f"{c_name} Configuration")
-            custom_form = QFormLayout(self._custom_plugin_grp)
-            view.populate_settings_panel(self, custom_form)
-            self.container_layout.insertWidget(self.container_layout.count() - 1, self._custom_plugin_grp)
-            self._custom_plugin_grp.setVisible(True)
-
-        else:
-            self.placeholder.setText(f"{c_name} has no view-specific visual parameters.")
-            self.placeholder.setVisible(True)
-
-        self._block_updates = False
 
     def _populate_multitrace(self, view):
+        # Scale mode
+        cur_scale_mode = getattr(view, "scale_mode", "std")
+        if hasattr(view, "get_settings") and callable(getattr(view, "get_settings")):
+            try:
+                cur_scale_mode = view.get_settings().get("scale_mode", cur_scale_mode)
+            except Exception:
+                pass
+        idx = self.combo_mt_scale_mode.findText(cur_scale_mode)
+        if idx >= 0:
+            self.combo_mt_scale_mode.setCurrentIndex(idx)
+
         # Mode
         mode = getattr(view, "mode", "heatmap")
         if mode == "lines":
@@ -457,8 +907,12 @@ class ViewSettingsPanel(QWidget):
 
         # Percentiles / Scale
         if hasattr(view, "lowerSpinBox") and hasattr(view, "upperSpinBox"):
-            self.spin_mt_lower.setRange(view.lowerSpinBox.minimum(), view.lowerSpinBox.maximum())
-            self.spin_mt_upper.setRange(view.upperSpinBox.minimum(), view.upperSpinBox.maximum())
+            self.spin_mt_lower.setRange(
+                view.lowerSpinBox.minimum(), view.lowerSpinBox.maximum()
+            )
+            self.spin_mt_upper.setRange(
+                view.upperSpinBox.minimum(), view.upperSpinBox.maximum()
+            )
             self.spin_mt_lower.setValue(float(view.lowerSpinBox.value()))
             self.spin_mt_upper.setValue(float(view.upperSpinBox.value()))
 
@@ -494,6 +948,29 @@ class ViewSettingsPanel(QWidget):
             self.spin_st_maxima.setValue(int(view.select_local_maxima_width))
 
     def _populate_fixed(self, view):
+        # Scale mode
+        cur_scale_mode = "mV"
+        if hasattr(view, "get_settings") and callable(getattr(view, "get_settings")):
+            try:
+                cur_scale_mode = view.get_settings().get("scale_mode", cur_scale_mode)
+            except Exception:
+                pass
+        elif hasattr(view, "settings") and isinstance(view.settings, dict):
+            cur_scale_mode = view.settings.get("scale_mode", cur_scale_mode)
+        if hasattr(self, "combo_fix_scale_mode"):
+            idx = self.combo_fix_scale_mode.findText(cur_scale_mode)
+            if idx >= 0:
+                self.combo_fix_scale_mode.setCurrentIndex(idx)
+
+        if hasattr(self, "combo_fix_axis_mode"):
+            if hasattr(view, "y_axis_combo"):
+                self.combo_fix_axis_mode.setCurrentIndex(
+                    view.y_axis_combo.currentIndex()
+                )
+            elif hasattr(view, "settings") and "y_axis_mode" in view.settings:
+                idx = 1 if view.settings.get("y_axis_mode") == "time" else 0
+                self.combo_fix_axis_mode.setCurrentIndex(idx)
+
         if hasattr(view, "scale_spinner"):
             self.spin_fix_scale.setValue(float(view.scale_spinner.value()))
         elif hasattr(view, "scale"):
@@ -508,6 +985,16 @@ class ViewSettingsPanel(QWidget):
             self.spin_fix_post.setValue(int(view.post_spinner.value()))
         elif hasattr(view, "post_sweeps"):
             self.spin_fix_post.setValue(int(view.post_sweeps))
+
+        if hasattr(self, "spin_fix_time_window"):
+            if hasattr(view, "time_window_spinner"):
+                self.spin_fix_time_window.setValue(
+                    float(view.time_window_spinner.value())
+                )
+            elif hasattr(view, "settings") and "time_window_s" in view.settings:
+                self.spin_fix_time_window.setValue(
+                    float(view.settings.get("time_window_s", 10.0))
+                )
 
     def _populate_unit(self, view):
         if hasattr(view, "chk_show_neighbors"):
@@ -524,6 +1011,29 @@ class ViewSettingsPanel(QWidget):
     # ---------------------------------------------------------
     # Event Handlers to update active view
     # ---------------------------------------------------------
+    def _on_mt_scale_mode_changed(self, text: str):
+        if self._block_updates or not self.active_view:
+            return
+        if hasattr(self.active_view, "scale_mode_combo"):
+            self.active_view.scale_mode_combo.setCurrentText(text)
+        elif hasattr(self.active_view, "_on_scale_mode_changed"):
+            self.active_view.scale_mode = text
+            self.active_view._on_scale_mode_changed(text)
+        elif hasattr(self.active_view, "set_settings"):
+            self.active_view.set_settings({"scale_mode": text})
+        self.settingsChanged.emit()
+
+    def _on_fix_scale_mode_changed(self, text: str):
+        if self._block_updates or not self.active_view:
+            return
+        if hasattr(self.active_view, "scale_mode_combo"):
+            self.active_view.scale_mode_combo.setCurrentText(text)
+        elif hasattr(self.active_view, "set_scale_setting"):
+            self.active_view.set_scale_setting(text)
+        elif hasattr(self.active_view, "set_settings"):
+            self.active_view.set_settings({"scale_mode": text})
+        self.settingsChanged.emit()
+
     def _on_mt_mode_changed(self, idx: int):
         if self._block_updates or not self.active_view:
             return
@@ -604,7 +1114,10 @@ class ViewSettingsPanel(QWidget):
     def _on_st_multi_toggled(self, checked: bool):
         if self._block_updates or not self.active_view:
             return
-        if hasattr(self.active_view, "channel_bar") and self.active_view.channel_bar is not None:
+        if (
+            hasattr(self.active_view, "channel_bar")
+            and self.active_view.channel_bar is not None
+        ):
             self.active_view.channel_bar.chk_multichannel.setChecked(checked)
         elif hasattr(self.active_view, "chk_multichannel"):
             self.active_view.chk_multichannel.setChecked(checked)
@@ -673,6 +1186,25 @@ class ViewSettingsPanel(QWidget):
             self.active_view.plot()
         self.settingsChanged.emit()
 
+    def _on_fix_axis_mode_changed(self, idx: int):
+        if self._block_updates or not self.active_view:
+            return
+        mode = "time" if idx == 1 else "sweep"
+        if hasattr(self.active_view, "set_settings"):
+            self.active_view.set_settings({"y_axis_mode": mode})
+        elif hasattr(self.active_view, "y_axis_combo"):
+            self.active_view.y_axis_combo.setCurrentIndex(idx)
+        self.settingsChanged.emit()
+
+    def _on_fix_time_window_changed(self, val: float):
+        if self._block_updates or not self.active_view:
+            return
+        if hasattr(self.active_view, "set_settings"):
+            self.active_view.set_settings({"time_window_s": val})
+        elif hasattr(self.active_view, "time_window_spinner"):
+            self.active_view.time_window_spinner.setValue(val)
+        self.settingsChanged.emit()
+
     def _on_unit_neighbors_toggled(self, checked: bool):
         if self._block_updates or not self.active_view:
             return
@@ -696,4 +1228,224 @@ class ViewSettingsPanel(QWidget):
             return
         if hasattr(self.active_view, "spin_last_n"):
             self.active_view.spin_last_n.setValue(val)
+        self.settingsChanged.emit()
+
+    # ---------------------------------------------------------
+    # Navigation & Limits Handlers
+    # ---------------------------------------------------------
+    def _populate_navigation(self, view):
+        self._block_updates = True
+        try:
+            # Mode
+            mode = ""
+            if hasattr(view, "get_nav_mode") and callable(
+                getattr(view, "get_nav_mode")
+            ):
+                mode = view.get_nav_mode()
+            elif (
+                hasattr(view, "matplotlib_toolbar")
+                and view.matplotlib_toolbar is not None
+            ):
+                tb_mode = getattr(view.matplotlib_toolbar, "mode", "")
+                if "pan" in tb_mode.lower():
+                    mode = "pan"
+                elif "zoom" in tb_mode.lower():
+                    mode = "zoom"
+
+            if mode == "pan":
+                self.btn_nav_pan.setChecked(True)
+            elif mode == "zoom":
+                self.btn_nav_zoom.setChecked(True)
+            else:
+                self.btn_nav_normal.setChecked(True)
+
+            # Range
+            if hasattr(view, "get_view_range") and callable(
+                getattr(view, "get_view_range")
+            ):
+                (xmin, xmax), (ymin, ymax) = view.get_view_range()
+                self.spin_xlim_min.setValue(xmin)
+                self.spin_xlim_max.setValue(xmax)
+                self.spin_ylim_min.setValue(ymin)
+                self.spin_ylim_max.setValue(ymax)
+
+                plot = (
+                    view.get_primary_nav_plot()
+                    if hasattr(view, "get_primary_nav_plot")
+                    else None
+                )
+                if plot is not None and hasattr(plot, "vb") and plot.vb is not None:
+                    self._connected_vb = plot.vb
+                    plot.vb.sigRangeChanged.connect(self._on_plot_range_changed)
+
+                if hasattr(view, "register_nav_mode_callback"):
+                    self._connected_nav_view = view
+                    view.register_nav_mode_callback(self._on_view_nav_mode_changed)
+
+            elif hasattr(view, "ax"):
+                xlim = view.ax.get_xlim()
+                ylim = view.ax.get_ylim()
+                self.spin_xlim_min.setValue(float(min(xlim)))
+                self.spin_xlim_max.setValue(float(max(xlim)))
+                self.spin_ylim_min.setValue(float(min(ylim)))
+                self.spin_ylim_max.setValue(float(max(ylim)))
+        finally:
+            self._block_updates = False
+
+    def _disconnect_navigation_signals(self):
+        if hasattr(self, "_connected_vb") and self._connected_vb is not None:
+            try:
+                self._connected_vb.sigRangeChanged.disconnect(
+                    self._on_plot_range_changed
+                )
+            except Exception:
+                pass
+            self._connected_vb = None
+
+        if (
+            hasattr(self, "_connected_nav_view")
+            and self._connected_nav_view is not None
+        ):
+            try:
+                self._connected_nav_view.unregister_nav_mode_callback(
+                    self._on_view_nav_mode_changed
+                )
+            except Exception:
+                pass
+            self._connected_nav_view = None
+
+    def _on_plot_range_changed(self, *args):
+        if self._block_updates or not self._is_view_alive(self.active_view):
+            return
+        if (
+            self.spin_xlim_min.hasFocus()
+            or self.spin_xlim_max.hasFocus()
+            or self.spin_ylim_min.hasFocus()
+            or self.spin_ylim_max.hasFocus()
+        ):
+            return
+        if hasattr(self.active_view, "get_view_range") and callable(
+            getattr(self.active_view, "get_view_range")
+        ):
+            (xmin, xmax), (ymin, ymax) = self.active_view.get_view_range()
+            self._block_updates = True
+            try:
+                self.spin_xlim_min.setValue(xmin)
+                self.spin_xlim_max.setValue(xmax)
+                self.spin_ylim_min.setValue(ymin)
+                self.spin_ylim_max.setValue(ymax)
+            finally:
+                self._block_updates = False
+
+    def _on_view_nav_mode_changed(self, mode: str):
+        if self._block_updates:
+            return
+        self._block_updates = True
+        try:
+            if mode == "pan":
+                self.btn_nav_pan.setChecked(True)
+            elif mode == "zoom":
+                self.btn_nav_zoom.setChecked(True)
+            else:
+                self.btn_nav_normal.setChecked(True)
+        finally:
+            self._block_updates = False
+
+    def _on_nav_mode_btn_clicked(self, mode: str):
+        if self._block_updates or not self._is_view_alive(self.active_view):
+            return
+        if hasattr(self.active_view, "set_nav_mode") and callable(
+            getattr(self.active_view, "set_nav_mode")
+        ):
+            self.active_view.set_nav_mode(mode)
+        elif (
+            hasattr(self.active_view, "matplotlib_toolbar")
+            and self.active_view.matplotlib_toolbar is not None
+        ):
+            tb = self.active_view.matplotlib_toolbar
+            current_tb_mode = getattr(tb, "mode", "").lower()
+            if mode == "pan" and "pan" not in current_tb_mode:
+                tb.pan()
+            elif mode == "zoom" and "zoom" not in current_tb_mode:
+                tb.zoom()
+            elif mode == "" and current_tb_mode != "":
+                if "pan" in current_tb_mode:
+                    tb.pan()
+                elif "zoom" in current_tb_mode:
+                    tb.zoom()
+        self.settingsChanged.emit()
+
+    def _on_apply_limits_clicked(self):
+        if self._block_updates or not self._is_view_alive(self.active_view):
+            return
+        xmin = float(self.spin_xlim_min.value())
+        xmax = float(self.spin_xlim_max.value())
+        ymin = float(self.spin_ylim_min.value())
+        ymax = float(self.spin_ylim_max.value())
+        if xmin >= xmax:
+            xmax = xmin + 1.0
+            self.spin_xlim_max.setValue(xmax)
+        if ymin >= ymax:
+            ymax = ymin + 1.0
+            self.spin_ylim_max.setValue(ymax)
+
+        self._block_updates = True
+        try:
+            if hasattr(self.active_view, "set_view_range") and callable(
+                getattr(self.active_view, "set_view_range")
+            ):
+                self.active_view.set_view_range((xmin, xmax), (ymin, ymax))
+            elif hasattr(self.active_view, "ax"):
+                self.active_view.ax.set_xlim(xmin, xmax)
+                self.active_view.ax.set_ylim(ymin, ymax)
+                if hasattr(self.active_view, "view") and hasattr(
+                    self.active_view.view, "draw_idle"
+                ):
+                    self.active_view.view.draw_idle()
+                elif hasattr(self.active_view, "canvas") and hasattr(
+                    self.active_view.canvas, "draw_idle"
+                ):
+                    self.active_view.canvas.draw_idle()
+        finally:
+            self._block_updates = False
+        self.settingsChanged.emit()
+
+    def _on_auto_limits_clicked(self):
+        self._on_nav_reset_clicked()
+
+    def _on_nav_reset_clicked(self):
+        if self._block_updates or not self._is_view_alive(self.active_view):
+            return
+        if hasattr(self.active_view, "reset_view") and callable(
+            getattr(self.active_view, "reset_view")
+        ):
+            self.active_view.reset_view()
+        elif hasattr(self.active_view, "matplotlib_toolbar") and hasattr(
+            self.active_view.matplotlib_toolbar, "home"
+        ):
+            self.active_view.matplotlib_toolbar.home()
+
+        if hasattr(self.active_view, "get_view_range") and callable(
+            getattr(self.active_view, "get_view_range")
+        ):
+            (xmin, xmax), (ymin, ymax) = self.active_view.get_view_range()
+            self._block_updates = True
+            try:
+                self.spin_xlim_min.setValue(xmin)
+                self.spin_xlim_max.setValue(xmax)
+                self.spin_ylim_min.setValue(ymin)
+                self.spin_ylim_max.setValue(ymax)
+            finally:
+                self._block_updates = False
+        elif hasattr(self.active_view, "ax"):
+            xlim = self.active_view.ax.get_xlim()
+            ylim = self.active_view.ax.get_ylim()
+            self._block_updates = True
+            try:
+                self.spin_xlim_min.setValue(float(min(xlim)))
+                self.spin_xlim_max.setValue(float(max(xlim)))
+                self.spin_ylim_min.setValue(float(min(ylim)))
+                self.spin_ylim_max.setValue(float(max(ylim)))
+            finally:
+                self._block_updates = False
         self.settingsChanged.emit()

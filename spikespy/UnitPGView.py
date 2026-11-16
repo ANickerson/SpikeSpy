@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QApplication,
+    QToolBar,
 )
 import pyqtgraph as pg
 
@@ -19,9 +20,10 @@ from .ChannelGroupBar import ChannelGroupBar
 from .helpers import qsignal_throttle, quiet_fail, run_adaptive_render
 from .live_orchestrator import LiveFrameConsumerMixin
 from .viewer_worker import get_task_manager, TaskType, TaskPriority
+from .PGNavigation import PGNavigationMixin
 
 
-class UnitPGView(LiveFrameConsumerMixin, QMainWindow):
+class UnitPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     """
     High-performance PyQtGraph port of UnitView.
     Displays aligned spike waveform snippets, mean waveform, and active sweep highlight.
@@ -164,6 +166,11 @@ class UnitPGView(LiveFrameConsumerMixin, QMainWindow):
 
         layout.addWidget(self.glw)
         self.setCentralWidget(central)
+
+        self.nav_toolbar = QToolBar("Navigation", self)
+        self.add_navigation_actions(self.nav_toolbar)
+        self.addToolBar(self.nav_toolbar)
+        self.init_navigation()
 
     def set_state(self, state: ViewerState):
         self.unset_connections()
@@ -446,8 +453,11 @@ class UnitPGView(LiveFrameConsumerMixin, QMainWindow):
             self.selected_curve.clear()
             self.selected_curve.setVisible(False)
 
+    def reset_view(self):
+        self.update_all()
+
     def _on_click(self, event):
-        if event.button() != Qt.LeftButton or not self.lines or self.state is None:
+        if self.is_nav_active() or event.button() != Qt.LeftButton or not self.lines or self.state is None:
             return
         if not hasattr(self.main_plot, "vb") or not self.main_plot.sceneBoundingRect().contains(event.scenePos()):
             return

@@ -392,11 +392,26 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
             area = pos
 
         self.dock_manager.addDockWidget(area, dock)
+        d_area = dock.dockAreaWidget()
+        if d_area is not None and not getattr(d_area, "_spikespy_current_changed_connected", False):
+            d_area.currentChanged.connect(lambda idx, a=d_area: self._on_subview_area_changed(a))
+            d_area._spikespy_current_changed_connected = True
 
         # Synchronize child to this container's channel/unit settings immediately
         self._sync_child(child)
 
+        if self.state and getattr(self.state, "hide_view_top_bars", False):
+            from .helpers import apply_top_bars_visibility
+            apply_top_bars_visibility(child, True)
+
         self.viewAdded.emit(child)
+
+    def _on_subview_area_changed(self, area):
+        if area and hasattr(area, "currentDockWidget") and area.currentDockWidget():
+            child = area.currentDockWidget().widget()
+            win = self.window()
+            if win is not None and hasattr(win, "settings_panel") and win.settings_panel is not None:
+                win.settings_panel.setActiveView(child)
 
     def _on_dock_closed(self, child: QWidget):
         if child in self.sub_views:

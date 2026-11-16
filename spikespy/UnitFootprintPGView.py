@@ -29,6 +29,7 @@ from .ViewerState import ViewerState, tracked_neuron_unit
 from .live_orchestrator import LiveFrameConsumerMixin
 from .ChannelGroupBar import ChannelGroupBar
 from .helpers import quiet_fail, run_adaptive_render
+from .PGNavigation import PGNavigationMixin
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +41,7 @@ def _get_mpl_lut(name: str = "RdBu_r", n: int = 256) -> np.ndarray:
     return (colors * 255).astype(np.uint8)
 
 
-class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
+class UnitFootprintPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     """
     High-performance PyQtGraph port of UnitFootprintView.
     Delivers GPU-accelerated spatiotemporal footprint waterfall heatmaps across
@@ -146,6 +147,8 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
         self.control_toolbar.addWidget(self.chk_show_live_trace)
         self.control_toolbar.addSeparator()
         self.control_toolbar.addWidget(self.btn_auto_assign_channels)
+        self.add_navigation_actions(self.control_toolbar)
+        self.init_navigation()
         self.addToolBar(self.control_toolbar)
 
         # Independent channel group and unit binding toolbar
@@ -827,9 +830,12 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, QMainWindow):
 
             self.grid_plots.append((plot, sg_original_idx, best_ch))
 
+    def reset_view(self):
+        self._schedule_render()
+
     def _on_scene_clicked(self, event):
         """Unified click handler dispatching to composite or grid mode handler."""
-        if getattr(event, "button", None) != Qt.LeftButton:
+        if self.is_nav_active() or getattr(event, "button", None) != Qt.LeftButton:
             return
         if self.combo_mode.currentIndex() == 0:
             self._on_plot_clicked(event)

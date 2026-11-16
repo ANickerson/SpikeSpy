@@ -160,3 +160,64 @@ def qsignal_throttle_wrapper(interval=33):
         return wrapped_func
 
     return decorator
+
+
+def apply_top_bars_visibility(widget, hide: bool):
+    """
+    Shows or hides top toolbars on a view or channel group container.
+    When hide is True, all QToolBar instances on the view are hidden so
+    controls are managed exclusively from the properties pane.
+    When hide is False, toolbars are restored (respecting channel bar deferral).
+    Does NOT hide the main application toolbar.
+    """
+    if widget is None:
+        return
+    from PySide6.QtWidgets import QToolBar
+
+    # If widget is the main application window (MdiView), delegate only to its docked views
+    if widget.__class__.__name__ == "MdiView" or (
+        hasattr(widget, "dock_manager") and hasattr(widget, "settings_panel")
+    ):
+        if hasattr(widget, "dock_manager") and widget.dock_manager is not None:
+            for dw in widget.dock_manager.dockWidgets():
+                w = dw.widget()
+                if w is not None and w is not getattr(widget, "settings_panel", None):
+                    apply_top_bars_visibility(w, hide)
+        return
+
+    # If widget is a ChannelGroupContainerView
+    if widget.__class__.__name__ == "ChannelGroupContainerView":
+        if hasattr(widget, "channel_bar") and widget.channel_bar is not None:
+            widget.channel_bar.setVisible(not hide)
+        if hasattr(widget, "control_bar") and widget.control_bar is not None:
+            widget.control_bar.setVisible(not hide)
+        if hasattr(widget, "sub_views"):
+            for sv in widget.sub_views:
+                apply_top_bars_visibility(sv, hide)
+        return
+
+    # Check if widget is nested within a ChannelGroupContainerView
+    is_inside_container = False
+    curr = widget.parentWidget() if hasattr(widget, "parentWidget") else None
+    while curr is not None:
+        if curr.__class__.__name__ == "ChannelGroupContainerView":
+            is_inside_container = True
+            break
+        curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
+
+    # Handle all QToolBar children of the view
+    try:
+        toolbars = widget.findChildren(QToolBar)
+    except Exception:
+        toolbars = []
+
+    for tb in toolbars:
+        # Never hide application-level toolbars
+        win = tb.window()
+        if win is not None and win.__class__.__name__ == "MdiView" and tb.parent() is win:
+            continue
+        # If inside a channel group container, child view's channel_bar was deferred and should stay hidden
+        if is_inside_container and hasattr(widget, "channel_bar") and tb is widget.channel_bar:
+            tb.setVisible(False)
+        else:
+            tb.setVisible(not hide)
