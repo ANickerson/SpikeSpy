@@ -23,6 +23,7 @@ from .ViewerState import ViewerState, tracked_neuron_unit
 from .ChannelGroupBar import ChannelGroupBar
 from .helpers import qsignal_throttle, quiet_fail, run_adaptive_render
 from .live_orchestrator import LiveFrameConsumerMixin
+from .PGNavigation import PGNavigationMixin
 
 
 class FixedTimeAxisItem(pg.AxisItem):
@@ -32,7 +33,7 @@ class FixedTimeAxisItem(pg.AxisItem):
         return [f"{1000 * v:g}" for v in values]
 
 
-class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
+class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     """
     High-performance PyQtGraph port of MultiTraceFixedView.
     Displays N-pre and N-post sweeps around the active stimulus sweep.
@@ -182,6 +183,8 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
         scale_layout.addWidget(self.post_spinner)
 
         toolbar.addWidget(scale_widget)
+        self.add_navigation_actions(toolbar)
+        self.init_navigation()
         self.addToolBar(toolbar)
 
     def _connect_state(self, sig, slot):
@@ -332,8 +335,16 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, QMainWindow):
                 self.settings["scale"] = float(np.round(1.0 / ylim, decimals=4))
                 self.scale_spinner.setValue(self.settings["scale"])
 
+    def reset_view(self):
+        erp = self.get_erp_signal()
+        if erp is not None and len(erp) > 0:
+            sr = float(self.state.sampling_rate) if self.state and self.state.sampling_rate else 10000.0
+            self.main_plot.setXRange(0, (erp.shape[-1] - 1) / sr, padding=0)
+        self._auto_scale()
+        self.update_figure()
+
     def _on_click(self, event):
-        if event.button() != Qt.LeftButton or self.state is None:
+        if self.is_nav_active() or event.button() != Qt.LeftButton or self.state is None:
             return
         if not hasattr(self.main_plot, "vb") or not self.main_plot.sceneBoundingRect().contains(event.scenePos()):
             return
