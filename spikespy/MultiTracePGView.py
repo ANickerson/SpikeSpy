@@ -109,6 +109,34 @@ class ChannelPlotPanel:
         self.has_data: bool = False
 
 
+class SummaryLinePanel:
+    """Encapsulates a summary line graph panel (channel row stat or global metric)."""
+
+    def __init__(
+        self,
+        key: str,
+        label: str,
+        plot: pg.PlotItem,
+        curve: pg.PlotDataItem,
+        stim_line: pg.InfiniteLine,
+        empty_text_item: pg.TextItem,
+        is_channel_stat: bool = False,
+        slot_idx: Optional[int] = None,
+        channel_name: Optional[str] = None,
+        has_data: bool = False,
+    ):
+        self.key: str = key
+        self.label: str = label
+        self.plot: pg.PlotItem = plot
+        self.curve: pg.PlotDataItem = curve
+        self.stim_line: pg.InfiniteLine = stim_line
+        self.empty_text_item: pg.TextItem = empty_text_item
+        self.is_channel_stat: bool = is_channel_stat
+        self.slot_idx: Optional[int] = slot_idx
+        self.channel_name: Optional[str] = channel_name
+        self.has_data: bool = has_data
+
+
 class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     """
     High-performance PyQtGraph port of MultiTraceView.
@@ -134,6 +162,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.std: float = 1.0
         self.rightPlots: Dict[str, bool] = {}
         self.right_plots: Dict[str, pg.PlotItem] = {}
+        self.summary_panels: Dict[str, SummaryLinePanel] = {}
         self.connections: List[Tuple] = []
         self.references = self.connections
         self.legend_items: List[pg.TextItem] = []
@@ -184,7 +213,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.dialogDeleteRegion.onSubmit.connect(self.deleteRegion)
         self.dialogDeleteRegion.finished.connect(lambda *args: self.toggle_deleter(False))
 
-        self.settingsDialog = DialogSignalSelect()
+        self.settingsDialog: Optional[DialogSignalSelect] = None
 
         if state is not None:
             self.set_state(state)
@@ -363,13 +392,20 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         toolbar.addWidget(self.deleterButton)
 
         self.settingsButton = QPushButton("Settings")
-        self.settingsButton.clicked.connect(lambda: self.settingsDialog.show())
+        self.settingsButton.clicked.connect(self.open_settings_dialog)
         toolbar.addWidget(self.settingsButton)
 
         self.toggleMaxMeanButton = QPushButton("Show max", self)
         self.toggleMaxMeanButton.setCheckable(True)
         self.toggleMaxMeanButton.clicked.connect(self.toggleMaxMean)
         toolbar.addWidget(self.toggleMaxMeanButton)
+
+        self.btn_summary_menu = QToolButton(self)
+        self.btn_summary_menu.setText("Summary ▾")
+        self.btn_summary_menu.setToolTip("Quick toggles for summary line graphs (Channel Mean/Max, Stim. Freq., Latency Diff.)")
+        self.btn_summary_menu.setPopupMode(QToolButton.InstantPopup)
+        toolbar.addWidget(self.btn_summary_menu)
+        self._build_summary_menu()
 
         self.showMessages = QPushButton("Show messages", self)
         self.showMessages.setCheckable(True)
@@ -517,6 +553,144 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
 
         menu.exec(screen_pos)
 
+    def _build_summary_menu(self):
+        menu = QMenu(self)
+        menu.aboutToShow.connect(self._populate_summary_menu)
+        self.btn_summary_menu.setMenu(menu)
+
+    def _populate_summary_menu(self):
+        menu = self.btn_summary_menu.menu()
+        if menu is None:
+            return
+        menu.clear()
+
+        act_ch_all = menu.addAction("Channel Summary Graphs (All in Group)")
+        act_ch_all.setCheckable(True)
+        act_ch_all.setChecked(self.rightPlots.get("__channel_summaries__", True))
+        act_ch_all.triggered.connect(lambda checked: self.toggle_channel_summaries(checked))
+
+        act_sf = menu.addAction("Stim. Freq. (Hz)")
+        act_sf.setCheckable(True)
+        act_sf.setChecked(self.rightPlots.get("Stim. Freq. (Hz)", True))
+        act_sf.triggered.connect(lambda checked: self.toggle_summary_graph("Stim. Freq. (Hz)", checked))
+
+        act_ld = menu.addAction("Latency Diff.")
+        act_ld.setCheckable(True)
+        act_ld.setChecked(self.rightPlots.get("Latency Diff.", True))
+        act_ld.triggered.connect(lambda checked: self.toggle_summary_graph("Latency Diff.", checked))
+
+        menu.addSeparator()
+
+        stat_lbl = "Switch to Mean" if self.toggleMaxMeanButton.isChecked() else "Switch to Max"
+        act_stat = menu.addAction(stat_lbl)
+        act_stat.triggered.connect(self.toggleMaxMean)
+
+        menu.addSeparator()
+        act_cfg = menu.addAction("Configure All Summary Signals...")
+        act_cfg.triggered.connect(self.open_settings_dialog)
+
+    def toggle_channel_summaries(self, visible: bool):
+        """Toggle all channel summary graphs on or off."""
+        self.rightPlots["__channel_summaries__"] = visible
+        self.plot_right_axis()
+
+    def toggle_summary_graph(self, key: str, visible: bool):
+        """Toggle visibility of a specific summary line graph."""
+        self.rightPlots[key] = visible
+        self.plot_right_axis()
+
+    def open_settings_dialog(self):
+        """Open settings dialog to configure which summary line graphs are displayed."""
+        all_options = dict(self.rightPlots)
+        all_options.setdefault("__channel_summaries__", True)
+        all_options.setdefault("Stim. Freq. (Hz)", True)
+        all_options.setdefault("Latency Diff.", True)
+
+        for ch in self.displayed_channels:
+            if ch and ch not in all_options:
+                all_options[ch] = True
+
+        if self.right_ax_data:
+            for k in self.right_ax_data.keys():
+                if k not in all_options:
+                    all_options[k] = True
+
+        if self.settingsDialog is not None:
+            try:
+                self.settingsDialog.close()
+                self.settingsDialog.deleteLater()
+            except Exception:
+                pass
+
+        self.settingsDialog = DialogSignalSelect(self, options=all_options)
+        self.settingsDialog.setWindowTitle("Configure Summary Line Graphs")
+
+        def updateView(k, v):
+            self.rightPlots[k] = v
+            self.plot_right_axis()
+            self.render()
+
+        self.settingsDialog.changeSelection.connect(updateView)
+        self.settingsDialog.show()
+
+    def _show_summary_context_menu(self, screen_pos, key: str, panel: SummaryLinePanel):
+        menu = QMenu(self)
+
+        if panel.is_channel_stat:
+            stat_act = menu.addAction(
+                "Switch to Mean" if self.toggleMaxMeanButton.isChecked() else "Switch to Max"
+            )
+            stat_act.triggered.connect(self.toggleMaxMean)
+            menu.addSeparator()
+
+            if panel.slot_idx is not None:
+                if panel.channel_name:
+                    primary_ch = (
+                        self.channel_bar.get_primary_channel()
+                        if hasattr(self, "channel_bar") and self.channel_bar
+                        else ""
+                    )
+                    if panel.channel_name != primary_ch:
+                        act_pri = menu.addAction(f"★ Set '{panel.channel_name}' as Primary")
+                        act_pri.triggered.connect(lambda: self._set_channel_as_primary(panel.slot_idx))
+
+                replace_menu = menu.addMenu("Set Channel..." if not panel.channel_name else "Replace Channel with...")
+                avail = self.state.get_available_channels() if self.state else []
+                for ch in avail:
+                    if ch != panel.channel_name:
+                        act_ch = replace_menu.addAction(ch)
+                        act_ch.triggered.connect(
+                            lambda checked=False, c=ch, idx=panel.slot_idx: self._replace_slot_channel(idx, c)
+                        )
+
+                if panel.channel_name is not None:
+                    act_clr = menu.addAction("Clear Slot to (Empty Screen)")
+                    act_clr.triggered.connect(lambda: self.clear_slot_to_empty(panel.slot_idx))
+
+            menu.addSeparator()
+
+        act_hide = menu.addAction(f"Hide '{panel.label}'")
+        act_hide.triggered.connect(lambda: self.toggle_summary_graph(key, False))
+
+        menu.exec(screen_pos)
+
+    def _format_summary_title(
+        self, slot_idx: int, total_n: int, ch_name: Optional[str], primary_ch: str = "", stat_name: str = "Mean"
+    ) -> str:
+        """Format informative label linking summary line graph to its channel group position."""
+        star = "★ " if ch_name and ch_name == primary_ch else ""
+        slot_label = f"{slot_idx + 1}/{total_n} in group"
+        if not ch_name:
+            return f"[{slot_label}] (Empty)"
+
+        has_data = False
+        if self.state is not None:
+            erp = self.get_channel_erp_signal(ch_name)
+            has_data = erp is not None and len(erp) > 0
+
+        status = f"({stat_name})" if has_data else "(No data)"
+        return f"{star}[{slot_label}] {ch_name} {status}"
+
     def _format_channel_title(
         self, slot_idx: int, total_n: int, ch_name: Optional[str], primary_ch: str = ""
     ) -> str:
@@ -565,6 +739,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 p.channel_name = self.displayed_channels[i]
                 title = self._format_channel_title(i, target_n, p.channel_name, primary_ch)
                 p.plot.setTitle(title, color="#333", size="9pt")
+            self.plot_right_axis()
             return
 
         # Count changed - remove right plots and channel panels from glw
@@ -574,6 +749,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             except Exception:
                 pass
         self.right_plots.clear()
+        self.summary_panels.clear()
 
         for p in self.channel_panels:
             try:
@@ -958,9 +1134,33 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         scene_pos = event.scenePos()
         target_panel = None
         for p in self.channel_panels:
-            if p.plot.vb.sceneBoundingRect().contains(scene_pos):
+            if hasattr(p.plot, "vb") and p.plot.vb.sceneBoundingRect().contains(scene_pos):
                 target_panel = p
                 break
+
+        target_summary = None
+        if target_panel is None:
+            for sp in self.summary_panels.values():
+                if hasattr(sp.plot, "vb") and sp.plot.vb.sceneBoundingRect().contains(scene_pos):
+                    target_summary = sp
+                    break
+
+        if target_summary is not None:
+            pos = target_summary.plot.vb.mapSceneToView(scene_pos)
+            if event.button() == Qt.RightButton:
+                screen_pos = event.screenPos().toPoint() if hasattr(event.screenPos(), "toPoint") else QtCore.QPoint(int(event.screenPos().x()), int(event.screenPos().y()))
+                self._show_summary_context_menu(screen_pos, target_summary.key, target_summary)
+                event.accept()
+                return
+            elif event.button() == Qt.LeftButton:
+                if not np.isnan(pos.y()):
+                    stimno = int(round(pos.y()))
+                    if self.state and self.state.event_signal is not None:
+                        if 0 <= stimno < len(self.state.event_signal):
+                            self.state.setStimNo(stimno)
+                event.accept()
+                return
+
         if target_panel is None:
             target_panel = self.channel_panels[0] if self.channel_panels else None
         if target_panel is None:
@@ -1293,21 +1493,34 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         stats: Dict[str, np.ndarray] = {}
         if self.state is None:
             return stats
+        is_streaming = getattr(self.state, "is_streaming", False)
         for ch_name in ch_names:
-            buf = None
-            if hasattr(self.state, "_live_aux_erp_buffers") and ch_name in self.state._live_aux_erp_buffers:
-                buf = self.state._live_aux_erp_buffers[ch_name]
-            elif (
-                getattr(self.state, "_live_erp_buffer", None) is not None
-                and self.state.analog_signal is not None
-                and ch_name == getattr(self.state.analog_signal, "name", None)
-            ):
-                buf = self.state._live_erp_buffer
-            if buf is not None and len(buf) > 0:
-                rv = buf.row_max if show_max else buf.row_mean
-                if hasattr(rv, "magnitude"):
-                    rv = rv.magnitude
-                stats[ch_name] = np.asarray(rv, dtype=np.float32)
+            if not ch_name:
+                continue
+            if is_streaming:
+                buf = None
+                if hasattr(self.state, "_live_aux_erp_buffers") and ch_name in self.state._live_aux_erp_buffers:
+                    buf = self.state._live_aux_erp_buffers[ch_name]
+                elif (
+                    getattr(self.state, "_live_erp_buffer", None) is not None
+                    and self.state.analog_signal is not None
+                    and ch_name == getattr(self.state.analog_signal, "name", None)
+                ):
+                    buf = self.state._live_erp_buffer
+                if buf is not None and len(buf) > 0:
+                    rv = buf.row_max if show_max else buf.row_mean
+                    if hasattr(rv, "magnitude"):
+                        rv = rv.magnitude
+                    stats[ch_name] = np.asarray(rv, dtype=np.float32)
+            else:
+                ch_erp = self.get_channel_erp_signal(ch_name)
+                if ch_erp is not None and len(ch_erp) > 0:
+                    ch_mag = ch_erp.magnitude if hasattr(ch_erp, "magnitude") else ch_erp
+                    if hasattr(ch_mag, "ndim") and ch_mag.ndim >= 2 and ch_mag.shape[0] > 0:
+                        rv = np.max(ch_mag, axis=1) if show_max else np.mean(ch_mag, axis=1)
+                        if hasattr(rv, "magnitude"):
+                            rv = rv.magnitude
+                        stats[ch_name] = np.asarray(rv, dtype=np.float32)
         return stats
 
     def _schedule_render(self, stimno: Optional[int]):
@@ -1389,11 +1602,19 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     def _get_channel_names(self) -> List[str]:
         """Get list of channel names for right axis computation."""
         names = []
+        if hasattr(self, "displayed_channels"):
+            for ch in self.displayed_channels:
+                if ch and ch not in names:
+                    names.append(ch)
         if hasattr(self, "channel_bar") and self.channel_bar is not None:
             chans = self.channel_bar.get_selected_channels()
-            names.extend(chans)
-        elif self.state.analog_signal is not None:
-            names.append(self.state.analog_signal.name)
+            for ch in chans:
+                if ch and ch not in names:
+                    names.append(ch)
+        elif self.state and self.state.analog_signal is not None:
+            sig_name = getattr(self.state.analog_signal, "name", None)
+            if sig_name and sig_name not in names:
+                names.append(sig_name)
         return names
     
     def _schedule_right_axis_update(self, force: bool = False):
@@ -1504,14 +1725,20 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         stimno = result.get("stimno")
         if stimno is not None:
             self.plot_curstim_line(stimno)
+
+        rdata = result.get("right_ax_data")
+        if rdata:
+            self.right_ax_data.update(rdata)
+            for k in rdata.keys():
+                if k not in self.rightPlots:
+                    self.rightPlots[k] = True
+            self.plot_right_axis()
         
         # Spike groups handled by separate result
     
     def _on_right_axis_result(self, result: Dict[str, Any], error: str):
         """Handle completed right axis computation."""
-        if error:
-            return
-        if not result:
+        if error or not result:
             return
         
         self.right_ax_data = result
@@ -1520,17 +1747,6 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         for k in self.right_ax_data.keys():
             if k not in self.rightPlots:
                 self.rightPlots[k] = True
-        
-        # Recreate settings dialog if needed
-        if self.settingsDialog is None:
-            self.settingsDialog = DialogSignalSelect(options=self.rightPlots)
-
-            def updateView(k, v):
-                self.rightPlots[k] = v
-                self.plot_right_axis()
-                self.render()
-            
-            self.settingsDialog.changeSelection.connect(updateView)
         
         self.plot_right_axis()
     
@@ -1799,6 +2015,10 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                     x = np.arange(len(y))
                     p.active_sweep_curve.setData(x, y, pen=pg.mkPen(color="purple", width=2))
 
+        for sp in self.summary_panels.values():
+            if hasattr(sp, "stim_line") and sp.stim_line is not None:
+                sp.stim_line.setValue(stimNo)
+
     @quiet_fail
     def plot_spikegroups(self):
         if self.state is None or self.state.event_signal is None:
@@ -1914,62 +2134,239 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     def render(self):
         self.plot_spikegroups()
 
+    def _sync_right_axis_data(self, force: bool = False):
+        """Synchronously compute right axis summary line data for both static and streaming sessions."""
+        if self.state is None:
+            return
+
+        data: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+
+        # 1. Stimulus frequency
+        if self.state.event_signal is not None and len(self.state.event_signal) > 1:
+            try:
+                times_s = self.state.event_signal.times.rescale(pq.second).magnitude
+                diffs = np.diff(times_s)
+                stim_freq = np.divide(1.0, diffs, out=np.zeros_like(diffs), where=diffs != 0)
+                sweeps = np.arange(1, len(times_s))
+                data["Stim. Freq. (Hz)"] = (np.asarray(stim_freq, dtype=np.float32), sweeps)
+            except Exception:
+                pass
+
+        # 2. Latency differences for target unit
+        ug = self.get_target_unit()
+        if ug is not None and self.state.event_signal is not None:
+            try:
+                latencies = ug.get_latencies(self.state.event_signal)
+                if latencies is not None and len(latencies) > 0:
+                    lat_mag = latencies.magnitude if hasattr(latencies, "magnitude") else latencies
+                    idx_na = np.isnan(lat_mag)
+                    if np.any(~idx_na):
+                        valid_lat = lat_mag[~idx_na]
+                        diffs = np.diff(valid_lat)
+                        out = np.ones(lat_mag.shape, dtype=np.float32) * np.nan
+                        valid_idx = np.where(~idx_na)[0]
+                        if len(valid_idx) > 1:
+                            out[valid_idx[1:]] = diffs
+                        data["Latency Diff."] = (out, np.arange(len(lat_mag)))
+            except Exception:
+                pass
+
+        # 3. Channel row statistics (Mean or Max)
+        show_max = self.toggleMaxMeanButton.isChecked()
+        all_chans = self._get_channel_names()
+        for ch in self.displayed_channels:
+            if ch and ch not in all_chans:
+                all_chans.append(ch)
+
+        channel_stats = self._extract_channel_row_stats(all_chans, show_max)
+        for ch_name, stat_arr in channel_stats.items():
+            if stat_arr is not None and len(stat_arr) > 0:
+                data[ch_name] = (stat_arr, np.arange(len(stat_arr)))
+
+        self.right_ax_data = data
+        for k in data.keys():
+            if k not in self.rightPlots:
+                self.rightPlots[k] = True
+
     def reset_right_axes_data(self):
-        """Schedule right axis data computation to background thread."""
+        """Recompute right axis summary data and schedule background updates."""
+        self._sync_right_axis_data(force=True)
+        self.plot_right_axis()
         self._schedule_right_axis_update(force=True)
 
     def plot_right_axis(self):
-        active_axes = [(k, v) for k, v in self.right_ax_data.items() if self.rightPlots.get(k, False)]
+        if not self.right_ax_data:
+            self._sync_right_axis_data()
+
+        active_summary_specs: List[Dict[str, Any]] = []
+        show_channel_summaries = self.rightPlots.get("__channel_summaries__", True)
+        stat_name = "Max" if self.toggleMaxMeanButton.isChecked() else "Mean"
+        primary_ch = (
+            self.channel_bar.get_primary_channel()
+            if hasattr(self, "channel_bar") and self.channel_bar
+            else ""
+        )
+        if not primary_ch and self.state is not None:
+            avail = self.state.get_available_channels()
+            if avail:
+                primary_ch = avail[0]
+            elif self.state.analog_signal is not None:
+                primary_ch = getattr(self.state.analog_signal, "name", "")
+
+        # A) Channel summary graphs for each slot in self.displayed_channels (size group_size_n)
+        if show_channel_summaries:
+            for i in range(self.group_size_n):
+                ch_name = self.displayed_channels[i] if i < len(self.displayed_channels) else None
+                key = ch_name if ch_name is not None else f"__empty_slot_{i}__"
+                if not self.rightPlots.get(key, True):
+                    continue
+
+                label = self._format_summary_title(i, self.group_size_n, ch_name, primary_ch, stat_name)
+                if ch_name is None:
+                    axis_label = f"Slot {i+1} (Empty)"
+                    has_data = False
+                    xy_data = None
+                elif ch_name in self.right_ax_data and len(self.right_ax_data[ch_name][0]) > 0:
+                    axis_label = f"{ch_name} ({stat_name})"
+                    has_data = True
+                    xy_data = self.right_ax_data[ch_name]
+                else:
+                    axis_label = f"{ch_name} (No data)"
+                    has_data = False
+                    xy_data = None
+
+                active_summary_specs.append({
+                    "key": key,
+                    "label": label,
+                    "axis_label": axis_label,
+                    "is_channel": True,
+                    "slot_idx": i,
+                    "channel_name": ch_name,
+                    "has_data": has_data,
+                    "xy_data": xy_data,
+                })
+
+        # B) Global metric summary graphs
+        for g_key, axis_lbl in [("Stim. Freq. (Hz)", "Freq (Hz)"), ("Latency Diff.", "Diff (s)")]:
+            if g_key in self.right_ax_data and self.rightPlots.get(g_key, True):
+                xy_data = self.right_ax_data[g_key]
+                if xy_data is not None and len(xy_data[0]) > 0:
+                    active_summary_specs.append({
+                        "key": g_key,
+                        "label": g_key,
+                        "axis_label": axis_lbl,
+                        "is_channel": False,
+                        "slot_idx": None,
+                        "channel_name": None,
+                        "has_data": True,
+                        "xy_data": xy_data,
+                    })
+
         start_col = len(self.channel_panels)
-        if not active_axes:
+        if not active_summary_specs:
             for p in self.right_plots.values():
                 try:
                     self.glw.removeItem(p)
                 except Exception:
                     pass
             self.right_plots.clear()
+            self.summary_panels.clear()
             for c in range(start_col):
                 self.glw.ci.layout.setColumnStretchFactor(c, 3)
             return
 
-        active_labels = [label for label, data in active_axes]
-        if list(self.right_plots.keys()) == active_labels:
-            for label, data in active_axes:
-                p = self.right_plots[label]
-                x_data = data[0].magnitude if hasattr(data[0], "magnitude") else data[0]
-                y_data = data[1].magnitude if hasattr(data[1], "magnitude") else data[1]
-                items = p.listDataItems()
-                if items:
-                    items[0].setData(x=x_data, y=y_data)
+        active_keys = [spec["key"] for spec in active_summary_specs]
+        cur_stim = self.state.stimno if self.state else 0
+
+        # Fast path: check if existing panels match keys and are attached
+        can_fast_path = (
+            list(self.summary_panels.keys()) == active_keys
+            and all(sp.plot.scene() is not None for sp in self.summary_panels.values())
+        )
+        if can_fast_path:
+            for spec in active_summary_specs:
+                sp = self.summary_panels[spec["key"]]
+                sp.label = spec["label"]
+                sp.plot.setTitle(spec["label"])
+                sp.plot.setLabel("bottom", spec["axis_label"])
+                sp.has_data = spec["has_data"]
+                sp.stim_line.setValue(cur_stim)
+                if spec["has_data"]:
+                    x_data, y_data = spec["xy_data"]
+                    x_val = x_data.magnitude if hasattr(x_data, "magnitude") else x_data
+                    y_val = y_data.magnitude if hasattr(y_data, "magnitude") else y_data
+                    sp.curve.setData(x=x_val, y=y_val)
+                    sp.empty_text_item.setVisible(False)
                 else:
-                    p.plot(x=x_data, y=y_data)
+                    sp.curve.clear()
+                    txt = "(Empty Screen)" if spec["channel_name"] is None else "(No Data)"
+                    sp.empty_text_item.setText(txt)
+                    sp.empty_text_item.setVisible(True)
             return
 
+        # Slow path: rebuild summary panels in grid layout
         for p in self.right_plots.values():
             try:
                 self.glw.removeItem(p)
             except Exception:
                 pass
         self.right_plots.clear()
+        self.summary_panels.clear()
 
         for c in range(start_col):
             self.glw.ci.layout.setColumnStretchFactor(c, 3)
+
         colorwheel = itertools.cycle(["#d95f02", "#7570b3", "#e7298a", "#66a61e", "#e6ab02", "#a6761d"])
 
-        for offset, (label, data) in enumerate(active_axes):
+        for offset, spec in enumerate(active_summary_specs):
             col_idx = start_col + offset
             c = next(colorwheel)
             p = self.glw.addPlot(row=0, col=col_idx)
             p.setYLink(self.main_plot)
             p.invertY(True)
-            x_data = data[0].magnitude if hasattr(data[0], "magnitude") else data[0]
-            y_data = data[1].magnitude if hasattr(data[1], "magnitude") else data[1]
-            p.plot(x=x_data, y=y_data, pen=pg.mkPen(c, width=1.5))
-            p.setLabel("bottom", label, color=c)
+            p.setTitle(spec["label"])
+            p.setLabel("bottom", spec["axis_label"], color=c)
             p.getAxis("left").setStyle(showValues=False)
             p.getAxis("left").setPen(c)
+            p.showGrid(x=True, y=True, alpha=0.2)
             self.glw.ci.layout.setColumnStretchFactor(col_idx, 1)
-            self.right_plots[label] = p
+
+            stim_line = pg.InfiniteLine(angle=0, pen=pg.mkPen("purple", width=1.5), movable=False)
+            stim_line.setValue(cur_stim)
+            p.addItem(stim_line)
+
+            curve = pg.PlotDataItem(pen=pg.mkPen(c, width=1.5), connect="finite")
+            p.addItem(curve)
+
+            txt_str = "(Empty Screen)" if spec["channel_name"] is None else ("(No Data)" if not spec["has_data"] else "")
+            empty_text = pg.TextItem(txt_str, color=(140, 140, 140), anchor=(0.5, 0.5))
+            p.addItem(empty_text)
+            empty_text.setPos(0, max(cur_stim, 1))
+
+            if spec["has_data"]:
+                x_data, y_data = spec["xy_data"]
+                x_val = x_data.magnitude if hasattr(x_data, "magnitude") else x_data
+                y_val = y_data.magnitude if hasattr(y_data, "magnitude") else y_data
+                curve.setData(x=x_val, y=y_val)
+                empty_text.setVisible(False)
+            else:
+                curve.clear()
+                empty_text.setVisible(True)
+
+            panel = SummaryLinePanel(
+                key=spec["key"],
+                label=spec["label"],
+                plot=p,
+                curve=curve,
+                stim_line=stim_line,
+                empty_text_item=empty_text,
+                is_channel_stat=spec["is_channel"],
+                slot_idx=spec["slot_idx"],
+                channel_name=spec["channel_name"],
+                has_data=spec["has_data"],
+            )
+            self.summary_panels[spec["key"]] = panel
+            self.right_plots[spec["key"]] = p
 
     # --- PolyLine Selection and Peak Tracking ---
 
@@ -2084,7 +2481,11 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
 
     # --- Message and Display Toggles ---
 
-    def toggleMaxMean(self):
+    def toggleMaxMean(self, checked: Optional[bool] = None):
+        if checked is not None:
+            self.toggleMaxMeanButton.setChecked(checked)
+        else:
+            self.toggleMaxMeanButton.setChecked(not self.toggleMaxMeanButton.isChecked())
         if self.toggleMaxMeanButton.isChecked():
             self.toggleMaxMeanButton.setText("Show Mean")
         else:
@@ -2131,6 +2532,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             "percentiles": (self.lowerSpinBox.value(), self.upperSpinBox.value()),
             "group_size_n": self.group_size_n,
             "displayed_channels": list(self.displayed_channels),
+            "right_plots": dict(self.rightPlots),
+            "show_max": self.toggleMaxMeanButton.isChecked(),
             "scale_mode": getattr(self, "scale_mode", "std"),
         }
         if hasattr(self, "channel_bar"):
@@ -2146,8 +2549,17 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 self.spin_group_size.blockSignals(True)
                 self.spin_group_size.setValue(self.group_size_n)
                 self.spin_group_size.blockSignals(False)
+            if hasattr(self, "groupSizeSpinBox"):
+                self.groupSizeSpinBox.blockSignals(True)
+                self.groupSizeSpinBox.setValue(self.group_size_n)
+                self.groupSizeSpinBox.blockSignals(False)
         if "displayed_channels" in values:
             self.displayed_channels = list(values["displayed_channels"])
+        if "right_plots" in values:
+            self.rightPlots = dict(values["right_plots"])
+        if "show_max" in values:
+            self.toggleMaxMeanButton.setChecked(values["show_max"])
+            self.toggleMaxMeanButton.setText("Show Mean" if values["show_max"] else "Show Max")
         if "xlim" in values:
             self.main_plot.setXRange(values["xlim"][0], values["xlim"][1], padding=0)
         if "mode" in values:
@@ -2189,10 +2601,10 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         # Unregister from task manager
         if hasattr(self, "_task_manager"):
             self._task_manager.unregister_viewer(self._viewer_id)
-        if hasattr(self, "dialogPolySelect"):
+        if hasattr(self, "dialogPolySelect") and self.dialogPolySelect is not None:
             self.dialogPolySelect.close()
-        if hasattr(self, "settingsDialog"):
+        if hasattr(self, "settingsDialog") and self.settingsDialog is not None:
             self.settingsDialog.close()
-        if hasattr(self, "dialogDeleteRegion"):
+        if hasattr(self, "dialogDeleteRegion") and self.dialogDeleteRegion is not None:
             self.dialogDeleteRegion.close()
         super().closeEvent(event)
