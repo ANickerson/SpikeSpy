@@ -28,7 +28,7 @@ SpikeSpy is a PySide6 desktop app for annotating stimulus-locked microneurograph
 - Channel selection is handled by `ChannelGroupBar` and `ChannelGroupContainer`; `MdiView.newWindow` auto-wraps channel/unit-specific views when given a unit or channel target. Views integrate by exposing a `channel_bar`.
 - Live acquisition lives in `open_ephys_addin/` (ZMQ stream worker, `OpenEphysController` HTTP control, singleton `OpenEphysLiveView`). DSP primitives are in `processing.py` (`LiveERPBuffer`, `MultiAnalogSignal`, `OnlineBandpassFilter`, `OnlineTTLDetector`, `MultiChannelTemplateMatcher`). Auto-tracking is in `basic_tracking.py` + `tracking_worker.py`, and render offloading is in `viewer_worker.py`. Keep expensive work off the GUI thread and honor live frame throttling.
 - I/O is centralized in `io_manager.py`: loads NIX `.h5`, NWB, Open Ephys binary, MATLAB folders, APTrack, and Spike2; saves NIX/NWB; imports/exports unit CSV and NPZ. `NeoOpenEphyisIO.py` (note the misspelling) is the legacy custom Open Ephys reader; its module name is imported as-is.
-- `oe_plugin/` is a separate C++ Open Ephys GUI plugin (CMake + libzmq). It is not built, tested, or packaged by `uv` or CI.
+- `oe_plugin/` is a separate C++ Open Ephys GUI plugin (CMake + libzmq). `uv` does not build or package it; CI builds it via `.github/workflows/build.oe_plugin.yml` on `v*` tags, PRs touching `oe_plugin/**`, and manual dispatch (ZeroMQ comes from vcpkg on Windows, Homebrew on macOS, `libzmq3-dev` on Linux).
 
 ## Repo hygiene
 

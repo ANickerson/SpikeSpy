@@ -7,3 +7,7 @@ data
 build
 dist
 .DS_Store
+plugin-GUI/
+oe_plugin/Build/
+oe_plugin/open-ephys.lib
+oe_plugin/open-ephys-lib.zip

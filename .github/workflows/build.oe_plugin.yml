@@ -16,6 +16,9 @@ on:
 permissions:
   contents: read
 
+env:
+  OE_GUI_REF: v1.1.0
+
 jobs:
   build:
     name: Build (${{ matrix.name }})
@@ -25,18 +28,28 @@ jobs:
       matrix:
         include:
           - name: linux-x64
-            os: ubuntu-latest
-            library: SpikeSpyStreamer.so
+            os: ubuntu-22.04
           - name: windows-x64
             os: windows-latest
-            library: SpikeSpyStreamer.dll
           - name: macos-arm64
             os: macos-latest
-            library: SpikeSpyStreamer.dylib
 
     steps:
       - uses: actions/checkout@v4
 
+      # ---------------------------------------------------------------
+      # plugin-GUI headers (pinned to the GUI release this plugin loads in)
+      # ---------------------------------------------------------------
+      - name: Fetch plugin-GUI sources
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "$OE_GUI_REF" \
+            https://github.com/open-ephys/plugin-GUI.git plugin-GUI
+          git -C plugin-GUI rev-parse --short HEAD
+
+      # ---------------------------------------------------------------
+      # ZeroMQ
+      # ---------------------------------------------------------------
       - name: Install ZeroMQ (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -52,34 +65,55 @@ jobs:
         shell: pwsh
         run: "& \"$env:VCPKG_INSTALLATION_ROOT\\vcpkg.exe\" install zeromq:x64-windows"
 
-      - name: Configure (Linux/macOS)
-        if: runner.os != 'Windows'
+      # ---------------------------------------------------------------
+      # Open Ephys import library (Windows only)
+      #
+      # The plugin DLL links against open-ephys.exe's exported symbols;
+      # the import library is published per GUI release on JFrog.
+      # ---------------------------------------------------------------
+      - name: Fetch Open Ephys import library (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          EXTRA_ARGS=""
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            ZMQ_PREFIX="$(brew --prefix zeromq)"
-            EXTRA_ARGS="-DCMAKE_PREFIX_PATH=$ZMQ_PREFIX -DZMQ_ROOT=$ZMQ_PREFIX"
-          fi
-          cmake -S oe_plugin -B build/oe_plugin -DCMAKE_BUILD_TYPE=Release $EXTRA_ARGS
+          Invoke-WebRequest `
+            -Uri "https://openephys.jfrog.io/artifactory/GUI-binaries/Libraries/open-ephys-lib-$env:OE_GUI_REF.zip" `
+            -OutFile open-ephys-lib.zip -UseBasicParsing
+          Expand-Archive -Path open-ephys-lib.zip -DestinationPath oe_plugin -Force
+          Remove-Item open-ephys-lib.zip
+          Get-ChildItem oe_plugin -Filter *.lib
 
+      # ---------------------------------------------------------------
+      # Build
+      # ---------------------------------------------------------------
       - name: Configure (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           cmake -S oe_plugin -B build/oe_plugin `
+            -G "Visual Studio 17 2022" -A x64 `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DZMQ_ROOT="$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows"
 
-      - name: Build
-        run: cmake --build build/oe_plugin --config Release
-
-      - name: Stage artifact (Linux/macOS)
-        if: runner.os != 'Windows'
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
         run: |
-          mkdir -p staging
-          cp "build/oe_plugin/${{ matrix.library }}" staging/
+          sudo ./plugin-GUI/Resources/Scripts/install_linux_dependencies.sh
+          cmake -S oe_plugin -B build/oe_plugin -DCMAKE_BUILD_TYPE=Release
 
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ZMQ_PREFIX="$(brew --prefix zeromq)"
+          cmake -S oe_plugin -B build/oe_plugin -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$ZMQ_PREFIX" -DZMQ_ROOT="$ZMQ_PREFIX"
+
+      - name: Build
+        run: cmake --build build/oe_plugin --config Release --parallel
+
+      # ---------------------------------------------------------------
+      # Stage artifacts
+      # ---------------------------------------------------------------
       - name: Stage artifact (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -87,6 +121,51 @@ jobs:
           New-Item -ItemType Directory -Force staging | Out-Null
           Copy-Item "build/oe_plugin/Release/SpikeSpyStreamer.dll" staging/
           Copy-Item "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*zmq*.dll" staging/
+          Get-ChildItem staging
+
+      - name: Stage artifact (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p staging
+          cp "build/oe_plugin/SpikeSpyStreamer.so" staging/
+          cp -L "$(ldconfig -p | awk '/libzmq\.so\.5/{print $NF; exit}')" staging/
+
+      - name: Stage artifact (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p staging
+          PLUGIN_BIN="build/oe_plugin/SpikeSpyStreamer.bundle/Contents/MacOS/SpikeSpyStreamer"
+          OLD_ID="$(otool -L "$PLUGIN_BIN" | awk '/libzmq/{print $1; exit}')"
+          cp -L "$(brew --prefix zeromq)/lib/libzmq.5.dylib" staging/
+          install_name_tool -change "$OLD_ID" "@loader_path/../../libzmq.5.dylib" "$PLUGIN_BIN"
+          codesign --force --sign - build/oe_plugin/SpikeSpyStreamer.bundle
+          cp -R build/oe_plugin/SpikeSpyStreamer.bundle staging/
+
+      - name: Write install instructions
+        shell: bash
+        run: |
+          cat > staging/README.txt <<'EOF'
+          SpikeSpyStreamer plugin for Open Ephys GUI v1.x (plugin API 10)
+
+          Windows:
+            1. Copy SpikeSpyStreamer.dll into the "plugins" folder next to
+               open-ephys.exe, or into %LOCALAPPDATA%\Open Ephys\plugins-api10
+            2. Copy libzmq-mt-4_3_5.dll into the "shared" folder next to
+               open-ephys.exe, or into %LOCALAPPDATA%\Open Ephys\shared-api10
+               (skip if the GUI install already ships it)
+            3. Restart Open Ephys and add the "SpikeSpy Streamer" processor.
+
+          Linux:
+            1. Copy SpikeSpyStreamer.so and libzmq.so.5 into
+               ~/.config/open-ephys/plugins-api10 (keep both side by side)
+            2. Restart Open Ephys.
+
+          macOS:
+            1. Copy SpikeSpyStreamer.bundle and libzmq.5.dylib into
+               ~/Library/Application Support/open-ephys/plugins-api10
+               (keep both side by side)
+            2. Restart Open Ephys.
+          EOF
 
       - uses: actions/upload-artifact@v4
         with:

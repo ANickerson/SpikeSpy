@@ -1,77 +1,54 @@
 /*
-  Open Ephys Plugin Library Interface for SpikeSpyStreamer
-  Open Ephys GUI v1.0+ Plugin API (PLUGIN_API_VER = 10)
+    ------------------------------------------------------------------
+
+    Open Ephys plugin entry point for the SpikeSpy Streamer processor.
+
+    Targets the Open Ephys GUI v1.x plugin API (PLUGIN_API_VER 10).
+    The getLibInfo/getPluginInfo signatures and struct layouts must match
+    Source/Processors/PluginManager/OpenEphysPlugin.h in the GUI.
+
+    ------------------------------------------------------------------
 */
 
-#include "SpikeSpyStreamer.h"
-#include <string>
+#include <PluginInfo.h>
 
-#ifndef PLUGIN_API_VER
-#define PLUGIN_API_VER 10
+#include "SpikeSpyStreamer.h"
+
+#ifdef _WIN32
+#include <Windows.h>
+#define PLUGIN_EXPORT __declspec (dllexport)
+#else
+#define PLUGIN_EXPORT __attribute__ ((visibility ("default")))
 #endif
 
-namespace Plugin
+#define NUM_PLUGINS 1
+
+extern "C" PLUGIN_EXPORT void getLibInfo (Plugin::LibraryInfo* info)
 {
-    enum Type
-    {
-        PROCESSOR = 0,
-        RECORD_ENGINE,
-        DATA_THREAD,
-        FILE_SOURCE
-    };
-
-    struct PluginInfo
-    {
-        Type type;
-        const char* name;
-        const char* description;
-        const char* creator;
-        float version;
-        void* (*creatorFunction)();
-    };
-
-    struct LibraryInfo
-    {
-        int apiVersion;
-        const char* name;
-        const char* version;
-        int numPlugins;
-    };
+    info->apiVersion = PLUGIN_API_VER;
+    info->name = "SpikeSpy";
+    info->libVersion = "1.0.0";
+    info->numPlugins = NUM_PLUGINS;
 }
 
-static void* createSpikeSpyStreamer()
+extern "C" PLUGIN_EXPORT int getPluginInfo (int index, Plugin::PluginInfo* info)
 {
-    return new SpikeSpyStreamer();
-}
-
-extern "C"
-{
-    /**
-     * Called by Open Ephys PluginManager to verify API compatibility
-     */
-    void getLibInfo(Plugin::LibraryInfo* info)
+    switch (index)
     {
-        info->apiVersion = PLUGIN_API_VER;
-        info->name = "SpikeSpy Streamer Plugin";
-        info->version = "1.0.0";
-        info->numPlugins = 1;
-    }
-
-    /**
-     * Returns metadata and creator function for the SpikeSpyStreamer processor plugin
-     */
-    int getPluginInfo(int index, Plugin::PluginInfo* info)
-    {
-        if (index == 0)
-        {
+        case 0:
             info->type = Plugin::PROCESSOR;
-            info->name = "SpikeSpy Streamer";
-            info->description = "Real-time stimulus-locked ERP slicer and ZeroMQ streamer for SpikeSpy";
-            info->creator = "SpikeSpy Team";
-            info->version = 1.0f;
-            info->creatorFunction = &createSpikeSpyStreamer;
+            info->processor.name = "SpikeSpy Streamer";
+            info->processor.type = Plugin::Processor::FILTER;
+            info->processor.creator = &(Plugin::createProcessor<SpikeSpyStreamer>);
             return 0;
-        }
-        return -1;
+        default:
+            return -1;
     }
 }
+
+#ifdef _WIN32
+BOOL WINAPI DllMain (IN HINSTANCE hInst, IN DWORD reason, IN LPVOID reserved)
+{
+    return TRUE;
+}
+#endif
