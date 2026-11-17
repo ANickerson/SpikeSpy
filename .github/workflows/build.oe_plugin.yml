@@ -89,11 +89,39 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          cmake --version
+          Write-Host "cmake executable: $((Get-Command cmake).Source)"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = $null
+          if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
+          }
+          Write-Host "vswhere detected Visual Studio: $vsPath"
+          if (-not $vsPath -and (Test-Path "C:\Program Files\Microsoft Visual Studio\2022\Enterprise")) {
+            $vsPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+            Write-Host "Falling back to well-known VS install path: $vsPath"
+          }
+          if (-not $vsPath) { throw "No Visual Studio instance with VC tools was detected" }
+
           cmake -S oe_plugin -B build/oe_plugin `
             -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_GENERATOR_INSTANCE="$($vsPath -replace '\\', '/')" `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows `
             -DZMQ_ROOT="$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows"
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "VS generator configure failed; falling back to Ninja with an explicit dev environment"
+            Remove-Item build/oe_plugin -Recurse -Force -ErrorAction SilentlyContinue
+            Import-Module "$vsPath\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+            Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdParameters "-arch=x64 -host_arch=x64"
+            Write-Host "cl.exe: $((Get-Command cl -ErrorAction SilentlyContinue).Source)"
+            cmake -S oe_plugin -B build/oe_plugin -G Ninja -DCMAKE_BUILD_TYPE=Release `
+              -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+              -DVCPKG_TARGET_TRIPLET=x64-windows `
+              -DZMQ_ROOT="$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows"
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Configure (Linux)
         if: runner.os == 'Linux'
@@ -119,7 +147,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force staging | Out-Null
-          Copy-Item "build/oe_plugin/Release/SpikeSpyStreamer.dll" staging/
+          $plugin = "build/oe_plugin/Release/SpikeSpyStreamer.dll"
+          if (-not (Test-Path $plugin)) { $plugin = "build/oe_plugin/SpikeSpyStreamer.dll" }
+          if (-not (Test-Path $plugin)) { throw "SpikeSpyStreamer.dll was not built" }
+          Copy-Item $plugin staging/
           Copy-Item "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*zmq*.dll" staging/
           Get-ChildItem staging
 
