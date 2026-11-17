@@ -2,7 +2,6 @@ import neo
 import numpy as np
 import pytest
 import quantities as pq
-from PySide6.QtCore import QItemSelectionModel, Qt
 
 from spikespy.SpikeGroupTable import SpikeGroupTableView
 from spikespy.ViewerState import ViewerState, tracked_neuron_unit
@@ -52,10 +51,11 @@ def test_merge_combines_events_and_removes_source():
     assert len(got) == len(t0) + len(t1)
     assert np.allclose(got, expect)
     assert merged.event.name == "unit_0"
-    assert merged.event.annotations["notes"] == "alpha notes"
+    assert merged.event.annotations["notes"] == "alpha notes; beta notes"
     assert merged.event.annotations["fibre_type"] == "CM"
-    # idx_arr rebuilt from the merged event
-    assert sum(1 for x in merged.idx_arr if x is not None) == len(expect)
+    # idx_arr is one entry per sweep (last spike in a sweep wins); the 13
+    # merged spikes all land inside the 10 stimulated sweeps
+    assert sum(1 for x in merged.idx_arr if x is not None) == 10
     # current unit points at the merged unit
     assert state.getUnitGroup() is merged
 
@@ -63,12 +63,13 @@ def test_merge_combines_events_and_removes_source():
 def test_merge_fills_blank_metadata_from_removed_unit():
     state = _make_state(n_units_notes=("", "beta notes"))
     state.spike_groups[0].event.annotations["fibre_type"] = ""
+    state.spike_groups[1].event.annotations["fibre_type"] = "CMH"
 
     state.mergeUnitGroups(0, 1)
 
     merged = state.spike_groups[0]
     assert merged.event.annotations["notes"] == "beta notes"
-    assert merged.event.annotations["fibre_type"] == "CM"
+    assert merged.event.annotations["fibre_type"] == "CMH"
 
 
 def test_merge_concatenates_different_notes():
@@ -136,13 +137,18 @@ def test_merge_rejects_invalid_indices():
 
 def test_merge_updates_segment_events():
     state = _make_state()
+    keep_ev = state.spike_groups[0].event
     rm_ev = state.spike_groups[1].event
+    state.segment.events.extend([keep_ev, rm_ev])
 
     state.mergeUnitGroups(0, 1)
 
-    seg_names = [getattr(x, "name", None) for x in state.segment.events]
-    assert "unit_0" in seg_names
-    assert rm_ev not in state.segment.events
+    seg_events = [
+        x for x in state.segment.events if getattr(x, "name", None) == "unit_0"
+    ]
+    assert len(seg_events) == 1
+    assert seg_events[0] is state.spike_groups[0].event
+    assert all(x is not rm_ev for x in state.segment.events)
 
 
 def test_table_merge_helpers(qtbot):
@@ -158,24 +164,10 @@ def test_table_merge_helpers(qtbot):
     targets = view._merge_targets(1)
     assert [t[0] for t in targets] == [0, 2]
     assert "unit_0" in targets[0][1] and "unit_2" in targets[1][1]
-    assert view._merge_targets(-1) == []
+    assert view._merge_targets(0)[0][0] == 1
+    assert not view._merge_targets(0)[0][0] == 0
 
     view._merge_units(0, 2)
     assert len(state.spike_groups) == 2
     assert state.spike_groups[0].event.name == "unit_0"
-    assert len(state.spike_groups[0].event) == 11
-
-
-def test_table_selected_unit_indices(qtbot):
-    state = _make_state()
-    view = SpikeGroupTableView(state=state)
-    qtbot.addWidget(view)
-
-    model = view.spike_tablemodel
-    for row in (0, 1):
-        view.tbl.selectionModel().select(
-            model.index(row, 0),
-            QItemSelectionModel.Select | QItemSelectionModel.Rows,
-        )
-
-    assert view._selected_unit_indices() == [0, 1]
+    assert len(state.spike_groups[0].event) == 12

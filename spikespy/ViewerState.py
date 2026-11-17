@@ -2017,7 +2017,11 @@ class ViewerState(QObject):
         merged unit or -1 on failure.
         """
         n = len(self.spike_groups)
-        if not (0 <= keep_idx < n) or not (0 <= remove_idx < n) or keep_idx == remove_idx:
+        if (
+            not (0 <= keep_idx < n)
+            or not (0 <= remove_idx < n)
+            or keep_idx == remove_idx
+        ):
             return -1
         keep_sg = self.spike_groups[keep_idx]
         rm_sg = self.spike_groups[remove_idx]
@@ -2040,8 +2044,12 @@ class ViewerState(QObject):
             anns["notes"] = f"{keep_notes}; {rm_notes}"
         elif rm_notes:
             anns["notes"] = rm_notes
-        keep_ft = str(anns.get("fibre_type", "") or getattr(keep_sg, "fibre_type", "") or "")
-        rm_ft = str(rm_anns.get("fibre_type", "") or getattr(rm_sg, "fibre_type", "") or "")
+        keep_ft = str(
+            anns.get("fibre_type", "") or getattr(keep_sg, "fibre_type", "") or ""
+        )
+        rm_ft = str(
+            rm_anns.get("fibre_type", "") or getattr(rm_sg, "fibre_type", "") or ""
+        )
         if not keep_ft and rm_ft:
             anns["fibre_type"] = rm_ft
         new_event = Event(
@@ -2053,7 +2061,9 @@ class ViewerState(QObject):
 
         old_groups = list(self.spike_groups)
         old_keep_ev = keep_ev
-        old_keep_idx_arr = list(keep_sg.idx_arr) if keep_sg.idx_arr is not None else None
+        old_keep_idx_arr = (
+            list(keep_sg.idx_arr) if keep_sg.idx_arr is not None else None
+        )
         old_rm_ev = rm_sg.event
         old_rm_idx_arr = list(rm_sg.idx_arr) if rm_sg.idx_arr is not None else None
         old_cur = int(self.cur_spike_group)

@@ -273,15 +273,6 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
         merge_items = self._merge_targets(unit_idx)
         if merge_items:
             menu.addSeparator()
-            selected_units = self._selected_unit_indices()
-            if unit_idx in selected_units and len(selected_units) == 2:
-                other = next(i for i in selected_units if i != unit_idx)
-                act_merge_sel = menu.addAction(
-                    f"Merge Selected Units (keep Unit {unit_idx})"
-                )
-                act_merge_sel.triggered.connect(
-                    lambda checked=False, keep=unit_idx, rm=other: self._merge_units(keep, rm)
-                )
             menu_merge = menu.addMenu(f"Merge Unit {unit_idx} Into...")
             for other_idx, label in merge_items:
                 menu_merge.addAction(
@@ -420,15 +411,6 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
         return [
             (i, self._unit_label(i)) for i in range(len(groups)) if i != exclude_idx
         ]
-
-    def _selected_unit_indices(self) -> List[int]:
-        selection = self.tbl.selectionModel().selectedRows() if self.tbl.selectionModel() else []
-        indices = []
-        for r in selection:
-            item = self.spike_tablemodel.row_to_item(r.row())
-            if item is not None and item[0] == "unit":
-                indices.append(int(item[1]))
-        return indices
 
     def _merge_units(self, keep_idx: int, remove_idx: int):
         if self.state is None or not hasattr(self.state, "mergeUnitGroups"):
