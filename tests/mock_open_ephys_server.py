@@ -144,7 +144,16 @@ class MockOpenEphysHTTPHandler(BaseHTTPRequestHandler):
                 {"timestamp": time.time(), "processor_id": proc_id, "config": config_text}
             )
             logger.info("Mock Open Ephys processor %d received config: %s", proc_id, config_text)
-            self._send_json(200, {"status": "ok", "processor_id": proc_id, "applied": config_text})
+            resp = {"status": "ok", "processor_id": proc_id, "applied": config_text}
+            try:
+                cmd_dict = json.loads(config_text)
+                if cmd_dict.get("command") == "ping":
+                    resp["plugin"] = "SpikeSpyStreamer"
+                    resp["sweeps_sent"] = self.server.parent_server._stim_count if self.server.parent_server else 0
+                    resp["client"] = cmd_dict.get("client", "SpikeSpy")
+            except Exception:
+                pass
+            self._send_json(200, resp)
 
         else:
             self._send_json(404, {"error": "Not found"})
@@ -191,11 +200,13 @@ class MockOpenEphysServer:
         adc_channel: Optional[int] = None,
         num_units: Optional[int] = None,
         unit_configs: Optional[List[Dict[str, Any]]] = None,
+        heartbeat_port: Optional[int] = None,
     ):
         self.host = host
         self.data_port = data_port
         self.event_port = event_port
         self.http_port = http_port
+        self.heartbeat_port = heartbeat_port
         self.sample_rate = sample_rate
         self.adc_channel = adc_channel
 
@@ -223,6 +234,7 @@ class MockOpenEphysServer:
         self._thread: Optional[threading.Thread] = None
         self._httpd: Optional[MockOpenEphysServerHTTPServer] = None
         self._http_thread: Optional[threading.Thread] = None
+        self._hb_thread: Optional[threading.Thread] = None
 
         # Simulation state
         self._sample_counter = 0
@@ -289,6 +301,48 @@ class MockOpenEphysServer:
         self._thread = threading.Thread(target=self._run_zmq, daemon=True)
         self._thread.start()
 
+        # 3. Start Heartbeat REP Thread if configured
+        if self.heartbeat_port is not None:
+            self._hb_thread = threading.Thread(target=self._run_heartbeat, daemon=True)
+            self._hb_thread.start()
+
+    def _run_heartbeat(self):
+        context = zmq.Context()
+        rep_sock = context.socket(zmq.REP)
+        rep_sock.setsockopt(zmq.LINGER, 0)
+        rep_sock.setsockopt(zmq.RCVTIMEO, 500)
+        rep_sock.setsockopt(zmq.SNDTIMEO, 500)
+        try:
+            rep_sock.bind(f"tcp://{self.host}:{self.heartbeat_port}")
+            while self._running:
+                try:
+                    msg = rep_sock.recv_string()
+                    data = {}
+                    try:
+                        data = json.loads(msg)
+                    except Exception:
+                        pass
+                    client = data.get("client", "SpikeSpy")
+                    resp = json.dumps({
+                        "status": "ok",
+                        "plugin": "SpikeSpyStreamer",
+                        "client": client,
+                        "sweeps_sent": self._stim_count,
+                        "timestamp": time.time(),
+                    })
+                    rep_sock.send_string(resp)
+                except zmq.Again:
+                    continue
+                except Exception as ex:
+                    if not self._running:
+                        break
+                    logger.debug("Heartbeat REP exception: %s", ex)
+        except Exception as e:
+            logger.debug("Failed to bind heartbeat REP socket on %s: %s", self.heartbeat_port, e)
+        finally:
+            rep_sock.close(linger=0)
+            context.term()
+
     def is_running(self) -> bool:
         return self._running
 
@@ -303,6 +357,10 @@ class MockOpenEphysServer:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+
+        if self._hb_thread is not None:
+            self._hb_thread.join(timeout=2.0)
+            self._hb_thread = None
 
     @property
     def received_messages(self) -> List[Dict[str, Any]]:

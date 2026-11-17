@@ -203,6 +203,31 @@ class OpenEphysController(QObject):
             return resp
         return {"status": "ok" if success else "error", "response": resp}
 
+    def find_spikespy_streamer_processor(self) -> Optional[int]:
+        """Find the SpikeSpy Streamer processor ID in the Open Ephys signal chain.
+
+        Returns:
+            Processor ID integer if found, None otherwise.
+        """
+        procs = self.get_processors()
+        for p in procs:
+            p_name = str(p.get("name", "")).lower()
+            p_type = str(p.get("type", "")).lower()
+            if "spikespy" in p_name or "spikespy" in p_type:
+                return p.get("id")
+        return None
+
+    def ping_processor(self, processor_id: int) -> tuple[bool, Dict[str, Any]]:
+        """Send a heartbeat ping to a specific processor via its config endpoint."""
+        code, resp = self._http_request(
+            "PUT",
+            f"/api/processors/{processor_id}/config",
+            {"text": json.dumps({"command": "ping", "client": "SpikeSpy"})},
+            timeout_override=0.5,
+        )
+        success = code in (200, 204)
+        return success, resp if isinstance(resp, dict) else {"response": resp}
+
     @Slot(dict)
     def sync_unit_annotation(self, annotation_info: Dict[str, Any]) -> bool:
         """Slot to synchronize a unit annotation event to Open Ephys.

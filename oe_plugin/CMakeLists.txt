@@ -54,7 +54,9 @@ set_property(DIRECTORY APPEND PROPERTY COMPILE_DEFINITIONS
 add_library(SpikeSpyStreamer SHARED
     Source/OpenEphysLib.cpp
     Source/SpikeSpyStreamer.cpp
-    Source/SpikeSpyStreamer.h)
+    Source/SpikeSpyStreamer.h
+    Source/SpikeSpyStreamerEditor.cpp
+    Source/SpikeSpyStreamerEditor.h)
 
 target_compile_features(SpikeSpyStreamer PRIVATE cxx_std_17)
 

@@ -174,12 +174,27 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           mkdir -p staging
-          PLUGIN_BIN="build/oe_plugin/SpikeSpyStreamer.bundle/Contents/MacOS/SpikeSpyStreamer"
-          OLD_ID="$(otool -L "$PLUGIN_BIN" | awk '/libzmq/{print $1; exit}')"
-          cp -L "$(brew --prefix zeromq)/lib/libzmq.5.dylib" staging/
-          install_name_tool -change "$OLD_ID" "@loader_path/../../libzmq.5.dylib" "$PLUGIN_BIN"
-          codesign --force --sign - build/oe_plugin/SpikeSpyStreamer.bundle
-          cp -R build/oe_plugin/SpikeSpyStreamer.bundle staging/
+          PLUGIN_BUNDLE="build/oe_plugin/SpikeSpyStreamer.bundle"
+          if [ -d "$PLUGIN_BUNDLE" ]; then
+            PLUGIN_BIN="$PLUGIN_BUNDLE/Contents/MacOS/SpikeSpyStreamer"
+            OLD_ID="$(otool -L "$PLUGIN_BIN" | awk '/libzmq/{print $1; exit}')"
+            cp -L "$(brew --prefix zeromq)/lib/libzmq.5.dylib" staging/
+            if [ -n "$OLD_ID" ]; then
+              install_name_tool -change "$OLD_ID" "@loader_path/../../libzmq.5.dylib" "$PLUGIN_BIN"
+            fi
+            codesign --force --sign - "$PLUGIN_BUNDLE"
+            cp -R "$PLUGIN_BUNDLE" staging/
+          else
+            PLUGIN_DYLIB="$(find build -name "SpikeSpyStreamer.dylib" | head -n 1)"
+            OLD_ID="$(otool -L "$PLUGIN_DYLIB" | awk '/libzmq/{print $1; exit}')"
+            cp -L "$(brew --prefix zeromq)/lib/libzmq.5.dylib" staging/
+            if [ -n "$OLD_ID" ]; then
+              install_name_tool -change "$OLD_ID" "@loader_path/libzmq.5.dylib" "$PLUGIN_DYLIB"
+            fi
+            codesign --force --sign - "$PLUGIN_DYLIB"
+            cp "$PLUGIN_DYLIB" staging/
+          fi
+          ls -la staging
 
       - name: Write install instructions
         shell: bash

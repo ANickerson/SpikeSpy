@@ -70,6 +70,7 @@ class OpenEphysLiveView(QWidget):
         self._perf_timer.setInterval(500)
         self._perf_timer.timeout.connect(self._update_perf_diagnostics)
         self._perf_timer.start()
+        self._diag_tick = 0
         self._last_synced_annotation_key = None
         self._syncing_follow_live = False
 
@@ -341,8 +342,14 @@ class OpenEphysLiveView(QWidget):
         diag_group = QGroupBox("Diagnostics & Live Metrics")
         diag_layout = QFormLayout(diag_group)
 
-        self.lbl_status = QLabel("Disconnected")
+        self.lbl_status = QLabel("○ Disconnected")
         self.lbl_status.setStyleSheet("color: gray; font-weight: bold;")
+
+        self.lbl_oe_gui_status = QLabel("○ Disconnected")
+        self.lbl_oe_gui_status.setStyleSheet("color: gray; font-weight: bold;")
+
+        self.lbl_plugin_detected = QLabel("Not detected")
+        self.lbl_plugin_detected.setStyleSheet("color: gray;")
 
         self.lbl_sweeps_count = QLabel("0")
         self.lbl_spikes_count = QLabel("0")
@@ -350,7 +357,9 @@ class OpenEphysLiveView(QWidget):
         self.lbl_ui_perf = QLabel("Normal (0.0 ms lag)")
         self.lbl_ui_perf.setStyleSheet("color: #2b7a2b;")
 
-        diag_layout.addRow("Status:", self.lbl_status)
+        diag_layout.addRow("Stream Status:", self.lbl_status)
+        diag_layout.addRow("Open Ephys GUI:", self.lbl_oe_gui_status)
+        diag_layout.addRow("Streamer Plugin:", self.lbl_plugin_detected)
         diag_layout.addRow("Sweeps Received:", self.lbl_sweeps_count)
         diag_layout.addRow("Spikes Detected:", self.lbl_spikes_count)
         diag_layout.addRow("Stimulus Frequency:", self.lbl_stim_freq)
@@ -569,11 +578,12 @@ class OpenEphysLiveView(QWidget):
         target_pid = self.spin_target_proc.value()
         self.controller.target_processor_id = target_pid if target_pid > 0 else None
 
+        hb_port = event_port if is_sliced else None
         self.worker = OpenEphysStreamWorker(
             host=host,
             data_port=data_port,
             event_port=event_port,
-            heartbeat_port=event_port,
+            heartbeat_port=hb_port,
             mode=mode,
             rec_channel=self.spin_rec_chan.value(),
             active_channels=active_chans,
@@ -616,6 +626,8 @@ class OpenEphysLiveView(QWidget):
         self.btn_toggle_stream.setStyleSheet(
             "background-color: #d9534f; color: white; font-weight: bold; padding: 6px;"
         )
+        self.lbl_status.setText(f"◌ Connecting ({host}:{data_port})...")
+        self.lbl_status.setStyleSheet("color: #d9822b; font-weight: bold;")
 
     def stop_stream(self):
         self._cancel_replay()
@@ -634,10 +646,10 @@ class OpenEphysLiveView(QWidget):
         )
         if sweeps_count > 0:
             self.btn_toggle_stream.setText("Resume Live Stream")
-            self.lbl_status.setText(f"Stopped ({sweeps_count} sweeps recorded)")
+            self.lbl_status.setText(f"○ Stopped ({sweeps_count} sweeps recorded)")
         else:
             self.btn_toggle_stream.setText("Start Live Stream")
-            self.lbl_status.setText("Stopped")
+            self.lbl_status.setText("○ Stopped")
         self.btn_toggle_stream.setStyleSheet("font-weight: bold; padding: 6px;")
         self.lbl_status.setStyleSheet("color: gray; font-weight: bold;")
 
@@ -681,7 +693,7 @@ class OpenEphysLiveView(QWidget):
         self.lbl_spikes_count.setText("0")
         self.lbl_stim_freq.setText("0.0 Hz")
         self.btn_toggle_stream.setText("Start Live Stream")
-        self.lbl_status.setText("Ready (New Session)")
+        self.lbl_status.setText("○ Ready (New Session)")
         self.lbl_status.setStyleSheet("color: gray; font-weight: bold;")
 
     # -------------------------------------------------------------
@@ -1545,6 +1557,22 @@ class OpenEphysLiveView(QWidget):
         freq = stats.get("last_stim_freq_hz", 0.0)
         self.lbl_stim_freq.setText(f"{freq:.2f} Hz")
 
+        plugin_conn = stats.get("plugin_connected", False)
+        plugin_info = stats.get("plugin_info")
+        if plugin_conn:
+            if plugin_info and isinstance(plugin_info, dict):
+                p_name = plugin_info.get("plugin", "SpikeSpy Streamer")
+                sweeps = plugin_info.get("sweeps_sent", "")
+                sweeps_str = f" ({sweeps} sweeps sent)" if sweeps != "" else ""
+                self.lbl_plugin_detected.setText(f"● {p_name}{sweeps_str}")
+                self.lbl_plugin_detected.setStyleSheet("color: #2b7a2b; font-weight: bold;")
+            elif "Detected" not in self.lbl_plugin_detected.text() and "SpikeSpy" not in self.lbl_plugin_detected.text():
+                self.lbl_plugin_detected.setText("● Connected")
+                self.lbl_plugin_detected.setStyleSheet("color: #2b7a2b; font-weight: bold;")
+        elif not self._is_streaming and self.controller and self.controller.get_status() == "DISCONNECTED":
+            self.lbl_plugin_detected.setText("○ Disconnected")
+            self.lbl_plugin_detected.setStyleSheet("color: gray;")
+
     @Slot()
     def _update_perf_diagnostics(self):
         watchdog = getattr(self.state, "ui_watchdog", None)
@@ -1576,6 +1604,18 @@ class OpenEphysLiveView(QWidget):
                 f"Normal (render {render_ms:.1f}ms, lag {lag_ms:.1f}ms)"
             )
             self.lbl_ui_perf.setStyleSheet("color: #2b7a2b;")
+
+        self._diag_tick = getattr(self, "_diag_tick", 0) + 1
+        # Periodically check Open Ephys GUI status and auto-discover plugin (every 2.0s / 4 ticks)
+        if self._diag_tick % 4 == 0 and self.controller is not None:
+            oe_status = self.controller.get_status()
+            if oe_status != "DISCONNECTED":
+                if self.spin_target_proc.value() == 0:
+                    found_id = self.controller.find_spikespy_streamer_processor()
+                    if found_id is not None:
+                        self.spin_target_proc.setValue(found_id)
+                        self.lbl_plugin_detected.setText(f"● SpikeSpy Streamer (ID {found_id})")
+                        self.lbl_plugin_detected.setStyleSheet("color: #2b7a2b; font-weight: bold;")
 
     @Slot()
     def _show_ui_diagnostics_dialog(self):
@@ -1634,11 +1674,15 @@ class OpenEphysLiveView(QWidget):
     @Slot(bool, str)
     def _on_connection_status_changed(self, connected: bool, message: str):
         if connected:
-            self.lbl_status.setText("Streaming (Connected)")
-            self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
+            self.lbl_status.setText(f"● Connected ({message})")
+            self.lbl_status.setStyleSheet("color: #2b7a2b; font-weight: bold;")
         else:
-            self.lbl_status.setText(f"Disconnected ({message})")
-            self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
+            if self._is_streaming:
+                self.lbl_status.setText(f"◌ Waiting ({message})")
+                self.lbl_status.setStyleSheet("color: #d9822b; font-weight: bold;")
+            else:
+                self.lbl_status.setText(f"○ Disconnected ({message})")
+                self.lbl_status.setStyleSheet("color: gray; font-weight: bold;")
 
     @Slot(int)
     def _on_data_port_changed(self, new_data_port: int):
@@ -1677,10 +1721,21 @@ class OpenEphysLiveView(QWidget):
             )
             return
 
-        lines = [
-            f"ID {p.get('id')}: {p.get('name', 'Processor')} ({p.get('type', '')})"
-            for p in procs
-        ]
+        found_streamer = None
+        lines = []
+        for p in procs:
+            p_id = p.get("id")
+            p_name = p.get("name", "Processor")
+            p_type = p.get("type", "")
+            lines.append(f"ID {p_id}: {p_name} ({p_type})")
+            if "spikespy" in str(p_name).lower() or "spikespy" in str(p_type).lower():
+                found_streamer = p_id
+
+        if found_streamer is not None and self.spin_target_proc.value() == 0:
+            self.spin_target_proc.setValue(found_streamer)
+            self.lbl_plugin_detected.setText(f"● SpikeSpy Streamer (ID {found_streamer})")
+            self.lbl_plugin_detected.setStyleSheet("color: #2b7a2b; font-weight: bold;")
+
         QMessageBox.information(
             self,
             "Open Ephys Signal Chain",
@@ -1703,8 +1758,17 @@ class OpenEphysLiveView(QWidget):
     def _on_oe_status_changed(self, status: str):
         if status in ("ACQUIRE", "RECORD"):
             self.btn_toggle_oe_acq.setText("Stop OE Acquisition")
+            color = "#2b7a2b" if status == "ACQUIRE" else "#d9534f"
+            self.lbl_oe_gui_status.setText(f"● {status}")
+            self.lbl_oe_gui_status.setStyleSheet(f"color: {color}; font-weight: bold;")
+        elif status == "IDLE":
+            self.btn_toggle_oe_acq.setText("Start OE Acquisition")
+            self.lbl_oe_gui_status.setText("◌ IDLE")
+            self.lbl_oe_gui_status.setStyleSheet("color: #d9822b; font-weight: bold;")
         else:
             self.btn_toggle_oe_acq.setText("Start OE Acquisition")
+            self.lbl_oe_gui_status.setText("○ Disconnected")
+            self.lbl_oe_gui_status.setStyleSheet("color: gray; font-weight: bold;")
 
     @Slot()
     def _send_stim_voltage(self):
