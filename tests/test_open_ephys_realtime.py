@@ -329,3 +329,116 @@ def test_realistic_microneurography_and_event_marker_alignment(qtbot):
         server.stop()
 
 
+def test_open_ephys_heartbeat_and_3part_packets(qtbot):
+    """Verify heartbeat is delivered on listening port and 3-part OE frames are parsed."""
+    import threading
+    import time
+    import zmq
+
+    ctx = zmq.Context()
+    # Mock listening REP socket on 5592
+    rep_sock = ctx.socket(zmq.REP)
+    rep_sock.setsockopt(zmq.RCVTIMEO, 1000)
+    rep_sock.setsockopt(zmq.LINGER, 0)
+    rep_sock.bind("tcp://127.0.0.1:5592")
+
+    # Mock data PUB socket on 5591
+    pub_sock = ctx.socket(zmq.PUB)
+    pub_sock.setsockopt(zmq.LINGER, 0)
+    pub_sock.bind("tcp://127.0.0.1:5591")
+
+    received_heartbeats = []
+    stop_event = threading.Event()
+
+    def rep_listener():
+        rep_poller = zmq.Poller()
+        rep_poller.register(rep_sock, zmq.POLLIN)
+        while not stop_event.is_set():
+            socks = dict(rep_poller.poll(50))
+            if rep_sock in socks:
+                try:
+                    msg = rep_sock.recv_string(zmq.NOBLOCK)
+                    received_heartbeats.append(msg)
+                    rep_sock.send_string('{"status": "ok"}')
+                except Exception:
+                    break
+
+    t = threading.Thread(target=rep_listener, daemon=True)
+    t.start()
+
+    from spikespy.open_ephys_addin.oe_stream_worker import OpenEphysStreamWorker
+    worker = OpenEphysStreamWorker(
+        host="127.0.0.1",
+        data_port=5591,
+        event_port=5592,
+        heartbeat_port=5592,
+        mode="zmq_raw",
+        apply_filter=False,
+        window_ms=100.0,
+        pre_stim_ms=10.0,
+        sample_rate=30000.0,
+    )
+
+    sweeps = []
+    worker.sweepsReady.connect(sweeps.extend)
+    worker.start()
+
+    try:
+        # Wait for heartbeat to arrive at REP socket (proves connection established)
+        qtbot.waitUntil(lambda: len(received_heartbeats) > 0, timeout=3000)
+        hb_data = json.loads(received_heartbeats[0])
+        assert hb_data.get("type") == "heartbeat"
+        assert hb_data.get("application") == "SpikeSpy"
+
+        # Give SUB socket a brief moment to complete subscription handshake
+        import time
+        time.sleep(0.1)
+
+        # Now test 3-part frame delivery: [b"data", header_json, buffer]
+        hdr = json.dumps({
+            "stream": "continuous",
+            "channel_count": 1,
+            "sample_rate": 30000.0,
+            "sample_num": 0,
+            "num_samples": 6000,
+            "dtype": "float32",
+        }).encode("utf-8")
+        data_chunk = np.ones((1, 6000), dtype=np.float32).tobytes()
+
+        # Send 3-part data frame
+        pub_sock.send_multipart([b"data", hdr, data_chunk])
+
+        # Also send a TTL event trigger on data socket
+        evt_hdr = json.dumps({
+            "stream": "events",
+            "type": "ttl",
+            "sample_num": 1500,
+        }).encode("utf-8")
+        evt_buf = bytes([1, 1, 0, 0, 0, 0, 0, 0, 0, 0])  # line 1, state 1
+        pub_sock.send_multipart([b"event", evt_hdr, evt_buf])
+
+        # Send second continuous chunk so pending sweep can complete
+        hdr2 = json.dumps({
+            "stream": "continuous",
+            "channel_count": 1,
+            "sample_rate": 30000.0,
+            "sample_num": 6000,
+            "num_samples": 6000,
+            "dtype": "float32",
+        }).encode("utf-8")
+        pub_sock.send_multipart([b"data", hdr2, data_chunk])
+
+        qtbot.waitUntil(lambda: len(sweeps) > 0, timeout=3000)
+        assert len(sweeps) >= 1
+        assert sweeps[0]["stim_timestamp_s"] == 1500 / 30000.0
+
+    finally:
+        stop_event.set()
+        worker.stop()
+        t.join(timeout=1.0)
+        rep_sock.close(linger=0)
+        pub_sock.close(linger=0)
+        ctx.term()
+
+
+

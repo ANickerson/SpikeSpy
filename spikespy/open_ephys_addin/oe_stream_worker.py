@@ -438,24 +438,27 @@ class OpenEphysStreamWorker(QThread):
             data_sub.connect(data_url)
             poller.register(data_sub, zmq.POLLIN)
 
-            # 2. Setup Event Socket (if different port or zmq_raw mode)
+            # 2. Setup Event Socket & Heartbeat Socket (if zmq_raw mode)
             if self.mode == "zmq_raw":
-                event_sub = context.socket(zmq.SUB)
-                event_sub.setsockopt_string(zmq.SUBSCRIBE, "")
-                event_sub.setsockopt(zmq.RCVTIMEO, 500)
-                event_sub.setsockopt(zmq.LINGER, 0)
-                event_url = f"tcp://{self.host}:{self.event_port}"
-                event_sub.connect(event_url)
-                poller.register(event_sub, zmq.POLLIN)
-
-                # Heartbeat REQ socket for Open Ephys ZMQ Interface (only if separate port)
-                if self.heartbeat_port and self.heartbeat_port != self.event_port and self.heartbeat_port != self.data_port:
+                # Heartbeat REQ socket for Open Ephys ZMQ Interface (listening port: heartbeat_port or event_port or data_port + 1)
+                hb_port = self.heartbeat_port or self.event_port or (self.data_port + 1)
+                if hb_port and hb_port != self.data_port:
                     heartbeat_req = context.socket(zmq.REQ)
                     heartbeat_req.setsockopt(zmq.RCVTIMEO, 500)
                     heartbeat_req.setsockopt(zmq.SNDTIMEO, 500)
                     heartbeat_req.setsockopt(zmq.LINGER, 0)
-                    heartbeat_req.connect(f"tcp://{self.host}:{self.heartbeat_port}")
+                    heartbeat_req.connect(f"tcp://{self.host}:{hb_port}")
                     poller.register(heartbeat_req, zmq.POLLIN)
+
+                # Event SUB socket: also subscribe to event_port for Event Broadcaster
+                if self.event_port and self.event_port != self.data_port:
+                    event_sub = context.socket(zmq.SUB)
+                    event_sub.setsockopt_string(zmq.SUBSCRIBE, "")
+                    event_sub.setsockopt(zmq.RCVTIMEO, 500)
+                    event_sub.setsockopt(zmq.LINGER, 0)
+                    event_url = f"tcp://{self.host}:{self.event_port}"
+                    event_sub.connect(event_url)
+                    poller.register(event_sub, zmq.POLLIN)
 
             self.connectionStatusChanged.emit(True, f"Connected to {self.host}:{self.data_port}")
             logger.info("OpenEphysStreamWorker connected to %s (mode=%s)", self.host, self.mode)
@@ -660,60 +663,107 @@ class OpenEphysStreamWorker(QThread):
             logger.error("Failed to parse sliced ERP packet: %s", e)
 
     def _parse_raw_zmq_data_packet(self, parts: List[bytes]):
-        """Parse continuous multi-channel raw stream from Open Ephys ZMQ Interface."""
+        """Parse continuous multi-channel raw stream or events from Open Ephys ZMQ Interface."""
         try:
-            # Open Ephys ZMQ Interface protocol:
-            # Frame 0: JSON header {
-            #   "stream": "continuous", "channel_count": N, "sample_rate": 30000.0,
-            #   "sample_number": S, "num_samples": M, "type": "continuous"
-            # }
-            # Frame 1: Raw binary buffer (float32 or int16 interleaved samples)
-            if len(parts) >= 2 and parts[0].startswith(b"{"):
-                meta = json.loads(parts[0].decode("utf-8"))
-                buf = parts[1]
-                n_chans = int(meta.get("channel_count", meta.get("channels", 1)))
-                n_samples = int(meta.get("num_samples", meta.get("sample_count", len(buf) // (4 * n_chans))))
-                start_sample = int(meta.get("sample_number", meta.get("start_sample", 0)))
-                sr = float(meta.get("sample_rate", self.sample_rate))
-                self.sample_rate = sr
+            # Open Ephys ZMQ Interface protocol sends:
+            # Case A (3 frames): [Envelope (e.g. b'data'), Header JSON, Binary Buffer]
+            # Case B (2 frames): [Header JSON, Binary Buffer]
+            # Case C (1 frame):  [Header JSON]
+            meta = None
+            meta_idx = -1
+            buf = None
+            envelope = ""
 
-                dtype_str = meta.get("dtype", "float32")
-                dt = np.float32 if "float" in dtype_str else np.int16
-                arr = np.frombuffer(buf, dtype=dt)
+            for i, p in enumerate(parts):
+                if p.startswith(b"{") and p.endswith(b"}"):
+                    try:
+                        meta = json.loads(p.decode("utf-8"))
+                        meta_idx = i
+                        if i > 0:
+                            envelope = parts[0].decode("utf-8", errors="ignore").strip().lower()
+                        if i + 1 < len(parts):
+                            buf = parts[i + 1]
+                        break
+                    except Exception:
+                        pass
 
-                if arr.size == n_chans * n_samples:
-                    data = arr.reshape((n_chans, n_samples))
-                    transposed = False
-                elif arr.size == n_samples * n_chans:
-                    data = arr.reshape((n_samples, n_chans))
-                    transposed = True
+            if meta is None:
+                if len(parts) >= 2 and parts[0].startswith(b"{"):
+                    meta = json.loads(parts[0].decode("utf-8"))
+                    buf = parts[1]
+                elif len(parts) == 1 and parts[0].startswith(b"{"):
+                    self._handle_event_json(parts[0])
+                    return
                 else:
                     return
 
-                # Convert int16 to microvolts if needed (single allocation, then in-place scale)
-                if dt == np.int16 and "bit_volts" in meta:
-                    data = data.astype(np.float32)
-                    data *= float(meta["bit_volts"])
-                if transposed:
-                    data = data.T
+            msg_type = (envelope or meta.get("type", meta.get("stream", "continuous"))).lower()
 
-                # Check analog TTL trigger if configured, using unfiltered samples
-                if self.trigger_source == "analog" and self.analog_trigger_channel < data.shape[0]:
-                    adc_data = data[self.analog_trigger_channel, :]
-                    triggers = self.analog_ttl_detector.process_chunk(adc_data, start_sample)
-                    for t_sample in triggers:
-                        self.queue_sweep_trigger(t_sample, t_sample / self.sample_rate)
+            # Check if this packet is an Event or Spike broadcast on the data socket
+            if "event" in msg_type or meta.get("type") == "ttl" or "line" in meta:
+                if buf is not None and len(buf) >= 2:
+                    # Open Ephys binary TTL: byte 0 = line, byte 1 = state (1 or 0)
+                    line = int(buf[0])
+                    state = int(buf[1])
+                    sample_num = int(meta.get("sample_num", meta.get("sample_number", 0)))
+                    ts = float(meta.get("timestamp", sample_num / self.sample_rate))
+                    if state == 1 and self.trigger_source == "ttl":
+                        self.queue_sweep_trigger(sample_num, ts)
+                else:
+                    self._handle_event_json(json.dumps(meta).encode("utf-8"))
+                return
 
-                # Filter the continuous stream exactly once per chunk (stateful, causal)
-                if self.apply_filter:
-                    data = self.bandpass_filter.process(data)
+            if "spike" in msg_type or meta.get("type") == "spike":
+                self._handle_event_json(json.dumps(meta).encode("utf-8"))
+                return
 
-                # Append to circular ring buffer (RingBuffer handles channel expansion thread-safely)
-                self.ring_buffer.append(data, start_sample)
+            # Continuous data handling
+            if buf is None:
+                return
 
-            elif len(parts) == 1 and parts[0].startswith(b"{"):
-                # Single json event frame
-                self._handle_event_json(parts[0])
+            n_chans = int(meta.get("channel_count", meta.get("channels", 1)))
+            n_samples = int(meta.get("num_samples", meta.get("sample_count", len(buf) // (4 * n_chans))))
+            start_sample = int(meta.get("sample_number", meta.get("start_sample", meta.get("sample_num", 0))))
+            sr = float(meta.get("sample_rate", self.sample_rate))
+            self.sample_rate = sr
+
+            dtype_str = meta.get("dtype", "float32")
+            dt = np.float32 if "float" in dtype_str else np.int16
+            arr = np.frombuffer(buf, dtype=dt)
+
+            if arr.size == n_chans * n_samples:
+                data = arr.reshape((n_chans, n_samples))
+                transposed = False
+            elif arr.size == n_samples * n_chans:
+                data = arr.reshape((n_samples, n_chans))
+                transposed = True
+            elif n_chans == 1 and arr.size == n_samples:
+                data = arr.reshape((1, n_samples))
+                transposed = False
+            else:
+                return
+
+            # Convert int16 to microvolts if needed (single allocation, then in-place scale)
+            if dt == np.int16 and "bit_volts" in meta:
+                data = data.astype(np.float32)
+                data *= float(meta["bit_volts"])
+            if transposed:
+                data = data.T
+
+            # Check analog TTL trigger if configured, using unfiltered samples
+            if self.trigger_source == "analog" and self.analog_trigger_channel < data.shape[0]:
+                adc_data = data[self.analog_trigger_channel, :]
+                triggers = self.analog_ttl_detector.process_chunk(adc_data, start_sample)
+                for t_sample in triggers:
+                    self.queue_sweep_trigger(t_sample, t_sample / self.sample_rate)
+
+            # Filter the continuous stream exactly once per chunk (stateful, causal)
+            if self.apply_filter:
+                data = self.bandpass_filter.process(data)
+
+            # Append to circular ring buffer (RingBuffer handles channel expansion thread-safely)
+            self.ring_buffer.append(data, start_sample)
+
         except Exception as e:
             logger.debug("Error parsing raw zmq data packet: %s", e)
 

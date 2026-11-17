@@ -114,6 +114,8 @@ class OpenEphysLiveView(QWidget):
         self.spin_data_port = QSpinBox()
         self.spin_data_port.setRange(1024, 65535)
         self.spin_data_port.setValue(5556)
+        self._prev_data_port = 5556
+        self.spin_data_port.valueChanged.connect(self._on_data_port_changed)
 
         self.spin_event_port = QSpinBox()
         self.spin_event_port.setRange(1024, 65535)
@@ -1613,6 +1615,14 @@ class OpenEphysLiveView(QWidget):
         else:
             self.lbl_status.setText(f"Disconnected ({message})")
             self.lbl_status.setStyleSheet("color: red; font-weight: bold;")
+
+    @Slot(int)
+    def _on_data_port_changed(self, new_data_port: int):
+        if not hasattr(self, "_prev_data_port"):
+            self._prev_data_port = 5556
+        if self.spin_event_port.value() == self._prev_data_port + 1:
+            self.spin_event_port.setValue(new_data_port + 1)
+        self._prev_data_port = new_data_port
 
     @Slot(int)
     def _on_rec_channel_changed(self, chan: int):
