@@ -57,7 +57,8 @@ jobs:
         run: |
           EXTRA_ARGS=""
           if [ "${{ runner.os }}" = "macOS" ]; then
-            EXTRA_ARGS="-DCMAKE_PREFIX_PATH=$(brew --prefix zeromq)"
+            ZMQ_PREFIX="$(brew --prefix zeromq)"
+            EXTRA_ARGS="-DCMAKE_PREFIX_PATH=$ZMQ_PREFIX -DZMQ_ROOT=$ZMQ_PREFIX"
           fi
           cmake -S oe_plugin -B build/oe_plugin -DCMAKE_BUILD_TYPE=Release $EXTRA_ARGS
 
@@ -66,7 +67,9 @@ jobs:
         shell: pwsh
         run: |
           cmake -S oe_plugin -B build/oe_plugin `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows `
+            -DZMQ_ROOT="$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows"
 
       - name: Build
         run: cmake --build build/oe_plugin --config Release
@@ -83,7 +86,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force staging | Out-Null
           Copy-Item "build/oe_plugin/Release/SpikeSpyStreamer.dll" staging/
-          Copy-Item "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/zmq*.dll" staging/
+          Copy-Item "$env:VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin/*zmq*.dll" staging/
 
       - uses: actions/upload-artifact@v4
         with:
