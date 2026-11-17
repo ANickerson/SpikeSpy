@@ -297,6 +297,7 @@ class OpenEphysStreamWorker(QThread):
     protocolEventReady = Signal(str, float, dict)
     statsUpdated = Signal(dict)
     connectionStatusChanged = Signal(bool, str)
+    debugEventEmitted = Signal(dict)
 
     def __init__(
         self,
@@ -338,6 +339,7 @@ class OpenEphysStreamWorker(QThread):
         self.filter_low = filter_low
         self.filter_high = filter_high
         self.sample_rate = sample_rate
+        self.auto_align_clock = True
 
         self._running = False
         self._pending_sweeps: List[PendingSweep] = []
@@ -418,6 +420,37 @@ class OpenEphysStreamWorker(QThread):
         self._pending_payloads = []
         self._last_sweep_flush = now
         self.sweepsReady.emit(payloads)
+
+    def force_trigger(self) -> bool:
+        """Manually force a sweep cut at current head to test slicing and rendering."""
+        latest_samp = self.ring_buffer.latest_sample
+        if latest_samp is None:
+            return False
+        window_samples = int((self.window_ms / 1000.0) * self.sample_rate)
+        stim_sample = max(0, latest_samp - window_samples)
+        self.queue_sweep_trigger(stim_sample, stim_sample / self.sample_rate, source_info="MANUAL_FORCE")
+        return True
+
+    def get_recent_continuous(
+        self, channel: int = 0, duration_s: float = 1.0
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """Return (time_axis_s, samples_uV) for channel over the most recent duration_s."""
+        latest = self.ring_buffer.latest_sample
+        if latest is None:
+            return None
+        n_samples = int(duration_s * self.sample_rate)
+        if n_samples <= 0:
+            return None
+        start_samp = max(0, latest - n_samples)
+        if start_samp >= latest:
+            return None
+        ch = max(0, min(channel, self.ring_buffer.n_channels - 1))
+        matrix = self.ring_buffer.slice_channels(start_samp, latest, [ch])
+        if matrix is None or matrix.size == 0:
+            return None
+        sig = matrix[0]
+        t = np.linspace(-duration_s, 0.0, len(sig), endpoint=False)
+        return t, sig
 
     def run(self):
         """Thread execution loop."""
@@ -675,12 +708,13 @@ class OpenEphysStreamWorker(QThread):
             envelope = ""
 
             for i, p in enumerate(parts):
-                if p.startswith(b"{") and p.endswith(b"}"):
+                cleaned_p = p.strip(b"\x00 \r\n\t")
+                if cleaned_p.startswith(b"{") and cleaned_p.endswith(b"}"):
                     try:
-                        meta = json.loads(p.decode("utf-8"))
+                        meta = json.loads(cleaned_p.decode("utf-8"))
                         meta_idx = i
                         if i > 0:
-                            envelope = parts[0].decode("utf-8", errors="ignore").strip().lower()
+                            envelope = parts[0].decode("utf-8", errors="ignore").strip("\x00 \r\n\t").lower()
                         if i + 1 < len(parts):
                             buf = parts[i + 1]
                         break
@@ -688,27 +722,65 @@ class OpenEphysStreamWorker(QThread):
                         pass
 
             if meta is None:
-                if len(parts) >= 2 and parts[0].startswith(b"{"):
-                    meta = json.loads(parts[0].decode("utf-8"))
-                    buf = parts[1]
-                elif len(parts) == 1 and parts[0].startswith(b"{"):
+                if len(parts) >= 2 and parts[0].strip(b"\x00 \r\n\t").startswith(b"{"):
+                    try:
+                        meta = json.loads(parts[0].strip(b"\x00 \r\n\t").decode("utf-8"))
+                        buf = parts[1]
+                    except Exception:
+                        pass
+                elif len(parts) == 1 and parts[0].strip(b"\x00 \r\n\t").startswith(b"{"):
                     self._handle_event_json(parts[0])
                     return
                 else:
                     return
 
+            if meta is None:
+                return
+
             msg_type = (envelope or meta.get("type", meta.get("stream", "continuous"))).lower()
 
             # Check if this packet is an Event or Spike broadcast on the data socket
-            if "event" in msg_type or meta.get("type") == "ttl" or "line" in meta:
-                if buf is not None and len(buf) >= 2:
-                    # Open Ephys binary TTL: byte 0 = line, byte 1 = state (1 or 0)
+            if "event" in msg_type or meta.get("type") == "ttl" or "line" in meta or (isinstance(meta.get("data"), dict) and "line" in meta["data"]):
+                line = None
+                state = None
+                if "line" in meta or "state" in meta:
+                    line = meta.get("line")
+                    state = meta.get("state")
+                elif isinstance(meta.get("data"), dict):
+                    line = meta["data"].get("line")
+                    state = meta["data"].get("state")
+
+                if (line is None or state is None) and buf is not None and len(buf) >= 2:
                     line = int(buf[0])
                     state = int(buf[1])
-                    sample_num = int(meta.get("sample_num", meta.get("sample_number", 0)))
-                    ts = float(meta.get("timestamp", sample_num / self.sample_rate))
-                    if state == 1 and self.trigger_source == "ttl":
-                        self.queue_sweep_trigger(sample_num, ts)
+
+                if line is not None or state is not None:
+                    sample_num = int(meta.get("sample_num", meta.get("sample_number", meta.get("sampleIndex", 0))))
+                    ts = float(meta.get("timestamp", sample_num / self.sample_rate if self.sample_rate else time.time()))
+
+                    is_rising = False
+                    if isinstance(state, (int, float, bool)):
+                        is_rising = (int(state) == 1)
+                    elif isinstance(state, str):
+                        is_rising = state.strip().lower() in ("1", "true", "high", "rising", "on")
+
+                    action_status = "TRIGGER QUEUED" if is_rising else f"IGNORED (state={state})"
+                    if hasattr(self, "debugEventEmitted"):
+                        self.debugEventEmitted.emit({
+                            "timestamp": time.time(),
+                            "topic": envelope or "DATA_SOCK_EVENT",
+                            "type": meta.get("type", "ttl"),
+                            "line": line,
+                            "state": state,
+                            "sample_number": sample_num,
+                            "buffer_latest_sample": self.ring_buffer.latest_sample,
+                            "clock_skew": (sample_num - self.ring_buffer.latest_sample) if self.ring_buffer.latest_sample else 0,
+                            "status": action_status,
+                            "raw_meta": meta,
+                        })
+
+                    if is_rising and self.trigger_source == "ttl":
+                        self.queue_sweep_trigger(sample_num, ts, source_info=f"TTL_Line{line if line is not None else 1}")
                 else:
                     self._handle_event_json(json.dumps(meta).encode("utf-8"))
                 return
@@ -776,39 +848,73 @@ class OpenEphysStreamWorker(QThread):
                 break
 
             for part in msg:
-                if part.startswith(b"{") and part.endswith(b"}"):
-                    self._handle_event_json(part)
+                cleaned_part = part.strip(b"\x00 \r\n\t")
+                if cleaned_part.startswith(b"{") and cleaned_part.endswith(b"}"):
+                    self._handle_event_json(cleaned_part)
 
     def _handle_event_json(self, raw_json: bytes):
         """Process event JSON (TTL events, Spikes, APTrack protocol events)."""
         try:
-            evt = json.loads(raw_json.decode("utf-8"))
+            cleaned = raw_json.strip(b"\x00 \r\n\t")
+            evt = json.loads(cleaned.decode("utf-8"))
         except Exception:
             return
 
-        evt_type = evt.get("type", "").lower()
+        evt_type = str(evt.get("type", evt.get("event_type", ""))).lower()
+
+        line = evt.get("line")
+        state = evt.get("state")
+        if isinstance(evt.get("data"), dict):
+            if line is None:
+                line = evt["data"].get("line")
+            if state is None:
+                state = evt["data"].get("state")
+        if state is None:
+            state = 1
 
         # 1. TTL Trigger Event (Digital Line)
-        if evt_type == "ttl" or "line" in evt:
-            state = evt.get("state", 1)
-            line = evt.get("line", 1)
-            sample_num = evt.get("sample_number", evt.get("sample_num", int(time.time() * self.sample_rate)))
-            timestamp_s = evt.get("timestamp", sample_num / self.sample_rate)
+        if evt_type in ("ttl", "event") or line is not None or "line" in evt:
+            sample_num = int(
+                evt.get(
+                    "sample_number",
+                    evt.get("sample_num", evt.get("sampleIndex", int(time.time() * self.sample_rate))),
+                )
+            )
+            timestamp_s = float(evt.get("timestamp", sample_num / self.sample_rate if self.sample_rate else time.time()))
 
-            # Check if rising edge
-            if state == 1 and self.trigger_source == "ttl":
-                self.queue_sweep_trigger(sample_num, timestamp_s)
+            is_rising = False
+            if isinstance(state, (int, float, bool)):
+                is_rising = (int(state) == 1)
+            elif isinstance(state, str):
+                is_rising = state.strip().lower() in ("1", "true", "high", "rising", "on")
+
+            action_status = "TRIGGER QUEUED" if is_rising else f"IGNORED (state={state})"
+            latest_buf = self.ring_buffer.latest_sample
+            if hasattr(self, "debugEventEmitted"):
+                self.debugEventEmitted.emit({
+                    "timestamp": time.time(),
+                    "topic": "EVENT_SOCK",
+                    "type": evt_type or "ttl",
+                    "line": line if line is not None else 1,
+                    "state": state,
+                    "sample_number": sample_num,
+                    "buffer_latest_sample": latest_buf,
+                    "clock_skew": (sample_num - latest_buf) if latest_buf is not None else 0,
+                    "status": action_status,
+                    "raw_meta": evt,
+                })
+
+            if is_rising and self.trigger_source == "ttl":
+                self.queue_sweep_trigger(sample_num, timestamp_s, source_info=f"TTL_Line{line if line is not None else 1}")
 
         # 2. Spike Event
         elif evt_type == "spike" or "electrode" in evt:
             electrode = evt.get("electrode", 0)
             unit_name = evt.get("unit_name", f"unit_ch{electrode}")
-            sample_num = evt.get("sample_number", evt.get("sample_num", int(time.time() * self.sample_rate)))
+            sample_num = int(evt.get("sample_number", evt.get("sample_num", int(time.time() * self.sample_rate))))
             spike_ts = float(evt.get("timestamp", sample_num / self.sample_rate))
             self._spikes_count += 1
 
-            # If there is a pending sweep covering sample_num, record spike latency directly on the sweep
-            # so it is delivered atomically with sweepReady instead of flooding the GUI event loop.
             matched_pending = False
             with self._pending_lock:
                 for sweep in self._pending_sweeps:
@@ -827,8 +933,6 @@ class OpenEphysStreamWorker(QThread):
             text = evt.get("text", "")
             ts = float(evt.get("timestamp", time.time()))
             self.protocolEventReady.emit(evt_type, ts, evt)
-            # Check for embedded spike/voltage messages:
-            # "spikeSampleNumber: 12345"
             if "spikeSampleNumber" in text:
                 try:
                     parts = text.split(":")
@@ -837,11 +941,30 @@ class OpenEphysStreamWorker(QThread):
                 except Exception:
                     pass
 
-    def queue_sweep_trigger(self, stim_sample: int, stim_timestamp_s: float):
+    def queue_sweep_trigger(
+        self, stim_sample: int, stim_timestamp_s: float, source_info: str = "TTL"
+    ):
         """Queue a pending sweep to be sliced when future samples have arrived in the ring buffer."""
-        # Calculate samples needed
         window_samples = int((self.window_ms / 1000.0) * self.sample_rate)
         pre_samples = int((self.pre_stim_ms / 1000.0) * self.sample_rate)
+
+        latest_samp = self.ring_buffer.latest_sample
+        earliest_samp = self.ring_buffer.earliest_sample
+
+        adjusted_stim_sample = stim_sample
+        skew = (stim_sample - latest_samp) if latest_samp is not None else 0
+
+        # Auto-align clock if sample is wildly desynchronized (e.g. 0-based relative clock vs hardware clock)
+        if getattr(self, "auto_align_clock", True) and latest_samp is not None:
+            if earliest_samp is not None and (stim_sample < earliest_samp or stim_sample > latest_samp + int(self.sample_rate * 2.0)):
+                adjusted_stim_sample = max(0, latest_samp - int(0.01 * self.sample_rate))
+                logger.info(
+                    "Auto-aligning trigger sample: original %d -> adjusted %d (latest %d, skew %d)",
+                    stim_sample,
+                    adjusted_stim_sample,
+                    latest_samp,
+                    skew,
+                )
 
         # Record stim interval
         if self._last_stim_timestamp is not None:
@@ -851,7 +974,7 @@ class OpenEphysStreamWorker(QThread):
         self._last_stim_timestamp = stim_timestamp_s
 
         pending = PendingSweep(
-            stim_sample=stim_sample,
+            stim_sample=adjusted_stim_sample,
             stim_timestamp_s=stim_timestamp_s,
             window_samples=window_samples,
             pre_samples=pre_samples,
@@ -860,7 +983,6 @@ class OpenEphysStreamWorker(QThread):
         )
 
         with self._pending_lock:
-            # Bound pending queue to prevent unbounded memory growth in extreme stalls
             if len(self._pending_sweeps) > 2000:
                 self._pending_sweeps.pop(0)
             self._pending_sweeps.append(pending)
@@ -896,6 +1018,18 @@ class OpenEphysStreamWorker(QThread):
                         earliest_samp,
                     )
                     finished_ids.add(id(sweep))
+                    if hasattr(self, "debugEventEmitted"):
+                        self.debugEventEmitted.emit({
+                            "timestamp": time.time(),
+                            "topic": "SWEEP_DROP",
+                            "type": "drop",
+                            "line": "--",
+                            "state": "--",
+                            "sample_number": sweep.stim_sample,
+                            "buffer_latest_sample": latest_samp,
+                            "clock_skew": sweep.stim_sample - latest_samp,
+                            "status": f"DROPPED: start_samp {start_samp} < earliest_samp {earliest_samp}",
+                        })
                 continue
 
             if start_samp < earliest_samp:
@@ -905,6 +1039,18 @@ class OpenEphysStreamWorker(QThread):
                     earliest_samp,
                 )
                 finished_ids.add(id(sweep))
+                if hasattr(self, "debugEventEmitted"):
+                    self.debugEventEmitted.emit({
+                        "timestamp": time.time(),
+                        "topic": "SWEEP_DROP",
+                        "type": "drop",
+                        "line": "--",
+                        "state": "--",
+                        "sample_number": sweep.stim_sample,
+                        "buffer_latest_sample": latest_samp,
+                        "clock_skew": sweep.stim_sample - latest_samp,
+                        "status": f"DROPPED: start_samp {start_samp} < earliest_samp {earliest_samp}",
+                    })
                 continue
 
             target_chans = sweep.aux_chans if sweep.aux_chans else list(self.active_channels)
@@ -933,6 +1079,20 @@ class OpenEphysStreamWorker(QThread):
             self._pending_sweeps = [
                 s for s in self._pending_sweeps if id(s) not in finished_ids
             ]
+
+        if hasattr(self, "debugEventEmitted"):
+            for sweep, valid_chans, _ in ready_items:
+                self.debugEventEmitted.emit({
+                    "timestamp": time.time(),
+                    "topic": "SWEEP_READY",
+                    "type": "slice",
+                    "line": "--",
+                    "state": "--",
+                    "sample_number": sweep.stim_sample,
+                    "buffer_latest_sample": latest_samp,
+                    "clock_skew": sweep.stim_sample - latest_samp,
+                    "status": f"SWEEP SLICED ({len(valid_chans)} channels)",
+                })
 
         # Process ready sweeps outside the lock; data is already filtered on ingest.
         for sweep, valid_chans, active_matrix in ready_items:

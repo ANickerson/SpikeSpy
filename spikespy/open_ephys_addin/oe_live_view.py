@@ -37,6 +37,7 @@ from spikespy.ViewerState import ViewerState, tracked_neuron_unit
 
 from .oe_controller import OpenEphysController
 from .oe_stream_worker import OpenEphysStreamWorker
+from .oe_debug_window import OpenEphysLiveDebugDialog
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,7 @@ class OpenEphysLiveView(QWidget):
         self._timeline_seek_timer.setSingleShot(True)
         self._timeline_seek_timer.setInterval(150)
         self._timeline_seek_timer.timeout.connect(self._on_timeline_seek_timeout)
+        self._debug_dialog: Optional[OpenEphysLiveDebugDialog] = None
 
         self._init_ui()
         self._init_controller()
@@ -382,6 +384,17 @@ class OpenEphysLiveView(QWidget):
         self.btn_start_demo.clicked.connect(self.start_demo_stream)
         diag_layout.addRow(self.btn_start_demo)
 
+        self.btn_open_debug = QPushButton("🔍 Open Live Stream & Trigger Debugger")
+        self.btn_open_debug.setStyleSheet(
+            "background-color: #2b7a2b; color: white; font-weight: bold; padding: 6px;"
+        )
+        self.btn_open_debug.setToolTip(
+            "Open the live continuous oscilloscope to view raw signal, monitor incoming TTL/crossing events, "
+            "and diagnose trigger clock synchronization in real time."
+        )
+        self.btn_open_debug.clicked.connect(self._open_debug_dialog)
+        diag_layout.addRow(self.btn_open_debug)
+
         self.btn_dump_diag = QPushButton("Show UI Performance & Freeze Diagnostics")
         self.btn_dump_diag.clicked.connect(self._show_ui_diagnostics_dialog)
         diag_layout.addRow(self.btn_dump_diag)
@@ -577,6 +590,8 @@ class OpenEphysLiveView(QWidget):
         self.worker.protocolEventReady.connect(self._on_protocol_event_ready)
         self.worker.statsUpdated.connect(self._on_stats_updated)
         self.worker.connectionStatusChanged.connect(self._on_connection_status_changed)
+        if self._debug_dialog is not None:
+            self._debug_dialog._connect_worker()
 
         can_resume = (
             hasattr(self.state, "has_live_session")
@@ -1606,6 +1621,15 @@ class OpenEphysLiveView(QWidget):
             "SpikeSpy UI Performance & Freeze Diagnostics",
             "\n".join(lines),
         )
+
+    @Slot()
+    def _open_debug_dialog(self):
+        """Open or focus the live continuous oscilloscope and trigger inspector dialog."""
+        if self._debug_dialog is None:
+            self._debug_dialog = OpenEphysLiveDebugDialog(self, parent=self.window())
+        self._debug_dialog.show()
+        self._debug_dialog.raise_()
+        self._debug_dialog.activateWindow()
 
     @Slot(bool, str)
     def _on_connection_status_changed(self, connected: bool, message: str):
