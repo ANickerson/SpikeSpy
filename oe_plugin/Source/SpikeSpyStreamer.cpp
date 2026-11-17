@@ -7,6 +7,7 @@
 */
 
 #include "SpikeSpyStreamer.h"
+#include "SpikeSpyStreamerEditor.h"
 
 #include <algorithm>
 #include <iomanip>
@@ -18,6 +19,34 @@ const int RING_SECONDS = 10;
 const int MAX_PENDING_SWEEPS = 200;
 } // namespace
 
+class SpikeSpyStreamer::HeartbeatThread : public Thread
+{
+public:
+    HeartbeatThread (SpikeSpyStreamer* streamer_)
+        : Thread ("SpikeSpyHeartbeatThread"), streamer (streamer_)
+    {
+    }
+
+    ~HeartbeatThread() override
+    {
+        stopThread (500);
+    }
+
+    void run() override
+    {
+        while (! threadShouldExit())
+        {
+            if (streamer != nullptr)
+                streamer->pollHeartbeat (150);
+            else
+                wait (100);
+        }
+    }
+
+private:
+    SpikeSpyStreamer* streamer = nullptr;
+};
+
 SpikeSpyStreamer::SpikeSpyStreamer()
     : GenericProcessor ("SpikeSpy Streamer")
 {
@@ -27,6 +56,12 @@ SpikeSpyStreamer::~SpikeSpyStreamer()
 {
     std::lock_guard<std::mutex> lock (stateMutex);
     closeZmq();
+}
+
+AudioProcessorEditor* SpikeSpyStreamer::createEditor()
+{
+    editor = std::make_unique<SpikeSpyStreamerEditor> (this);
+    return editor.get();
 }
 
 void SpikeSpyStreamer::registerParameters()
@@ -96,6 +131,7 @@ void SpikeSpyStreamer::bindZmq (int port)
         return;
     }
 
+    // 1. Sweep publisher
     zmqPublisher = zmq_socket (zmqContext, ZMQ_PUB);
     if (zmqPublisher == nullptr)
     {
@@ -124,10 +160,45 @@ void SpikeSpyStreamer::bindZmq (int port)
 
     boundZmqPort = port;
     DBG ("SpikeSpyStreamer: ZMQ publisher bound to " << endpoint);
+
+    // 2. Heartbeat & handshake REP socket (on port + 1)
+    const int hbPort = port + 1;
+    zmqHeartbeat = zmq_socket (zmqContext, ZMQ_REP);
+    if (zmqHeartbeat != nullptr)
+    {
+        zmq_setsockopt (zmqHeartbeat, ZMQ_LINGER, &linger, sizeof (linger));
+        const std::string hbEndpoint = "tcp://*:" + std::to_string (hbPort);
+        if (zmq_bind (zmqHeartbeat, hbEndpoint.c_str()) == 0)
+        {
+            boundHeartbeatPort = hbPort;
+            DBG ("SpikeSpyStreamer: ZMQ heartbeat REP bound to " << hbEndpoint);
+
+            heartbeatThread = std::make_unique<HeartbeatThread> (this);
+            heartbeatThread->startThread();
+        }
+        else
+        {
+            DBG ("SpikeSpyStreamer: zmq_bind failed for heartbeat on " << hbEndpoint);
+            zmq_close (zmqHeartbeat);
+            zmqHeartbeat = nullptr;
+        }
+    }
 }
 
 void SpikeSpyStreamer::closeZmq()
 {
+    if (heartbeatThread != nullptr)
+    {
+        heartbeatThread->stopThread (500);
+        heartbeatThread.reset();
+    }
+
+    if (zmqHeartbeat != nullptr)
+    {
+        zmq_close (zmqHeartbeat);
+        zmqHeartbeat = nullptr;
+    }
+
     if (zmqPublisher != nullptr)
     {
         zmq_close (zmqPublisher);
@@ -141,6 +212,81 @@ void SpikeSpyStreamer::closeZmq()
     }
 
     boundZmqPort = 0;
+    boundHeartbeatPort = 0;
+}
+
+void SpikeSpyStreamer::pollHeartbeat (int timeoutMs)
+{
+    if (zmqHeartbeat == nullptr)
+        return;
+
+    zmq_pollitem_t items[1];
+    items[0].socket = zmqHeartbeat;
+    items[0].fd = 0;
+    items[0].events = ZMQ_POLLIN;
+    items[0].revents = 0;
+
+    int rc = zmq_poll (items, 1, timeoutMs);
+    if (rc <= 0 || ! (items[0].revents & ZMQ_POLLIN))
+        return;
+
+    char buffer[1024];
+    int bytes = zmq_recv (zmqHeartbeat, buffer, sizeof (buffer) - 1, 0);
+    if (bytes < 0)
+        return;
+
+    buffer[bytes] = '\0';
+    String receivedStr (buffer);
+
+    // Update connection status
+    {
+        std::lock_guard<std::mutex> lock (stateMutex);
+        lastHeartbeatMs = Time::getMillisecondCounter();
+        clientConnected = true;
+        if (receivedStr.contains ("SpikeSpy"))
+            clientName = "SpikeSpy";
+    }
+
+    // Reply with status JSON
+    String reply = "{\"status\":\"ok\",\"plugin\":\"SpikeSpyStreamer\",\"version\":\"1.0.0\",\"connected\":true,\"sweeps_sent\":"
+                   + String (totalSweepsSent) + ",\"acquiring\":" + (acquiring ? "true" : "false")
+                   + ",\"rec_channel\":" + String (cachedRecChannel) + "}";
+
+    zmq_send (zmqHeartbeat, reply.toRawUTF8(), reply.getNumBytesAsUTF8(), 0);
+}
+
+bool SpikeSpyStreamer::isClientConnected() const
+{
+    std::lock_guard<std::mutex> lock (stateMutex);
+    if (! clientConnected)
+        return false;
+
+    const int64 now = Time::getMillisecondCounter();
+    return (now - lastHeartbeatMs) < 3500;
+}
+
+int SpikeSpyStreamer::getSweepsSent() const
+{
+    std::lock_guard<std::mutex> lock (stateMutex);
+    return totalSweepsSent;
+}
+
+String SpikeSpyStreamer::getClientName() const
+{
+    std::lock_guard<std::mutex> lock (stateMutex);
+    return clientName;
+}
+
+int SpikeSpyStreamer::getZmqPort() const
+{
+    std::lock_guard<std::mutex> lock (stateMutex);
+    return boundZmqPort > 0 ? boundZmqPort : cachedZmqPort;
+}
+
+int SpikeSpyStreamer::getHeartbeatPort() const
+{
+    std::lock_guard<std::mutex> lock (stateMutex);
+    return boundHeartbeatPort > 0 ? boundHeartbeatPort : (cachedZmqPort + 1);
 }
 
 void SpikeSpyStreamer::publishSweep (const SlicedSweep& sweep, const float* waveform, int numSamples)
@@ -181,6 +327,8 @@ void SpikeSpyStreamer::publishSweep (const SlicedSweep& sweep, const float* wave
 
     zmq_send (zmqPublisher, header.data(), header.size(), ZMQ_SNDMORE);
     zmq_send (zmqPublisher, waveform, numSamples * sizeof (float), 0);
+
+    totalSweepsSent++;
 }
 
 void SpikeSpyStreamer::resolveSweeps (uint16 streamId)
@@ -412,11 +560,26 @@ bool SpikeSpyStreamer::stopAcquisition()
 
 String SpikeSpyStreamer::handleConfigMessage (const String& msg)
 {
-    DBG ("SpikeSpyStreamer: config message (ignored): " << msg);
-    return String();
+    DBG ("SpikeSpyStreamer: config message: " << msg);
+
+    std::lock_guard<std::mutex> lock (stateMutex);
+    lastHeartbeatMs = Time::getMillisecondCounter();
+    clientConnected = true;
+    if (msg.contains ("SpikeSpy"))
+        clientName = "SpikeSpy (HTTP)";
+
+    return "{\"status\":\"ok\",\"plugin\":\"SpikeSpyStreamer\",\"version\":\"1.0.0\",\"connected\":true,\"sweeps_sent\":"
+           + String (totalSweepsSent) + ",\"acquiring\":" + (acquiring ? "true" : "false")
+           + ",\"rec_channel\":" + String (cachedRecChannel) + "}";
 }
 
 void SpikeSpyStreamer::handleBroadcastMessage (const String& msg, const int64 systemTimeMillis)
 {
-    DBG ("SpikeSpyStreamer: broadcast message (ignored): " << msg);
+    if (msg.contains ("SpikeSpy"))
+    {
+        std::lock_guard<std::mutex> lock (stateMutex);
+        lastHeartbeatMs = Time::getMillisecondCounter();
+        clientConnected = true;
+        clientName = "SpikeSpy";
+    }
 }

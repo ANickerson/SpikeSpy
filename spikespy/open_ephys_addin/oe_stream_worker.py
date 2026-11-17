@@ -364,6 +364,12 @@ class OpenEphysStreamWorker(QThread):
         self._last_stim_timestamp: Optional[float] = None
         self._stim_intervals: List[float] = []
 
+        # Connection monitoring & heartbeat state
+        self._plugin_connected = False
+        self._last_heartbeat_reply = 0.0
+        self._last_data_received = 0.0
+        self._plugin_info: Dict[str, Any] = {}
+
     def stop(self):
         """Signal thread to stop and wait."""
         self._running = False
@@ -438,19 +444,8 @@ class OpenEphysStreamWorker(QThread):
             data_sub.connect(data_url)
             poller.register(data_sub, zmq.POLLIN)
 
-            # 2. Setup Event Socket & Heartbeat Socket (if zmq_raw mode)
+            # 2. Setup Event Socket (if zmq_raw mode)
             if self.mode == "zmq_raw":
-                # Heartbeat REQ socket for Open Ephys ZMQ Interface (listening port: heartbeat_port or event_port or data_port + 1)
-                hb_port = self.heartbeat_port or self.event_port or (self.data_port + 1)
-                if hb_port and hb_port != self.data_port:
-                    heartbeat_req = context.socket(zmq.REQ)
-                    heartbeat_req.setsockopt(zmq.RCVTIMEO, 500)
-                    heartbeat_req.setsockopt(zmq.SNDTIMEO, 500)
-                    heartbeat_req.setsockopt(zmq.LINGER, 0)
-                    heartbeat_req.connect(f"tcp://{self.host}:{hb_port}")
-                    poller.register(heartbeat_req, zmq.POLLIN)
-
-                # Event SUB socket: also subscribe to event_port for Event Broadcaster
                 if self.event_port and self.event_port != self.data_port:
                     event_sub = context.socket(zmq.SUB)
                     event_sub.setsockopt_string(zmq.SUBSCRIBE, "")
@@ -460,29 +455,54 @@ class OpenEphysStreamWorker(QThread):
                     event_sub.connect(event_url)
                     poller.register(event_sub, zmq.POLLIN)
 
-            self.connectionStatusChanged.emit(True, f"Connected to {self.host}:{self.data_port}")
-            logger.info("OpenEphysStreamWorker connected to %s (mode=%s)", self.host, self.mode)
+            # 3. Setup Heartbeat REQ socket
+            hb_target_port = None
+            if self.mode == "sliced_erp":
+                hb_target_port = self.heartbeat_port or self.event_port or (self.data_port + 1)
+            elif self.mode == "zmq_raw":
+                if self.heartbeat_port and self.heartbeat_port != self.data_port:
+                    hb_target_port = self.heartbeat_port
+
+            if hb_target_port is not None and hb_target_port != self.data_port:
+                heartbeat_req = context.socket(zmq.REQ)
+                heartbeat_req.setsockopt(zmq.RCVTIMEO, 500)
+                heartbeat_req.setsockopt(zmq.SNDTIMEO, 500)
+                heartbeat_req.setsockopt(zmq.LINGER, 0)
+                heartbeat_req.connect(f"tcp://{self.host}:{hb_target_port}")
+                poller.register(heartbeat_req, zmq.POLLIN)
+
+            self._plugin_connected = False
+            self._last_heartbeat_reply = 0.0
+            self._last_data_received = 0.0
+            self.connectionStatusChanged.emit(False, f"Connecting to {self.host}:{self.data_port}...")
+            logger.info("OpenEphysStreamWorker connecting to %s (mode=%s)", self.host, self.mode)
 
             last_heartbeat_time = 0.0
             last_stats_time = time.time()
+            heartbeat_pending = False
 
             while self._running:
                 now = time.time()
 
-                # Heartbeat every 2.0 seconds (non-blocking; reply drained by the main poller)
-                if self.mode == "zmq_raw" and heartbeat_req is not None:
-                    if now - last_heartbeat_time >= 2.0:
+                # Heartbeat every 1.2 seconds
+                if heartbeat_req is not None:
+                    if not heartbeat_pending and (now - last_heartbeat_time >= 1.2):
                         try:
                             hb_msg = json.dumps(
                                 {
                                     "application": "SpikeSpy",
+                                    "client": "SpikeSpy",
                                     "uuid": "spikespy-oe-addin",
                                     "type": "heartbeat",
+                                    "time": now,
                                 }
                             ).encode("utf-8")
                             heartbeat_req.send(hb_msg, zmq.NOBLOCK)
+                            heartbeat_pending = True
+                            last_heartbeat_time = now
                         except Exception as e:
                             logger.debug("Heartbeat error: %s", e)
+                            heartbeat_pending = False
                             try:
                                 poller.unregister(heartbeat_req)
                             except Exception:
@@ -496,20 +516,33 @@ class OpenEphysStreamWorker(QThread):
                                 heartbeat_req.setsockopt(zmq.RCVTIMEO, 500)
                                 heartbeat_req.setsockopt(zmq.SNDTIMEO, 500)
                                 heartbeat_req.setsockopt(zmq.LINGER, 0)
-                                heartbeat_req.connect(f"tcp://{self.host}:{self.heartbeat_port}")
+                                heartbeat_req.connect(f"tcp://{self.host}:{hb_target_port}")
                                 poller.register(heartbeat_req, zmq.POLLIN)
                             except Exception:
                                 heartbeat_req = None
-                        last_heartbeat_time = now
 
                 # Poll sockets
                 socks = dict(poller.poll(20))
 
                 if heartbeat_req is not None and heartbeat_req in socks:
                     try:
-                        heartbeat_req.recv(zmq.NOBLOCK)
+                        reply_raw = heartbeat_req.recv(zmq.NOBLOCK)
+                        heartbeat_pending = False
+                        self._last_heartbeat_reply = now
+                        plugin_label = "SpikeSpy Streamer"
+                        if reply_raw:
+                            try:
+                                self._plugin_info = json.loads(reply_raw.decode("utf-8"))
+                                plugin_label = self._plugin_info.get("plugin", plugin_label)
+                            except Exception:
+                                pass
+                        if not self._plugin_connected:
+                            self._plugin_connected = True
+                            self.connectionStatusChanged.emit(
+                                True, f"Connected to {plugin_label} ({self.host}:{self.data_port})"
+                            )
                     except Exception:
-                        pass
+                        heartbeat_pending = False
 
                 if data_sub in socks and socks[data_sub] == zmq.POLLIN:
                     self._handle_data_socket(data_sub)
@@ -520,6 +553,14 @@ class OpenEphysStreamWorker(QThread):
                 # Check pending sweeps
                 self._check_pending_sweeps()
                 self._flush_sweep_payloads()
+
+                # Connection timeout check: if connected but no activity for > 3.5s
+                last_act = max(self._last_heartbeat_reply, self._last_data_received)
+                if self._plugin_connected and last_act > 0 and (now - last_act > 3.5):
+                    self._plugin_connected = False
+                    self.connectionStatusChanged.emit(
+                        False, f"Waiting for SpikeSpy Streamer on {self.host}:{self.data_port}..."
+                    )
 
                 # Emit stats every 1 second
                 if now - last_stats_time >= 1.0:
@@ -533,6 +574,9 @@ class OpenEphysStreamWorker(QThread):
                             "spikes_received": self._spikes_count,
                             "packets_received": self._packets_count,
                             "last_stim_freq_hz": float(avg_freq),
+                            "plugin_connected": self._plugin_connected,
+                            "last_ping_s": (now - last_act) if last_act > 0 else -1.0,
+                            "plugin_info": self._plugin_info,
                         }
                     )
                     last_stats_time = now
@@ -549,6 +593,7 @@ class OpenEphysStreamWorker(QThread):
             if heartbeat_req is not None:
                 heartbeat_req.close(0)
             context.term()
+            self._plugin_connected = False
             self.connectionStatusChanged.emit(False, "Disconnected")
 
     def _handle_data_socket(self, sock: zmq.Socket):
@@ -563,6 +608,12 @@ class OpenEphysStreamWorker(QThread):
                 continue
 
             self._packets_count += 1
+            self._last_data_received = time.time()
+            if not self._plugin_connected:
+                self._plugin_connected = True
+                self.connectionStatusChanged.emit(
+                    True, f"Receiving live stream on {self.host}:{self.data_port}"
+                )
 
             # Check if pre-sliced ERP packet
             if self.mode == "sliced_erp" or msg_parts[0].startswith(b"ERP"):
