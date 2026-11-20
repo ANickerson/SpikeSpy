@@ -2,12 +2,13 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import PySide6
-from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtCore import QSignalBlocker, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -182,6 +183,42 @@ class SharedChannelPanel(QWidget):
 
         main_layout.addWidget(link_box)
 
+        # -------------------------------------------------------------
+        # 5. Shared Visual Settings
+        # -------------------------------------------------------------
+        vis_box = QGroupBox("Shared Visual Settings (Synced Across Linked Viewers)", self)
+        vis_layout = QHBoxLayout(vis_box)
+        vis_layout.setContentsMargins(6, 6, 6, 6)
+        vis_layout.setSpacing(6)
+
+        vis_layout.addWidget(QLabel("Scale Mode:", self))
+        self.combo_shared_scale_mode = QComboBox(self)
+        self.combo_shared_scale_mode.addItems(["std", "mV"])
+        self.combo_shared_scale_mode.currentTextChanged.connect(self._on_shared_visual_controls_changed)
+        vis_layout.addWidget(self.combo_shared_scale_mode)
+
+        vis_layout.addWidget(QLabel("Min:", self))
+        self.spin_shared_min_scale = QDoubleSpinBox(self)
+        self.spin_shared_min_scale.setRange(0.0, 100.0)
+        self.spin_shared_min_scale.setSingleStep(0.1)
+        self.spin_shared_min_scale.setValue(0.5)
+        self.spin_shared_min_scale.valueChanged.connect(self._on_shared_visual_controls_changed)
+        vis_layout.addWidget(self.spin_shared_min_scale)
+
+        vis_layout.addWidget(QLabel("Max:", self))
+        self.spin_shared_max_scale = QDoubleSpinBox(self)
+        self.spin_shared_max_scale.setRange(0.0, 100.0)
+        self.spin_shared_max_scale.setSingleStep(0.1)
+        self.spin_shared_max_scale.setValue(2.0)
+        self.spin_shared_max_scale.valueChanged.connect(self._on_shared_visual_controls_changed)
+        vis_layout.addWidget(self.spin_shared_max_scale)
+
+        self.btn_sync_visuals_now = QPushButton("Broadcast Visuals to Linked Viewers", self)
+        self.btn_sync_visuals_now.clicked.connect(self.broadcast_shared_visuals)
+        vis_layout.addWidget(self.btn_sync_visuals_now)
+
+        main_layout.addWidget(vis_box)
+
         if state is not None:
             self.setState(state)
 
@@ -190,6 +227,8 @@ class SharedChannelPanel(QWidget):
         if self.state is not None:
             if hasattr(self.state, "onSharedChannelSetChanged"):
                 self.state.onSharedChannelSetChanged.connect(self._on_shared_channel_set_changed)
+            if hasattr(self.state, "onSharedVisualSettingsChanged"):
+                self.state.onSharedVisualSettingsChanged.connect(self._on_shared_visual_settings_changed)
             if hasattr(self.state, "onChannelGroupsChanged"):
                 self.state.onChannelGroupsChanged.connect(self.refresh_chips)
             if hasattr(self.state, "onUnitGroupChange"):
@@ -204,6 +243,7 @@ class SharedChannelPanel(QWidget):
         self.refresh_chips()
         self.update_active_set_display()
         self.update_linked_viewers_label()
+        self._sync_visual_controls_from_state()
 
     def get_active_set(self) -> str:
         return self.combo_set.currentText() or "Shared Group A"
@@ -329,11 +369,17 @@ class SharedChannelPanel(QWidget):
     def _on_set_changed(self, index: int):
         self.update_active_set_display()
         self.update_linked_viewers_label()
+        self._sync_visual_controls_from_state()
 
     def _on_shared_channel_set_changed(self, set_name: str):
         if set_name == self.get_active_set():
             self.update_active_set_display()
             self.update_linked_viewers_label()
+            self._sync_visual_controls_from_state()
+
+    def _on_shared_visual_settings_changed(self, set_name: str, settings: dict):
+        if not self._block_updates and set_name == self.get_active_set():
+            self._sync_visual_controls_from_state()
 
     def _on_unit_selection_changed(self, index: int):
         if not self.state:
@@ -456,6 +502,68 @@ class SharedChannelPanel(QWidget):
             if hasattr(inner, "channel_bar"):
                 inner.channel_bar.bind_to_shared_set(active_set)
         self.update_linked_viewers_label()
+
+    # -------------------------------------------------------------
+    # Shared Visual Settings Sync
+    # -------------------------------------------------------------
+    def _sync_visual_controls_from_state(self):
+        if not self.state or not hasattr(self.state, "get_shared_visual_settings"):
+            return
+        vis = self.state.get_shared_visual_settings(self.get_active_set())
+        if not isinstance(vis, dict):
+            return
+        scale_mode = str(vis.get("scale_mode", "std") or "std")
+        cs = vis.get("color_scale") or (0.5, 2.0)
+        with (
+            QSignalBlocker(self.combo_shared_scale_mode),
+            QSignalBlocker(self.spin_shared_min_scale),
+            QSignalBlocker(self.spin_shared_max_scale),
+        ):
+            idx = self.combo_shared_scale_mode.findText(scale_mode)
+            if idx >= 0:
+                self.combo_shared_scale_mode.setCurrentIndex(idx)
+            if isinstance(cs, (tuple, list)) and len(cs) == 2:
+                self.spin_shared_min_scale.setValue(float(cs[0]))
+                self.spin_shared_max_scale.setValue(float(cs[1]))
+
+    def _on_shared_visual_controls_changed(self, *args):
+        if self._block_updates:
+            return
+        self.broadcast_shared_visuals()
+
+    def broadcast_shared_visuals(self):
+        active_set = self.get_active_set()
+        scale_mode = self.combo_shared_scale_mode.currentText() or "std"
+        min_val = float(self.spin_shared_min_scale.value())
+        max_val = float(self.spin_shared_max_scale.value())
+        if max_val < min_val:
+            max_val = min_val
+            with QSignalBlocker(self.spin_shared_max_scale):
+                self.spin_shared_max_scale.setValue(max_val)
+
+        payload = {
+            "scale_mode": scale_mode,
+            "color_scale": (min_val, max_val),
+        }
+
+        self._block_updates = True
+        try:
+            if self.state is not None and hasattr(self.state, "update_shared_visual_settings"):
+                self.state.update_shared_visual_settings(active_set, **payload)
+
+            for dw, inner in self.get_open_viewers():
+                cb = getattr(inner, "channel_bar", None)
+                if cb is not None:
+                    mode, val = cb.get_channel_mode()
+                    if mode == cb.MODE_SHARED_SET and val == active_set:
+                        if hasattr(inner, "apply_shared_visual_settings"):
+                            inner.apply_shared_visual_settings(payload)
+                        if hasattr(inner, "sub_views"):
+                            for sv in inner.sub_views:
+                                if hasattr(sv, "apply_shared_visual_settings"):
+                                    sv.apply_shared_visual_settings(payload)
+        finally:
+            self._block_updates = False
 
     # -------------------------------------------------------------
     # Settings persistence

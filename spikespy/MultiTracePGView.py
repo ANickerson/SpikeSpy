@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QApplication,
+    QFrame,
 )
 import pyqtgraph as pg
 import matplotlib.pyplot as plt
@@ -219,6 +220,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self._was_shown: bool = False
         self._has_initialized_ranges: bool = False
         self._last_setup_mode: Optional[str] = None
+        self._applying_shared_visuals: bool = False
+        self.protocol_marker_items: List[Any] = []
 
         # Background task manager
         self._task_manager = get_task_manager()
@@ -248,6 +251,22 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         central = QWidget(self)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
+
+        self.live_paused_banner = QFrame(central)
+        self.live_paused_banner.setObjectName("live_paused_banner")
+        self.live_paused_banner.setStyleSheet(
+            "QFrame#live_paused_banner { background: #fff3cd; border: 1px solid #ffe69c; border-radius: 4px; padding: 2px 6px; }"
+        )
+        banner_layout = QHBoxLayout(self.live_paused_banner)
+        banner_layout.setContentsMargins(6, 2, 6, 2)
+        self.lbl_live_paused = QLabel("⏸ Viewing History —", self.live_paused_banner)
+        self.btn_return_live = QPushButton("📡 Return to Live (Ctrl+L)", self.live_paused_banner)
+        self.btn_return_live.clicked.connect(self._on_return_to_live_clicked)
+        banner_layout.addWidget(self.lbl_live_paused)
+        banner_layout.addStretch()
+        banner_layout.addWidget(self.btn_return_live)
+        self.live_paused_banner.setVisible(False)
+        layout.addWidget(self.live_paused_banner)
 
         self.glw = pg.GraphicsLayoutWidget()
         self.glw.setBackground("w")  # Clean white background matching Matplotlib
@@ -758,6 +777,17 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             act_prev.triggered.connect(lambda: self.channel_bar.shift_group(-1))
             act_next = menu.addAction("Shift Group +1 (>)")
             act_next.triggered.connect(lambda: self.channel_bar.shift_group(1))
+
+        if self.state is not None:
+            menu.addSeparator()
+            act_seed = menu.addAction("🎯 Seed & Auto-Track New Unit at Current Sweep")
+            act_seed.triggered.connect(
+                lambda checked=False, p=panel: self._seed_unit_at_current_sweep(p)
+            )
+            act_reanchor = menu.addAction("📍 Re-Anchor Active Unit at Current Sweep")
+            act_reanchor.triggered.connect(
+                lambda checked=False, p=panel: self._reanchor_active_unit_at_current_sweep(p)
+            )
 
         menu.exec(screen_pos)
 
@@ -1837,8 +1867,24 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             event.accept()
             return
 
-        # Normal mode: single left-click selects stimulus sweep
+        # Normal mode: Shift+Click seeds & auto-tracks a new unit; plain left-click selects sweep
         if event.button() == Qt.LeftButton:
+            modifiers = (
+                event.modifiers()
+                if hasattr(event, "modifiers") and callable(event.modifiers)
+                else Qt.NoModifier
+            )
+            if modifiers & Qt.ShiftModifier:
+                if not np.isnan(pos.x()) and not np.isnan(pos.y()):
+                    sweep_idx = self._y_pos_to_stimno(float(pos.y()))
+                    if sweep_idx is not None:
+                        self.seed_new_unit_at_pos(
+                            float(pos.x()),
+                            stimno=sweep_idx,
+                            channel_name=target_panel.channel_name,
+                        )
+                        event.accept()
+                        return
             if not np.isnan(pos.y()):
                 if getattr(self, "y_axis_mode", "sweep") == "time":
                     stim_times_s = self._get_stim_times_s()
@@ -1976,6 +2022,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             if target is not None:
                 self.update_ylim(target)
                 self.plot_curstim_line(target)
+        self._update_live_paused_banner()
 
     @Slot()
     @Slot(int)
@@ -2058,10 +2105,29 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self._connect_state(self.state.onNewSpikeEvents, self._on_new_spike_events)
         if hasattr(self.state, "onStreamStateChanged"):
             self._connect_state(self.state.onStreamStateChanged, self._on_stream_state_changed)
+        if hasattr(self.state, "onFollowLiveChanged"):
+            self._connect_state(self.state.onFollowLiveChanged, self._update_live_paused_banner)
+        if hasattr(self.state, "onProtocolMarkersChanged"):
+            self._connect_state(
+                self.state.onProtocolMarkersChanged,
+                self._update_protocol_markers_overlay,
+            )
+        if hasattr(self.state, "onContainerVisualSettingsChanged"):
+            self._connect_state(
+                self.state.onContainerVisualSettingsChanged,
+                self._on_container_visual_settings_changed,
+            )
+        if hasattr(self.state, "onSharedVisualSettingsChanged"):
+            self._connect_state(
+                self.state.onSharedVisualSettingsChanged,
+                self._on_shared_visual_settings_changed,
+            )
 
         self.update_axis()
         self._schedule_right_axis_update(force=True)
         self.update_window_title()
+        self._update_live_paused_banner()
+        self._update_protocol_markers_overlay()
 
     def _on_stream_state_changed(self, is_streaming: bool):
         if not is_streaming and self.state is not None:
@@ -2602,8 +2668,12 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             return
         for p in self.channel_panels:
             if p.has_data and hasattr(p, "img_item"):
-                vmin = p.std * self.lowerSpinBox.value()
-                vmax = p.std * self.upperSpinBox.value()
+                if getattr(self, "scale_mode", "std") == "mV":
+                    vmin = self.lowerSpinBox.value()
+                    vmax = self.upperSpinBox.value()
+                else:
+                    vmin = p.std * self.lowerSpinBox.value()
+                    vmax = p.std * self.upperSpinBox.value()
                 p.img_item.setLevels((vmin, max(vmin + 0.001, vmax)))
 
     @quiet_fail
@@ -2868,6 +2938,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.plot_curstim_line(self.state.stimno, force=True)
         self.plot_spikegroups()
         self.plot_right_axis()
+        self._update_protocol_markers_overlay()
+        self._update_live_paused_banner()
         self._last_setup_mode = self.mode
 
     @quiet_fail
@@ -3437,31 +3509,365 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.plotsChanged.emit()
 
     def toggleShowMessages(self):
-        if self.state is None or self.state.segment is None:
-            return
-        try:
-            ev_other = next(e for e in self.state.segment.events if e.name == "log.other")
-        except StopIteration:
-            return
-
         if self.showMessages.isChecked():
             self.showMessages.setText("Hide messages")
-            for item in self.message_items:
-                self.main_plot.removeItem(item)
-            self.message_items.clear()
-
-            for i, t in enumerate(ev_other):
-                yy = self.state.event_signal.times.searchsorted(t, "right") - 1
-                msg = ev_other.array_annotations.get("message", [""])[i]
-                txt = pg.TextItem(text=str(msg), color=(0, 0, 0), fill=pg.mkBrush(255, 255, 255, 200))
-                txt.setPos(0, yy)
-                self.main_plot.addItem(txt)
-                self.message_items.append(txt)
         else:
             self.showMessages.setText("Show messages")
-            for item in self.message_items:
-                self.main_plot.removeItem(item)
-            self.message_items.clear()
+        self._update_protocol_markers_overlay()
+
+    def _on_return_to_live_clicked(self):
+        if self.state is not None and hasattr(self.state, "set_follow_live"):
+            self.state.set_follow_live(True)
+        elif hasattr(self, "channel_bar") and self.channel_bar is not None:
+            self.channel_bar.set_follow_live_events(True)
+        self._update_live_paused_banner()
+
+    def _update_live_paused_banner(self, *args):
+        if not hasattr(self, "live_paused_banner"):
+            return
+        if self.state is None:
+            self.live_paused_banner.setVisible(False)
+            return
+        ev_sig = getattr(self.state, "event_signal", None)
+        n_sweeps = len(ev_sig) if ev_sig is not None else 0
+        follow_live = getattr(self.state, "follow_live", True)
+        if not follow_live and n_sweeps > 0:
+            stimno = int(getattr(self.state, "stimno", 0) or 0)
+            latest = max(0, n_sweeps - 1)
+            self.lbl_live_paused.setText(
+                f"⏸ Viewing History (Sweep #{stimno} / #{latest}) —"
+            )
+            self.live_paused_banner.setVisible(True)
+        elif not follow_live:
+            self.lbl_live_paused.setText("⏸ Viewing History —")
+            self.live_paused_banner.setVisible(True)
+        else:
+            self.live_paused_banner.setVisible(False)
+
+    def _sampling_rate_hz(self) -> float:
+        sr = getattr(self.state, "sampling_rate", None) if self.state is not None else None
+        if sr is None and self.state is not None and getattr(self.state, "analog_signal", None) is not None:
+            sr = getattr(self.state.analog_signal, "sampling_rate", None)
+        if sr is None:
+            return 10000.0
+        return float(sr.rescale("Hz").magnitude) if hasattr(sr, "rescale") else float(sr)
+
+    def _y_pos_to_stimno(self, y_pos: float) -> Optional[int]:
+        if self.state is None or self.state.event_signal is None or len(self.state.event_signal) == 0:
+            return None
+        n_sweeps = len(self.state.event_signal)
+        if getattr(self, "y_axis_mode", "sweep") == "time":
+            stim_times_s = self._get_stim_times_s()
+            if stim_times_s is not None and len(stim_times_s) > 0:
+                cur_stim = min(max(0, int(getattr(self.state, "stimno", 0) or 0)), len(stim_times_s) - 1)
+                t_selected = stim_times_s[cur_stim]
+                t_clicked = t_selected + y_pos
+                closest_stim = int(np.argmin(np.abs(stim_times_s - t_clicked)))
+                return max(0, min(n_sweeps - 1, closest_stim))
+        stimno = int(round(y_pos))
+        return max(0, min(n_sweeps - 1, stimno))
+
+    def _snap_peak_on_sweep(self, sample_x: float, stimno: int, channel_name: Optional[str] = None) -> int:
+        erp = self.get_channel_erp_signal(channel_name) if channel_name else self.get_erp_signal()
+        if erp is None or len(erp) == 0:
+            erp = self.get_erp_signal()
+        if erp is None or stimno < 0 or stimno >= len(erp):
+            return max(0, int(round(sample_x)))
+        row = erp[stimno]
+        if hasattr(row, "magnitude"):
+            row = row.magnitude
+        row = np.asarray(row).ravel()
+        n_pts = len(row)
+        if n_pts == 0:
+            return 0
+        x_idx = max(0, min(n_pts - 1, int(round(sample_x))))
+        sr = self._sampling_rate_hz()
+        half_w = max(1, int(round(0.0015 * sr)))
+        lo = max(0, x_idx - half_w)
+        hi = min(n_pts, x_idx + half_w + 1)
+        if hi > lo:
+            x_idx = lo + int(np.argmax(np.abs(row[lo:hi])))
+        return int(x_idx)
+
+    def seed_new_unit_at_pos(
+        self,
+        sample_x: float,
+        stimno: Optional[int] = None,
+        channel_name: Optional[str] = None,
+    ):
+        if self.state is None or np.isnan(sample_x):
+            return None
+        if stimno is None:
+            stimno = int(getattr(self.state, "stimno", 0) or 0)
+        if not channel_name:
+            channel_name = (
+                self.channel_bar.get_primary_channel()
+                if hasattr(self, "channel_bar") and self.channel_bar is not None
+                else getattr(getattr(self.state, "analog_signal", None), "name", "")
+            )
+        peak_sample = self._snap_peak_on_sweep(sample_x, int(stimno), channel_name)
+        if hasattr(self.state, "seed_unit_at"):
+            return self.state.seed_unit_at(
+                peak_sample,
+                stimno=int(stimno),
+                channel=channel_name,
+                auto_track=True,
+            )
+
+        # Fallback when ViewerState does not define seed_unit_at
+        self.state.addUnitGroup()
+        new_idx = len(self.state.spike_groups) - 1
+        if new_idx < 0:
+            return None
+        sg = self.state.spike_groups[new_idx]
+        if channel_name:
+            sg.channel = channel_name
+            sg.tracking_channel = channel_name
+            if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+                sg.event.annotations["channel"] = channel_name
+                sg.event.annotations["tracking_channel"] = channel_name
+        sg.auto_track = True
+        if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+            sg.event.annotations["auto_track"] = True
+        if hasattr(self.state, "setUnitGroup"):
+            self.state.setUnitGroup(new_idx)
+        self.state.setUnit(peak_sample, stimno=int(stimno), unitid=new_idx)
+        return new_idx
+
+    def _current_unit_sample_or_center(self, panel: ChannelPlotPanel, stimno: int) -> int:
+        ug = self.get_target_unit()
+        if ug is not None and getattr(ug, "idx_arr", None):
+            if 0 <= stimno < len(ug.idx_arr) and ug.idx_arr[stimno] is not None:
+                item = ug.idx_arr[stimno]
+                return int(item[0] if isinstance(item, (tuple, list)) else item)
+            for item in ug.idx_arr:
+                if item is not None:
+                    return int(item[0] if isinstance(item, (tuple, list)) else item)
+        xr = panel.plot.viewRange()[0] if panel is not None else self.main_plot.viewRange()[0]
+        return max(0, int(round((float(xr[0]) + float(xr[1])) / 2.0)))
+
+    def _seed_unit_at_current_sweep(self, panel: ChannelPlotPanel):
+        if self.state is None:
+            return
+        stimno = int(getattr(self.state, "stimno", 0) or 0)
+        sample_x = float(self._current_unit_sample_or_center(panel, stimno))
+        self.seed_new_unit_at_pos(sample_x, stimno=stimno, channel_name=panel.channel_name)
+
+    def _reanchor_active_unit_at_current_sweep(self, panel: ChannelPlotPanel):
+        if self.state is None:
+            return
+        stimno = int(getattr(self.state, "stimno", 0) or 0)
+        unit_idx = self.get_target_unit_idx()
+        sample_x = self._current_unit_sample_or_center(panel, stimno)
+        peak_sample = self._snap_peak_on_sweep(sample_x, stimno, panel.channel_name)
+        if hasattr(self.state, "reanchor_unit_at"):
+            self.state.reanchor_unit_at(
+                unit_idx,
+                peak_sample,
+                stimno=stimno,
+            )
+        else:
+            self.state.setUnit(peak_sample, stimno=stimno, unitid=unit_idx)
+
+    def _clear_protocol_markers_overlay(self):
+        for item in getattr(self, "message_items", []):
+            try:
+                if item.scene() is not None:
+                    self.main_plot.removeItem(item)
+            except Exception:
+                pass
+        self.message_items.clear()
+        for item in getattr(self, "protocol_marker_items", []):
+            try:
+                if item.scene() is not None:
+                    self.main_plot.removeItem(item)
+            except Exception:
+                pass
+        self.protocol_marker_items.clear()
+
+    def _update_protocol_markers_overlay(self, *args):
+        if self.state is None or not hasattr(self, "main_plot") or self.main_plot is None:
+            return
+        self._clear_protocol_markers_overlay()
+
+        markers = []
+        if hasattr(self.state, "get_protocol_markers"):
+            try:
+                markers = list(self.state.get_protocol_markers() or [])
+            except Exception:
+                markers = []
+
+        show_messages = hasattr(self, "showMessages") and self.showMessages.isChecked()
+        if not show_messages and not markers:
+            return
+
+        is_time = getattr(self, "y_axis_mode", "sweep") == "time"
+        stim_times_s = self._get_stim_times_s() if is_time else None
+        cur_stim = int(getattr(self.state, "stimno", 0) or 0)
+        t_selected = (
+            stim_times_s[min(max(0, cur_stim), len(stim_times_s) - 1)]
+            if (is_time and stim_times_s is not None and len(stim_times_s) > 0)
+            else 0.0
+        )
+
+        # Collect log.other messages when showMessages is checked
+        if show_messages and getattr(self.state, "segment", None) is not None and getattr(self.state, "event_signal", None) is not None:
+            try:
+                ev_other = next(e for e in self.state.segment.events if e.name == "log.other")
+                for i, t in enumerate(ev_other):
+                    yy = self.state.event_signal.times.searchsorted(t, "right") - 1
+                    y_pos = (
+                        float(stim_times_s[yy] - t_selected)
+                        if (is_time and stim_times_s is not None and 0 <= yy < len(stim_times_s))
+                        else float(yy)
+                    )
+                    msg = ev_other.array_annotations.get("message", [""])[i]
+                    txt = pg.TextItem(text=str(msg), color=(0, 0, 0), fill=pg.mkBrush(255, 255, 255, 200))
+                    txt.setPos(0, y_pos)
+                    self.main_plot.addItem(txt)
+                    self.message_items.append(txt)
+            except StopIteration:
+                pass
+
+        # Render protocol markers (lines + badges)
+        for m in markers:
+            if isinstance(m, dict):
+                m_stim = m.get("stimno")
+                m_time = m.get("time_s", m.get("timestamp_s"))
+                m_label = str(m.get("label", m.get("message", m.get("name", "Marker"))))
+            else:
+                m_stim = getattr(m, "stimno", None)
+                m_time = getattr(m, "time_s", getattr(m, "timestamp_s", None))
+                m_label = str(getattr(m, "label", getattr(m, "message", getattr(m, "name", "Marker"))))
+
+            if is_time:
+                if m_time is not None:
+                    y_pos = float(m_time) - t_selected
+                elif m_stim is not None and stim_times_s is not None and 0 <= int(m_stim) < len(stim_times_s):
+                    y_pos = float(stim_times_s[int(m_stim)] - t_selected)
+                else:
+                    continue
+            else:
+                if m_stim is not None:
+                    y_pos = float(m_stim)
+                elif m_time is not None and stim_times_s is not None and len(stim_times_s) > 0:
+                    y_pos = float(np.searchsorted(stim_times_s, float(m_time), side="right") - 1)
+                else:
+                    continue
+
+            line = pg.InfiniteLine(
+                angle=0,
+                pos=y_pos,
+                pen=pg.mkPen((40, 110, 180, 180), width=1.2, style=Qt.DashLine),
+                movable=False,
+            )
+            line.setZValue(14)
+            self.main_plot.addItem(line)
+            self.protocol_marker_items.append(line)
+
+            badge = pg.TextItem(
+                text=m_label,
+                color=(20, 60, 120),
+                fill=pg.mkBrush(225, 240, 255, 220),
+                border=pg.mkPen((40, 110, 180, 180), width=1),
+                anchor=(0, 1),
+            )
+            badge.setPos(0, y_pos)
+            badge.setZValue(15)
+            self.main_plot.addItem(badge)
+            self.protocol_marker_items.append(badge)
+
+    def _on_container_visual_settings_changed(self, settings: Dict[str, Any]):
+        if isinstance(settings, dict):
+            self.apply_shared_visual_settings(settings)
+
+    def _on_shared_visual_settings_changed(self, *args):
+        set_name = None
+        settings = None
+        if len(args) == 1:
+            if isinstance(args[0], dict):
+                settings = args[0]
+            elif isinstance(args[0], str):
+                set_name = args[0]
+        elif len(args) >= 2:
+            set_name = args[0]
+            if isinstance(args[1], dict):
+                settings = args[1]
+
+        bound_set = (
+            self.channel_bar.get_bound_shared_set()
+            if hasattr(self, "channel_bar") and self.channel_bar is not None
+            and hasattr(self.channel_bar, "get_bound_shared_set")
+            else None
+        )
+        if set_name is not None and set_name != bound_set:
+            return
+        if settings is None and self.state is not None and set_name is not None:
+            if hasattr(self.state, "get_shared_visual_settings"):
+                settings = self.state.get_shared_visual_settings(set_name)
+            elif hasattr(self.state, "get_shared_channel_set"):
+                s = self.state.get_shared_channel_set(set_name)
+                if isinstance(s, dict):
+                    settings = s.get("visual_settings")
+        if isinstance(settings, dict):
+            self.apply_shared_visual_settings(settings)
+
+    def apply_shared_visual_settings(self, settings: Dict[str, Any]):
+        if not isinstance(settings, dict) or self._applying_shared_visuals:
+            return
+        self._applying_shared_visuals = True
+        try:
+            needs_setup = False
+            needs_levels = False
+
+            if "scale_mode" in settings and hasattr(self, "scale_mode_combo"):
+                mode = str(settings["scale_mode"])
+                if mode != self.scale_mode:
+                    self.scale_mode = mode
+                    with QSignalBlocker(self.scale_mode_combo):
+                        idx = self.scale_mode_combo.findText(mode)
+                        if idx >= 0:
+                            self.scale_mode_combo.setCurrentIndex(idx)
+                    if self.mode == "lines":
+                        needs_setup = True
+                    else:
+                        needs_levels = True
+
+            if "color_scale" in settings and settings["color_scale"] is not None:
+                cs = settings["color_scale"]
+                if len(cs) == 2 and hasattr(self, "lowerSpinBox") and hasattr(self, "upperSpinBox"):
+                    lo, hi = float(cs[0]), float(cs[1])
+                    with QSignalBlocker(self.lowerSpinBox), QSignalBlocker(self.upperSpinBox):
+                        self.upperSpinBox.setMinimum(0.0)
+                        self.lowerSpinBox.setMaximum(max(10.0, hi))
+                        self.lowerSpinBox.setValue(lo)
+                        self.upperSpinBox.setValue(hi)
+                        self.upperSpinBox.setMinimum(lo)
+                        self.lowerSpinBox.setMaximum(hi)
+                    needs_levels = True
+
+            if "trace_scale" in settings and settings["trace_scale"] is not None and hasattr(self, "scale_spinner"):
+                sc = float(settings["trace_scale"])
+                if abs(sc - self.scale) > 1e-9:
+                    self.scale = sc
+                    with QSignalBlocker(self.scale_spinner):
+                        self.scale_spinner.setValue(sc)
+                    if self.mode == "lines":
+                        needs_setup = True
+
+            if "x_range" in settings and settings["x_range"] is not None:
+                xr = settings["x_range"]
+                if len(xr) == 2 and xr[0] is not None and xr[1] is not None:
+                    x0, x1 = float(xr[0]), float(xr[1])
+                    if x0 < x1:
+                        self.main_plot.setXRange(x0, x1, padding=0)
+
+            if needs_setup:
+                self.setup_figure()
+            elif needs_levels:
+                self.updateAll()
+        finally:
+            self._applying_shared_visuals = False
 
     # --- Window State & Settings ---
 

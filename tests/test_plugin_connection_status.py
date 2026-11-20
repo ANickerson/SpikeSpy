@@ -140,3 +140,41 @@ def test_oe_live_view_status_badges(qtbot):
     assert "● SpikeSpy Streamer" in view.lbl_plugin_detected.text()
     assert "10 sweeps sent" in view.lbl_plugin_detected.text()
     assert "#2b7a2b" in view.lbl_plugin_detected.styleSheet()
+    assert "Sweeps: 10" in view.lbl_summary_sweeps.text()
+
+
+def test_oe_live_view_tab_organization_and_summary_header(qtbot):
+    """Verify OpenEphysLiveView organizes sub-groups into 4 tabs and keeps header synced."""
+    state = ViewerState()
+    view = OpenEphysLiveView(state=state)
+    qtbot.addWidget(view)
+
+    assert view.tabs_live.count() == 4
+    assert view.tabs_live.tabText(0) == "📡 Acquisition & Channels"
+    assert view.tabs_live.tabText(1) == "⚡ Closed-Loop & OE"
+    assert view.tabs_live.tabText(2) == "📊 Diagnostics & Demo"
+    assert view.tabs_live.tabText(3) == "⏪ Replay Signal"
+
+    assert view.conn_group.parent() is view
+    assert view.tabs_live.widget(0).isAncestorOf(view.chan_group)
+    assert view.tabs_live.widget(1).isAncestorOf(view.bidi_group)
+    assert view.tabs_live.widget(2).isAncestorOf(view.diag_group)
+    assert view.tabs_live.widget(3).isAncestorOf(view.replay_group)
+
+    # Compact status header stays synchronized with stream and OE status updates
+    view._is_streaming = True
+    view._on_connection_status_changed(True, "127.0.0.1:5556")
+    view._on_oe_status_changed("ACQUIRE")
+    assert "● Connected" in view.lbl_summary_status.text()
+    assert "● ACQUIRE" in view.lbl_summary_oe.text()
+
+    # Tab index persists across get_settings / set_settings
+    view.tabs_live.setCurrentIndex(2)
+    saved = view.get_settings()
+    assert saved["active_tab"] == 2
+
+    restored = OpenEphysLiveView(state=state)
+    qtbot.addWidget(restored)
+    restored.set_settings(saved)
+    assert restored.tabs_live.currentIndex() == 2
+

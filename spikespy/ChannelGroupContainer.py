@@ -159,6 +159,14 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
         self.chk_follow_events.toggled.connect(self._on_follow_events_toggled)
         self.control_bar.addWidget(self.chk_follow_events)
 
+        # Sync Visuals checkbox
+        self.chk_sync_visuals = QCheckBox("🔗 Sync Visuals", self)
+        self.chk_sync_visuals.setChecked(True)
+        self.chk_sync_visuals.setToolTip(
+            "Synchronize visual settings (scale mode, color scale, trace scale, X range) across views in this container."
+        )
+        self.control_bar.addWidget(self.chk_sync_visuals)
+
         self.addToolBar(Qt.TopToolBarArea, self.control_bar)
 
         if state is not None:
@@ -469,6 +477,18 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
         # Synchronize child to this container's channel/unit settings immediately
         self._sync_child(child)
 
+        # Synchronize child to container visual settings when enabled
+        if (
+            self.chk_sync_visuals.isChecked()
+            and self.view_state is not None
+            and hasattr(self.view_state, "get_visual_settings")
+            and hasattr(child, "apply_shared_visual_settings")
+        ):
+            vis = self.view_state.get_visual_settings() or {}
+            non_none_vis = {k: v for k, v in vis.items() if v is not None}
+            if non_none_vis:
+                child.apply_shared_visual_settings(non_none_vis)
+
         if self.state and getattr(self.state, "hide_view_top_bars", False):
             from .helpers import apply_top_bars_visibility
             apply_top_bars_visibility(child, True)
@@ -590,6 +610,17 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
                 child.channel_bar.bind_to_channels(self.channel_bar.get_selected_channels())
             child.channel_bar.chk_multichannel.setChecked(self.channel_bar.is_multichannel())
 
+    def broadcast_visual_settings(self, **kwargs):
+        """Update container visual settings and apply them to all child views."""
+        clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        if not clean_kwargs:
+            return
+        if self.view_state is not None and hasattr(self.view_state, "update_visual_settings"):
+            self.view_state.update_visual_settings(**clean_kwargs)
+        for child in self.sub_views:
+            if hasattr(child, "apply_shared_visual_settings"):
+                child.apply_shared_visual_settings(clean_kwargs)
+
     def get_child_views(self) -> List[QWidget]:
         return list(self.sub_views)
 
@@ -610,6 +641,7 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
             "layout": self._current_layout,
             "follow_live": self.is_following_live(),
             "follow_live_events": self.is_following_live_events(),
+            "sync_visuals": self.chk_sync_visuals.isChecked(),
             "children": children_settings,
         }
 
@@ -625,6 +657,8 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
             self.set_follow_live(bool(values["follow_live"]))
         if "follow_live_events" in values:
             self.set_follow_live_events(bool(values["follow_live_events"]))
+        if "sync_visuals" in values:
+            self.chk_sync_visuals.setChecked(bool(values["sync_visuals"]))
         if "children" in values:
             for c_info in values["children"]:
                 child = self.add_view_by_key(c_info.get("class", ""))

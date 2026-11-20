@@ -230,14 +230,18 @@ def notify_view_selected(view_or_child, ensure_panel_visible: bool = True):
     if view_or_child is None:
         return
     from PySide6.QtWidgets import QApplication, QWidget
+    try:
+        from shiboken6 import isValid as _qt_is_valid
+    except Exception:
+        _qt_is_valid = lambda _obj: True
 
-    if not isinstance(view_or_child, QWidget):
+    if not isinstance(view_or_child, QWidget) or not _qt_is_valid(view_or_child):
         return
 
     # Find MdiView
     mdi = None
     curr = view_or_child
-    while curr is not None:
+    while curr is not None and _qt_is_valid(curr):
         if curr.__class__.__name__ == "MdiView" or (
             hasattr(curr, "settings_panel") and hasattr(curr, "dock_manager")
         ):
@@ -246,7 +250,7 @@ def notify_view_selected(view_or_child, ensure_panel_visible: bool = True):
         curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
     if mdi is None:
         win = view_or_child.window()
-        if win is not None and (
+        if win is not None and _qt_is_valid(win) and (
             win.__class__.__name__ == "MdiView" or hasattr(win, "settings_panel")
         ):
             mdi = win
@@ -254,18 +258,20 @@ def notify_view_selected(view_or_child, ensure_panel_visible: bool = True):
         app = QApplication.instance()
         if app is not None:
             for top_w in app.topLevelWidgets():
+                if not _qt_is_valid(top_w):
+                    continue
                 if top_w.__class__.__name__ == "MdiView" or hasattr(top_w, "settings_panel"):
                     mdi = top_w
                     break
 
-    if mdi is not None:
+    if mdi is not None and _qt_is_valid(mdi):
         if getattr(mdi, "settings_panel", None) is None and hasattr(mdi, "open_or_show_view_settings_panel"):
             mdi.open_or_show_view_settings_panel()
 
-        if hasattr(mdi, "settings_panel") and mdi.settings_panel is not None:
+        if hasattr(mdi, "settings_panel") and mdi.settings_panel is not None and _qt_is_valid(mdi.settings_panel):
             try:
                 resolved = mdi.settings_panel._resolve_view(view_or_child)
-                if mdi.settings_panel._is_configurable_view(resolved):
+                if resolved is not None and _qt_is_valid(resolved) and mdi.settings_panel._is_configurable_view(resolved):
                     mdi.settings_panel.setActiveView(resolved)
                     if ensure_panel_visible and hasattr(mdi, "open_or_show_view_settings_panel"):
                         mdi.open_or_show_view_settings_panel()

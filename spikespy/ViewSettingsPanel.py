@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .ActiveUnitInfoView import ActiveUnitInfoView
 from .ChannelGroupBar import ChannelGroupBar
 from .MultiTracePlotManager import MultiTracePlotManager
 
@@ -44,6 +45,7 @@ class ViewSettingsPanel(QWidget):
         self.state = state
         self.active_view: Optional[QWidget] = None
         self._active_state_connections = []
+        self._current_view_connections = []
         self._block_updates = False
 
         self.setWindowTitle("View Settings")
@@ -144,7 +146,7 @@ class ViewSettingsPanel(QWidget):
         row_opts.addWidget(self.btn_group_menu)
         grp_layout.addLayout(row_opts)
 
-        # Follow Live Events checkbox row
+        # Follow Live Events and Sync Visuals checkboxes row
         row_live = QHBoxLayout()
         self.chk_follow_events = QCheckBox("📡 Follow Live Events", self.grp_unit_selector)
         self.chk_follow_events.setToolTip(
@@ -152,6 +154,14 @@ class ViewSettingsPanel(QWidget):
         )
         self.chk_follow_events.toggled.connect(self._on_follow_events_toggled)
         row_live.addWidget(self.chk_follow_events)
+
+        self.chk_sync_group_visuals = QCheckBox("🔗 Sync Visuals Across Group", self.grp_unit_selector)
+        self.chk_sync_group_visuals.setChecked(True)
+        self.chk_sync_group_visuals.setToolTip(
+            "Broadcast visual setting changes (scale mode, color scale, trace scale, X range) "
+            "to sibling views in the same channel group container or shared channel set."
+        )
+        row_live.addWidget(self.chk_sync_group_visuals)
         grp_layout.addLayout(row_live)
 
         main_layout.addWidget(self.grp_unit_selector)
@@ -177,6 +187,16 @@ class ViewSettingsPanel(QWidget):
         self.container_layout = QVBoxLayout(self.container_widget)
         self.container_layout.setContentsMargins(0, 0, 0, 0)
         self.container_layout.setSpacing(8)
+
+        # Compact Active Unit Info & Tracking section
+        self.grp_active_unit_info = QGroupBox("Active Unit Info & Tracking", self)
+        unit_info_layout = QVBoxLayout(self.grp_active_unit_info)
+        unit_info_layout.setContentsMargins(4, 4, 4, 4)
+        self.unit_info_widget = ActiveUnitInfoView(
+            parent=self.grp_active_unit_info, state=self.state, compact=True
+        )
+        unit_info_layout.addWidget(self.unit_info_widget)
+        self.container_layout.addWidget(self.grp_active_unit_info)
 
         # Empty placeholder widget
         self.placeholder = QLabel("Select a view to display its configuration options.")
@@ -587,6 +607,13 @@ class ViewSettingsPanel(QWidget):
         """Cleanly disconnect any signals from the previously active view."""
         self._disconnect_navigation_signals()
         self._disconnect_active_state_signals()
+        for sig, slot in getattr(self, "_current_view_connections", []):
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        if hasattr(self, "_current_view_connections"):
+            self._current_view_connections.clear()
         if hasattr(self, "mt_plot_manager"):
             self.mt_plot_manager.set_view(None)
         self.active_view = None
@@ -625,9 +652,13 @@ class ViewSettingsPanel(QWidget):
 
     def set_state(self, state):
         self.state = state
+        if hasattr(self, "unit_info_widget") and self.unit_info_widget is not None:
+            self.unit_info_widget.set_state(state)
         if self.state is not None:
             self._connect_state_signals()
             self._refresh_unit_combo()
+            self._refresh_channel_combo()
+            self._sync_follow_events_checkbox()
             if hasattr(self, "chk_hide_top_bars"):
                 self.chk_hide_top_bars.setChecked(getattr(self.state, "hide_view_top_bars", False))
 
@@ -721,15 +752,23 @@ class ViewSettingsPanel(QWidget):
             if not restored:
                 self.combo_unit.setCurrentIndex(0)
 
+    def _resolve_active_view_bound_unit(self, view: Optional[QWidget]) -> Optional[int]:
+        if view is None or not self._is_view_alive(view):
+            return None
+        container = self._find_parent_container(view)
+        if container is not None and hasattr(container, "channel_bar") and container.channel_bar is not None:
+            return container.channel_bar.get_bound_unit()
+        if hasattr(view, "channel_bar") and view.channel_bar is not None:
+            return view.channel_bar.get_bound_unit()
+        if hasattr(view, "get_target_unit_idx") and callable(getattr(view, "get_target_unit_idx")):
+            if hasattr(view, "channel_bar") and hasattr(view.channel_bar, "is_unit_locked") and view.channel_bar.is_unit_locked():
+                return view.get_target_unit_idx()
+        return None
+
     def _on_state_unit_changed(self, *args):
         self._refresh_unit_combo()
         if self.active_view is not None:
-            container = self._find_parent_container(self.active_view)
-            bound = None
-            if container is not None and hasattr(container, "channel_bar") and container.channel_bar is not None:
-                bound = container.channel_bar.get_bound_unit()
-            elif hasattr(self.active_view, "channel_bar") and self.active_view.channel_bar is not None:
-                bound = self.active_view.channel_bar.get_bound_unit()
+            bound = self._resolve_active_view_bound_unit(self.active_view)
             with QSignalBlocker(self.combo_unit):
                 target_idx = 0
                 for idx in range(self.combo_unit.count()):
@@ -737,6 +776,11 @@ class ViewSettingsPanel(QWidget):
                         target_idx = idx
                         break
                 self.combo_unit.setCurrentIndex(target_idx)
+            if hasattr(self, "unit_info_widget") and self.unit_info_widget is not None:
+                self.unit_info_widget.set_target_unit(bound)
+        else:
+            if hasattr(self, "unit_info_widget") and self.unit_info_widget is not None:
+                self.unit_info_widget.set_target_unit(None)
 
     def _on_unit_selection_changed(self, idx: int):
         if self._block_updates or self.active_view is None:
@@ -766,6 +810,8 @@ class ViewSettingsPanel(QWidget):
                 self.active_view.channel_bar.bind_to_unit(selected_unit)
             elif hasattr(self.active_view, "bind_to_unit"):
                 self.active_view.bind_to_unit(selected_unit)
+        if hasattr(self, "unit_info_widget") and self.unit_info_widget is not None:
+            self.unit_info_widget.set_target_unit(selected_unit)
         self.settingsChanged.emit()
 
     def _get_active_channel_bar(self) -> Optional[ChannelGroupBar]:
@@ -1199,6 +1245,8 @@ class ViewSettingsPanel(QWidget):
                 self._custom_plugin_grp.deleteLater()
                 self._custom_plugin_grp = None
             self.placeholder.setVisible(True)
+            if hasattr(self, "unit_info_widget") and self.unit_info_widget is not None:
+                self.unit_info_widget.set_target_unit(None)
             self._block_updates = False
             return
 
@@ -1256,15 +1304,7 @@ class ViewSettingsPanel(QWidget):
                 return
 
             self.grp_unit_selector.setVisible(True)
-            bound_unit = None
-            container = self._find_parent_container(view)
-            if container is not None and hasattr(container, "channel_bar") and container.channel_bar is not None:
-                bound_unit = container.channel_bar.get_bound_unit()
-            elif hasattr(view, "channel_bar") and view.channel_bar is not None:
-                bound_unit = view.channel_bar.get_bound_unit()
-            elif hasattr(view, "get_target_unit_idx") and callable(getattr(view, "get_target_unit_idx")):
-                if hasattr(view, "channel_bar") and hasattr(view.channel_bar, "is_unit_locked") and view.channel_bar.is_unit_locked():
-                    bound_unit = view.get_target_unit_idx()
+            bound_unit = self._resolve_active_view_bound_unit(view)
 
             with QSignalBlocker(self.combo_unit):
                 target_idx = 0
@@ -1274,12 +1314,23 @@ class ViewSettingsPanel(QWidget):
                         break
                 self.combo_unit.setCurrentIndex(target_idx)
 
+            if hasattr(self, "unit_info_widget") and self.unit_info_widget is not None:
+                self.unit_info_widget.set_target_unit(bound_unit)
+
+            for sig, slot in getattr(self, "_current_view_connections", []):
+                try:
+                    sig.disconnect(slot)
+                except (TypeError, RuntimeError):
+                    pass
+            if hasattr(self, "_current_view_connections"):
+                self._current_view_connections.clear()
+
             target_bar = self._get_active_channel_bar()
             if target_bar is not None:
                 self._sync_channel_selection_from_bar()
                 try:
-                    target_bar.bindingChanged.connect(self._sync_channel_selection_from_bar)
-                    self._current_view_connections.append((target_bar.bindingChanged, self._sync_channel_selection_from_bar))
+                    target_bar.bindingChanged.connect(self._on_active_bar_binding_changed)
+                    self._current_view_connections.append((target_bar.bindingChanged, self._on_active_bar_binding_changed))
                 except Exception:
                     pass
             else:
@@ -1471,6 +1522,66 @@ class ViewSettingsPanel(QWidget):
             self.spin_unit_last_n.setValue(int(view.spin_last_n.value()))
 
     # ---------------------------------------------------------
+    # Shared Visual Settings Broadcasting
+    # ---------------------------------------------------------
+    def _on_active_bar_binding_changed(self):
+        self._sync_channel_selection_from_bar()
+        if self.active_view is not None and self._is_view_alive(self.active_view):
+            bound = self._resolve_active_view_bound_unit(self.active_view)
+            with QSignalBlocker(self.combo_unit):
+                target_idx = 0
+                for idx in range(self.combo_unit.count()):
+                    if self.combo_unit.itemData(idx) == bound:
+                        target_idx = idx
+                        break
+                self.combo_unit.setCurrentIndex(target_idx)
+            if hasattr(self, "unit_info_widget") and self.unit_info_widget is not None:
+                self.unit_info_widget.set_target_unit(bound)
+
+    def _broadcast_shared_visual_settings(self, **kwargs):
+        if (
+            not hasattr(self, "chk_sync_group_visuals")
+            or not self.chk_sync_group_visuals.isChecked()
+            or not kwargs
+        ):
+            return
+
+        clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
+        if not clean_kwargs:
+            return
+
+        # 1. Broadcast to ChannelGroupContainerView if active view lives inside one
+        container = self._find_parent_container(self.active_view)
+        if container is not None:
+            if (
+                hasattr(container, "chk_sync_visuals")
+                and not container.chk_sync_visuals.isChecked()
+            ):
+                pass
+            else:
+                if (
+                    getattr(container, "view_state", None) is not None
+                    and hasattr(container.view_state, "update_visual_settings")
+                ):
+                    container.view_state.update_visual_settings(**clean_kwargs)
+                if hasattr(container, "sub_views"):
+                    for sv in container.sub_views:
+                        if sv is not self.active_view and hasattr(sv, "apply_shared_visual_settings"):
+                            sv.apply_shared_visual_settings(clean_kwargs)
+
+        # 2. Broadcast to shared channel set if bound to one
+        target_bar = self._get_active_channel_bar()
+        if target_bar is not None and hasattr(target_bar, "get_channel_mode"):
+            mode, val = target_bar.get_channel_mode()
+            if (
+                mode == ChannelGroupBar.MODE_SHARED_SET
+                and val
+                and self.state is not None
+                and hasattr(self.state, "update_shared_visual_settings")
+            ):
+                self.state.update_shared_visual_settings(val, **clean_kwargs)
+
+    # ---------------------------------------------------------
     # Event Handlers to update active view
     # ---------------------------------------------------------
     def _on_mt_scale_mode_changed(self, text: str):
@@ -1483,6 +1594,7 @@ class ViewSettingsPanel(QWidget):
             self.active_view._on_scale_mode_changed(text)
         elif hasattr(self.active_view, "set_settings"):
             self.active_view.set_settings({"scale_mode": text})
+        self._broadcast_shared_visual_settings(scale_mode=text)
         self.settingsChanged.emit()
 
     def _on_fix_scale_mode_changed(self, text: str):
@@ -1494,6 +1606,7 @@ class ViewSettingsPanel(QWidget):
             self.active_view.set_scale_setting(text)
         elif hasattr(self.active_view, "set_settings"):
             self.active_view.set_settings({"scale_mode": text})
+        self._broadcast_shared_visual_settings(scale_mode=text)
         self.settingsChanged.emit()
 
     def _on_mt_mode_changed(self, idx: int):
@@ -1526,6 +1639,7 @@ class ViewSettingsPanel(QWidget):
             self.active_view.set_percentiles(low, high)
         elif hasattr(self.active_view, "update_axis"):
             self.active_view.update_axis()
+        self._broadcast_shared_visual_settings(color_scale=(float(low), float(high)))
         self.settingsChanged.emit()
 
     def _on_mt_lock_stim_toggled(self, checked: bool):
@@ -1625,6 +1739,7 @@ class ViewSettingsPanel(QWidget):
                 self.active_view.update_plot()
             elif hasattr(self.active_view, "plot"):
                 self.active_view.plot()
+        self._broadcast_shared_visual_settings(trace_scale=float(val))
         self.settingsChanged.emit()
 
     def _on_fix_sweeps_changed(self):
@@ -1992,6 +2107,7 @@ class ViewSettingsPanel(QWidget):
                     self.active_view.canvas.draw_idle()
         finally:
             self._block_updates = False
+        self._broadcast_shared_visual_settings(x_range=(xmin, xmax))
         self.settingsChanged.emit()
 
     def _on_auto_limits_clicked(self):

@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -29,6 +31,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -104,14 +107,56 @@ class OpenEphysLiveView(QWidget):
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(8, 8, 8, 8)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(6, 6, 6, 6)
+        main_layout.setSpacing(6)
 
         # -------------------------------------------------------------
-        # 1. Connection Group
+        # 1. Connection & Live Stream Control (Always Visible)
         # -------------------------------------------------------------
-        conn_group = QGroupBox("Open Ephys Connection (v1.0+)")
-        conn_layout = QFormLayout(conn_group)
+        self.conn_group = QGroupBox("Connection & Live Stream Control")
+        conn_vbox = QVBoxLayout(self.conn_group)
+        conn_vbox.setContentsMargins(8, 8, 8, 8)
+        conn_vbox.setSpacing(6)
+
+        # Compact live status summary header
+        self.status_summary_bar = QFrame()
+        self.status_summary_bar.setFrameShape(QFrame.StyledPanel)
+        self.status_summary_bar.setStyleSheet(
+            "QFrame { border: 1px solid rgba(128, 128, 128, 0.3); "
+            "border-radius: 4px; background-color: rgba(128, 128, 128, 0.08); }"
+        )
+        summary_layout = QVBoxLayout(self.status_summary_bar)
+        summary_layout.setContentsMargins(8, 5, 8, 5)
+        summary_layout.setSpacing(2)
+
+        self.lbl_summary_status = QLabel("○ Disconnected")
+        self.lbl_summary_status.setStyleSheet(
+            "color: gray; font-weight: bold; border: none; background: transparent;"
+        )
+        summary_layout.addWidget(self.lbl_summary_status)
+
+        summary_meta_row = QHBoxLayout()
+        summary_meta_row.setContentsMargins(0, 0, 0, 0)
+        summary_meta_row.setSpacing(8)
+        self.lbl_summary_oe = QLabel("OE: ○ Disconnected")
+        self.lbl_summary_oe.setStyleSheet(
+            "color: gray; font-size: 11px; border: none; background: transparent;"
+        )
+        self.lbl_summary_sweeps = QLabel("Sweeps: 0")
+        self.lbl_summary_sweeps.setStyleSheet(
+            "font-size: 11px; font-weight: bold; border: none; background: transparent;"
+        )
+        summary_meta_row.addWidget(self.lbl_summary_oe)
+        summary_meta_row.addStretch()
+        summary_meta_row.addWidget(self.lbl_summary_sweeps)
+        summary_layout.addLayout(summary_meta_row)
+
+        conn_vbox.addWidget(self.status_summary_bar)
+
+        conn_grid = QGridLayout()
+        conn_grid.setContentsMargins(0, 0, 0, 0)
+        conn_grid.setHorizontalSpacing(8)
+        conn_grid.setVerticalSpacing(4)
 
         self.edit_host = QLineEdit("127.0.0.1")
         self.spin_data_port = QSpinBox()
@@ -136,11 +181,21 @@ class OpenEphysLiveView(QWidget):
             ]
         )
 
-        conn_layout.addRow("Host:", self.edit_host)
-        conn_layout.addRow("ZMQ Data Port:", self.spin_data_port)
-        conn_layout.addRow("ZMQ Event / Heartbeat Port:", self.spin_event_port)
-        conn_layout.addRow("OE HTTP API Port:", self.spin_http_port)
-        conn_layout.addRow("Stream Mode:", self.combo_stream_mode)
+        conn_grid.addWidget(QLabel("Host:"), 0, 0)
+        conn_grid.addWidget(self.edit_host, 0, 1)
+        conn_grid.addWidget(QLabel("HTTP Port:"), 0, 2)
+        conn_grid.addWidget(self.spin_http_port, 0, 3)
+
+        conn_grid.addWidget(QLabel("Data Port:"), 1, 0)
+        conn_grid.addWidget(self.spin_data_port, 1, 1)
+        conn_grid.addWidget(QLabel("Event Port:"), 1, 2)
+        conn_grid.addWidget(self.spin_event_port, 1, 3)
+
+        conn_grid.addWidget(QLabel("Stream Mode:"), 2, 0)
+        conn_grid.addWidget(self.combo_stream_mode, 2, 1, 1, 3)
+        conn_grid.setColumnStretch(1, 1)
+        conn_grid.setColumnStretch(3, 1)
+        conn_vbox.addLayout(conn_grid)
 
         self.btn_toggle_stream = QPushButton("Start Live Stream")
         self.btn_toggle_stream.setStyleSheet("font-weight: bold; padding: 6px;")
@@ -154,17 +209,34 @@ class OpenEphysLiveView(QWidget):
         self.btn_reset_session.clicked.connect(self.reset_session)
 
         stream_btn_layout = QHBoxLayout()
+        stream_btn_layout.setSpacing(6)
         stream_btn_layout.addWidget(self.btn_toggle_stream)
         stream_btn_layout.addWidget(self.btn_reset_session)
-        conn_layout.addRow(stream_btn_layout)
+        conn_vbox.addLayout(stream_btn_layout)
 
-        main_layout.addWidget(conn_group)
+        main_layout.addWidget(self.conn_group)
 
         # -------------------------------------------------------------
-        # 2. Channel & Filter Group
+        # Tabbed Controls Below Connection Group
         # -------------------------------------------------------------
-        chan_group = QGroupBox("Channel & Online Slicing")
-        chan_layout = QFormLayout(chan_group)
+        self.tabs_live = QTabWidget(self)
+        main_layout.addWidget(self.tabs_live, 1)
+
+        def _wrap_tab_group(group_box: QGroupBox) -> QWidget:
+            page = QWidget(self.tabs_live)
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(4, 6, 4, 4)
+            page_layout.setSpacing(6)
+            page_layout.addWidget(group_box)
+            page_layout.addStretch(1)
+            return page
+
+        # -------------------------------------------------------------
+        # Tab 1: Acquisition & Channels
+        # -------------------------------------------------------------
+        self.chan_group = QGroupBox("Channel & Online Slicing")
+        chan_layout = QFormLayout(self.chan_group)
+        chan_layout.setVerticalSpacing(6)
 
         self.spin_rec_chan = QSpinBox()
         self.spin_rec_chan.setRange(0, 512)
@@ -213,13 +285,146 @@ class OpenEphysLiveView(QWidget):
         chan_layout.addRow("", self.chk_online_filter)
         chan_layout.addRow("", self.chk_follow_live)
 
-        main_layout.addWidget(chan_group)
+        self.tabs_live.addTab(
+            _wrap_tab_group(self.chan_group), "📡 Acquisition & Channels"
+        )
 
         # -------------------------------------------------------------
-        # 2b. Replay of the currently loaded recording
+        # Tab 2: Closed-Loop & OE
         # -------------------------------------------------------------
-        replay_group = QGroupBox("Replay Loaded Signal")
-        replay_layout = QFormLayout(replay_group)
+        self.bidi_group = QGroupBox("Bidirectional Open Ephys Control")
+        bidi_layout = QFormLayout(self.bidi_group)
+        bidi_layout.setVerticalSpacing(6)
+
+        self.chk_sync_annotations = QCheckBox("Sync Annotations to MessageCenter")
+        self.chk_sync_annotations.setChecked(True)
+
+        self.spin_target_proc = QSpinBox()
+        self.spin_target_proc.setRange(0, 9999)
+        self.spin_target_proc.setValue(0)
+        self.spin_target_proc.setSpecialValueText("None (Broadcast Only)")
+
+        btn_hlayout = QHBoxLayout()
+        self.btn_query_chain = QPushButton("Query Signal Chain")
+        self.btn_query_chain.clicked.connect(self._query_signal_chain)
+        self.btn_toggle_oe_acq = QPushButton("Start OE Acquisition")
+        self.btn_toggle_oe_acq.clicked.connect(self._toggle_oe_acquisition)
+        btn_hlayout.addWidget(self.btn_query_chain)
+        btn_hlayout.addWidget(self.btn_toggle_oe_acq)
+
+        volt_hlayout = QHBoxLayout()
+        self.spin_stim_volt = QDoubleSpinBox()
+        self.spin_stim_volt.setRange(0.0, 100.0)
+        self.spin_stim_volt.setValue(5.0)
+        self.spin_stim_volt.setSuffix(" V")
+        self.btn_send_volt = QPushButton("Send Voltage")
+        self.btn_send_volt.clicked.connect(self._send_stim_voltage)
+        volt_hlayout.addWidget(self.spin_stim_volt)
+        volt_hlayout.addWidget(self.btn_send_volt)
+
+        bidi_layout.addRow("", self.chk_sync_annotations)
+        bidi_layout.addRow("Target Processor ID:", self.spin_target_proc)
+        bidi_layout.addRow("OE Control:", btn_hlayout)
+        bidi_layout.addRow("Stimulus Voltage:", volt_hlayout)
+
+        self.tabs_live.addTab(_wrap_tab_group(self.bidi_group), "⚡ Closed-Loop & OE")
+
+        # -------------------------------------------------------------
+        # Tab 3: Diagnostics & Demo
+        # -------------------------------------------------------------
+        self.diag_group = QGroupBox("Diagnostics & Live Metrics")
+        diag_layout = QFormLayout(self.diag_group)
+        diag_layout.setVerticalSpacing(5)
+
+        self.lbl_status = QLabel("○ Disconnected")
+        self.lbl_status.setStyleSheet("color: gray; font-weight: bold;")
+
+        self.lbl_oe_gui_status = QLabel("○ Disconnected")
+        self.lbl_oe_gui_status.setStyleSheet("color: gray; font-weight: bold;")
+
+        self.lbl_plugin_detected = QLabel("Not detected")
+        self.lbl_plugin_detected.setStyleSheet("color: gray;")
+
+        self.lbl_sweeps_count = QLabel("0")
+        self.lbl_spikes_count = QLabel("0")
+        self.lbl_stim_freq = QLabel("0.0 Hz")
+        self.lbl_ui_perf = QLabel("Normal (0.0 ms lag)")
+        self.lbl_ui_perf.setStyleSheet("color: #2b7a2b;")
+
+        metrics_row = QHBoxLayout()
+        metrics_row.setSpacing(6)
+        metrics_row.addWidget(QLabel("Sweeps:"))
+        metrics_row.addWidget(self.lbl_sweeps_count)
+        metrics_row.addWidget(QLabel("| Spikes:"))
+        metrics_row.addWidget(self.lbl_spikes_count)
+        metrics_row.addWidget(QLabel("| Freq:"))
+        metrics_row.addWidget(self.lbl_stim_freq)
+        metrics_row.addStretch()
+
+        diag_layout.addRow("Stream Status:", self.lbl_status)
+        diag_layout.addRow("Open Ephys GUI:", self.lbl_oe_gui_status)
+        diag_layout.addRow("Streamer Plugin:", self.lbl_plugin_detected)
+        diag_layout.addRow("Counters:", metrics_row)
+        diag_layout.addRow("UI Strain / Loop Lag:", self.lbl_ui_perf)
+
+        diag_divider = QFrame()
+        diag_divider.setFrameShape(QFrame.HLine)
+        diag_divider.setFrameShadow(QFrame.Sunken)
+        diag_layout.addRow(diag_divider)
+
+        # Demo stream parameter controls
+        self.spin_demo_stim_freq = QDoubleSpinBox()
+        self.spin_demo_stim_freq.setRange(0.5, 50.0)
+        self.spin_demo_stim_freq.setValue(5.0)
+        self.spin_demo_stim_freq.setSingleStep(0.5)
+        self.spin_demo_stim_freq.setSuffix(" Hz")
+        self.spin_demo_stim_freq.valueChanged.connect(self._on_demo_stim_freq_changed)
+
+        self.combo_demo_units = QComboBox()
+        self.combo_demo_units.addItems(
+            [
+                "1 Unit (Fast A-beta)",
+                "2 Units (A-beta + A-delta)",
+                "3 Units (A-beta, A-delta, C-fiber)",
+            ]
+        )
+        self.combo_demo_units.setCurrentIndex(2)
+
+        diag_layout.addRow("Demo Stim Freq (Hz):", self.spin_demo_stim_freq)
+        diag_layout.addRow("Demo Units:", self.combo_demo_units)
+
+        self.btn_start_demo = QPushButton("Start Built-in Demo Stream")
+        self.btn_start_demo.setStyleSheet(
+            "background-color: #2b5c8f; color: white; font-weight: bold; padding: 6px;"
+        )
+        self.btn_start_demo.clicked.connect(self.start_demo_stream)
+        diag_layout.addRow(self.btn_start_demo)
+
+        self.btn_open_debug = QPushButton("🔍 Open Live Stream & Trigger Debugger")
+        self.btn_open_debug.setStyleSheet(
+            "background-color: #2b7a2b; color: white; font-weight: bold; padding: 6px;"
+        )
+        self.btn_open_debug.setToolTip(
+            "Open the live continuous oscilloscope to view raw signal, monitor incoming TTL/crossing events, "
+            "and diagnose trigger clock synchronization in real time."
+        )
+        self.btn_open_debug.clicked.connect(self._open_debug_dialog)
+        diag_layout.addRow(self.btn_open_debug)
+
+        self.btn_dump_diag = QPushButton("Show UI Performance & Freeze Diagnostics")
+        self.btn_dump_diag.clicked.connect(self._show_ui_diagnostics_dialog)
+        diag_layout.addRow(self.btn_dump_diag)
+
+        self.tabs_live.addTab(
+            _wrap_tab_group(self.diag_group), "📊 Diagnostics & Demo"
+        )
+
+        # -------------------------------------------------------------
+        # Tab 4: Replay Signal
+        # -------------------------------------------------------------
+        self.replay_group = QGroupBox("Replay Loaded Signal")
+        replay_layout = QFormLayout(self.replay_group)
+        replay_layout.setVerticalSpacing(6)
 
         self.spin_replay_speed = QDoubleSpinBox()
         self.spin_replay_speed.setRange(0.1, 1000.0)
@@ -242,7 +447,7 @@ class OpenEphysLiveView(QWidget):
         self.btn_replay_loaded.setToolTip(
             "Slice the signal currently loaded in SpikeSpy at its stimulus events and "
             "feed those sweeps through the live pipeline, using the sweep window and "
-            "pre-stimulus time configured above."
+            "pre-stimulus time configured in Acquisition & Channels."
         )
         self.btn_replay_loaded.clicked.connect(self.toggle_replay)
 
@@ -295,121 +500,25 @@ class OpenEphysLiveView(QWidget):
         replay_layout.addRow(self.btn_replay_loaded)
         replay_layout.addRow(self.lbl_replay_info)
 
-        main_layout.addWidget(replay_group)
+        self.tabs_live.addTab(_wrap_tab_group(self.replay_group), "⏪ Replay Signal")
+        self._sync_header_summary()
 
-        # -------------------------------------------------------------
-        # 3. Bidirectional Closed-Loop Control Group
-        # -------------------------------------------------------------
-        bidi_group = QGroupBox("Bidirectional Open Ephys Control")
-        bidi_layout = QFormLayout(bidi_group)
-
-        self.chk_sync_annotations = QCheckBox("Sync Annotations to MessageCenter")
-        self.chk_sync_annotations.setChecked(True)
-
-        self.spin_target_proc = QSpinBox()
-        self.spin_target_proc.setRange(0, 9999)
-        self.spin_target_proc.setValue(0)
-        self.spin_target_proc.setSpecialValueText("None (Broadcast Only)")
-
-        btn_hlayout = QHBoxLayout()
-        self.btn_query_chain = QPushButton("Query Signal Chain")
-        self.btn_query_chain.clicked.connect(self._query_signal_chain)
-        self.btn_toggle_oe_acq = QPushButton("Start OE Acquisition")
-        self.btn_toggle_oe_acq.clicked.connect(self._toggle_oe_acquisition)
-        btn_hlayout.addWidget(self.btn_query_chain)
-        btn_hlayout.addWidget(self.btn_toggle_oe_acq)
-
-        volt_hlayout = QHBoxLayout()
-        self.spin_stim_volt = QDoubleSpinBox()
-        self.spin_stim_volt.setRange(0.0, 100.0)
-        self.spin_stim_volt.setValue(5.0)
-        self.spin_stim_volt.setSuffix(" V")
-        self.btn_send_volt = QPushButton("Send Voltage")
-        self.btn_send_volt.clicked.connect(self._send_stim_voltage)
-        volt_hlayout.addWidget(self.spin_stim_volt)
-        volt_hlayout.addWidget(self.btn_send_volt)
-
-        bidi_layout.addRow("", self.chk_sync_annotations)
-        bidi_layout.addRow("Target Processor ID:", self.spin_target_proc)
-        bidi_layout.addRow("OE Control:", btn_hlayout)
-        bidi_layout.addRow("Stimulus Voltage:", volt_hlayout)
-
-        main_layout.addWidget(bidi_group)
-
-        # -------------------------------------------------------------
-        # 4. Live Diagnostics & Demo Stream Group
-        # -------------------------------------------------------------
-        diag_group = QGroupBox("Diagnostics & Live Metrics")
-        diag_layout = QFormLayout(diag_group)
-
-        self.lbl_status = QLabel("○ Disconnected")
-        self.lbl_status.setStyleSheet("color: gray; font-weight: bold;")
-
-        self.lbl_oe_gui_status = QLabel("○ Disconnected")
-        self.lbl_oe_gui_status.setStyleSheet("color: gray; font-weight: bold;")
-
-        self.lbl_plugin_detected = QLabel("Not detected")
-        self.lbl_plugin_detected.setStyleSheet("color: gray;")
-
-        self.lbl_sweeps_count = QLabel("0")
-        self.lbl_spikes_count = QLabel("0")
-        self.lbl_stim_freq = QLabel("0.0 Hz")
-        self.lbl_ui_perf = QLabel("Normal (0.0 ms lag)")
-        self.lbl_ui_perf.setStyleSheet("color: #2b7a2b;")
-
-        diag_layout.addRow("Stream Status:", self.lbl_status)
-        diag_layout.addRow("Open Ephys GUI:", self.lbl_oe_gui_status)
-        diag_layout.addRow("Streamer Plugin:", self.lbl_plugin_detected)
-        diag_layout.addRow("Sweeps Received:", self.lbl_sweeps_count)
-        diag_layout.addRow("Spikes Detected:", self.lbl_spikes_count)
-        diag_layout.addRow("Stimulus Frequency:", self.lbl_stim_freq)
-        diag_layout.addRow("UI Strain / Loop Lag:", self.lbl_ui_perf)
-
-        # Demo stream parameter controls
-        self.spin_demo_stim_freq = QDoubleSpinBox()
-        self.spin_demo_stim_freq.setRange(0.5, 50.0)
-        self.spin_demo_stim_freq.setValue(5.0)
-        self.spin_demo_stim_freq.setSingleStep(0.5)
-        self.spin_demo_stim_freq.setSuffix(" Hz")
-        self.spin_demo_stim_freq.valueChanged.connect(self._on_demo_stim_freq_changed)
-
-        self.combo_demo_units = QComboBox()
-        self.combo_demo_units.addItems(
-            [
-                "1 Unit (Fast A-beta)",
-                "2 Units (A-beta + A-delta)",
-                "3 Units (A-beta, A-delta, C-fiber)",
-            ]
-        )
-        self.combo_demo_units.setCurrentIndex(2)
-
-        diag_layout.addRow("Stimulation Frequency (Hz):", self.spin_demo_stim_freq)
-        diag_layout.addRow("Demo Units:", self.combo_demo_units)
-
-        self.btn_start_demo = QPushButton("Start Built-in Demo Stream")
-        self.btn_start_demo.setStyleSheet(
-            "background-color: #2b5c8f; color: white; font-weight: bold; padding: 6px;"
-        )
-        self.btn_start_demo.clicked.connect(self.start_demo_stream)
-        diag_layout.addRow(self.btn_start_demo)
-
-        self.btn_open_debug = QPushButton("🔍 Open Live Stream & Trigger Debugger")
-        self.btn_open_debug.setStyleSheet(
-            "background-color: #2b7a2b; color: white; font-weight: bold; padding: 6px;"
-        )
-        self.btn_open_debug.setToolTip(
-            "Open the live continuous oscilloscope to view raw signal, monitor incoming TTL/crossing events, "
-            "and diagnose trigger clock synchronization in real time."
-        )
-        self.btn_open_debug.clicked.connect(self._open_debug_dialog)
-        diag_layout.addRow(self.btn_open_debug)
-
-        self.btn_dump_diag = QPushButton("Show UI Performance & Freeze Diagnostics")
-        self.btn_dump_diag.clicked.connect(self._show_ui_diagnostics_dialog)
-        diag_layout.addRow(self.btn_dump_diag)
-
-        main_layout.addWidget(diag_group)
-        main_layout.addStretch()
+    def _sync_header_summary(self):
+        """Mirror key stream, OE GUI, and sweep metrics into the top header bar."""
+        if hasattr(self, "lbl_summary_status") and hasattr(self, "lbl_status"):
+            self.lbl_summary_status.setText(self.lbl_status.text())
+            base_style = self.lbl_status.styleSheet()
+            self.lbl_summary_status.setStyleSheet(
+                f"{base_style} border: none; background: transparent;"
+            )
+        if hasattr(self, "lbl_summary_oe") and hasattr(self, "lbl_oe_gui_status"):
+            self.lbl_summary_oe.setText(f"OE: {self.lbl_oe_gui_status.text()}")
+            oe_style = self.lbl_oe_gui_status.styleSheet()
+            self.lbl_summary_oe.setStyleSheet(
+                f"{oe_style} font-size: 11px; border: none; background: transparent;"
+            )
+        if hasattr(self, "lbl_summary_sweeps") and hasattr(self, "lbl_sweeps_count"):
+            self.lbl_summary_sweeps.setText(f"Sweeps: {self.lbl_sweeps_count.text()}")
 
     def _init_controller(self):
         host = self.edit_host.text().strip()
@@ -467,6 +576,7 @@ class OpenEphysLiveView(QWidget):
             "demo_units": self.combo_demo_units.currentIndex(),
             "replay_speed": self.spin_replay_speed.value(),
             "replay_spikes": self.chk_replay_spikes.isChecked(),
+            "active_tab": self.tabs_live.currentIndex(),
         }
 
     def set_settings(self, settings: Dict[str, Any]):
@@ -503,6 +613,10 @@ class OpenEphysLiveView(QWidget):
             self.spin_replay_speed.setValue(float(settings["replay_speed"]))
         if "replay_spikes" in settings:
             self.chk_replay_spikes.setChecked(bool(settings["replay_spikes"]))
+        if "active_tab" in settings:
+            tab_idx = int(settings["active_tab"])
+            if 0 <= tab_idx < self.tabs_live.count():
+                self.tabs_live.setCurrentIndex(tab_idx)
 
     @Slot(float)
     def _on_demo_stim_freq_changed(self, val: float):
@@ -628,6 +742,7 @@ class OpenEphysLiveView(QWidget):
         )
         self.lbl_status.setText(f"◌ Connecting ({host}:{data_port})...")
         self.lbl_status.setStyleSheet("color: #d9822b; font-weight: bold;")
+        self._sync_header_summary()
 
     def stop_stream(self):
         self._cancel_replay()
@@ -652,6 +767,7 @@ class OpenEphysLiveView(QWidget):
             self.lbl_status.setText("○ Stopped")
         self.btn_toggle_stream.setStyleSheet("font-weight: bold; padding: 6px;")
         self.lbl_status.setStyleSheet("color: gray; font-weight: bold;")
+        self._sync_header_summary()
 
     @Slot()
     def reset_session(self):
@@ -695,6 +811,7 @@ class OpenEphysLiveView(QWidget):
         self.btn_toggle_stream.setText("Start Live Stream")
         self.lbl_status.setText("○ Ready (New Session)")
         self.lbl_status.setStyleSheet("color: gray; font-weight: bold;")
+        self._sync_header_summary()
 
     # -------------------------------------------------------------
     # Replay of the currently loaded recording
@@ -756,6 +873,7 @@ class OpenEphysLiveView(QWidget):
         self.lbl_stim_freq.setText("0.0 Hz")
         self.lbl_status.setText(f"Replaying loaded signal (0/{self._replay_n})")
         self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
+        self._sync_header_summary()
 
         self._replay_next_sweep()
 
@@ -772,6 +890,7 @@ class OpenEphysLiveView(QWidget):
             self.state.stop_live_session()
         self.lbl_status.setText(f"Replay stopped ({played}/{total} sweeps)")
         self.lbl_status.setStyleSheet("color: gray; font-weight: bold;")
+        self._sync_header_summary()
 
     def _cancel_replay(self):
         """Stop the replay timer and restore controls without touching the session."""
@@ -796,6 +915,7 @@ class OpenEphysLiveView(QWidget):
         self.lbl_sweeps_count.setText(str(self._replay_n))
         self.lbl_status.setText(f"Replay complete ({self._replay_n} sweeps)")
         self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
+        self._sync_header_summary()
 
     def _set_replay_controls(self, active: bool):
         self.btn_toggle_stream.setEnabled(not active)
@@ -959,6 +1079,7 @@ class OpenEphysLiveView(QWidget):
         self.lbl_status.setText(
             f"Replaying loaded signal ({self._replay_index}/{self._replay_n})"
         )
+        self._sync_header_summary()
 
         if self._replay_index >= self._replay_n:
             self._finish_replay()
@@ -1572,6 +1693,7 @@ class OpenEphysLiveView(QWidget):
         elif not self._is_streaming and self.controller and self.controller.get_status() == "DISCONNECTED":
             self.lbl_plugin_detected.setText("○ Disconnected")
             self.lbl_plugin_detected.setStyleSheet("color: gray;")
+        self._sync_header_summary()
 
     @Slot()
     def _update_perf_diagnostics(self):
@@ -1683,6 +1805,7 @@ class OpenEphysLiveView(QWidget):
             else:
                 self.lbl_status.setText(f"○ Disconnected ({message})")
                 self.lbl_status.setStyleSheet("color: gray; font-weight: bold;")
+        self._sync_header_summary()
 
     @Slot(int)
     def _on_data_port_changed(self, new_data_port: int):
@@ -1769,6 +1892,7 @@ class OpenEphysLiveView(QWidget):
             self.btn_toggle_oe_acq.setText("Start OE Acquisition")
             self.lbl_oe_gui_status.setText("○ Disconnected")
             self.lbl_oe_gui_status.setStyleSheet("color: gray; font-weight: bold;")
+        self._sync_header_summary()
 
     @Slot()
     def _send_stim_voltage(self):

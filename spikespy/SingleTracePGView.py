@@ -9,10 +9,13 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
     QVBoxLayout,
+    QHBoxLayout,
+    QFrame,
     QToolBar,
     QCheckBox,
     QDoubleSpinBox,
     QLabel,
+    QPushButton,
 )
 import pyqtgraph as pg
 
@@ -99,6 +102,7 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self._aux_trace_by_channel: Dict[str, pg.PlotDataItem] = {}
         self._separate_axes: bool = True
         self._syncing_tracking_controls: bool = False
+        self._applying_shared_visuals: bool = False
         self.template_curve: Optional[pg.PlotDataItem] = None
 
         # Time-based LIFO convolution buffer: accumulates latest sweep, flushes periodically
@@ -165,6 +169,21 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.axis_bar.addWidget(QLabel("track window:", self))
         self.axis_bar.addWidget(self.track_window_spin)
 
+        self.track_threshold_spin = QDoubleSpinBox(self)
+        self.track_threshold_spin.setRange(-1e6, 1e6)
+        self.track_threshold_spin.setDecimals(4)
+        self.track_threshold_spin.setSingleStep(0.01)
+        self.track_threshold_spin.setSuffix(" mV")
+        self.track_threshold_spin.setToolTip(
+            "Tracking threshold for the bound unit (editable here or by dragging "
+            "the horizontal threshold line)"
+        )
+        self.track_threshold_spin.valueChanged.connect(
+            self._on_track_threshold_spin_changed
+        )
+        self.axis_bar.addWidget(QLabel("threshold:", self))
+        self.axis_bar.addWidget(self.track_threshold_spin)
+
         self.show_template_check = QCheckBox("Show template", self)
         self.show_template_check.setChecked(True)
         self.show_template_check.setToolTip(
@@ -189,6 +208,22 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         central = QWidget(self)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(0, 0, 0, 0)
+
+        self.live_paused_banner = QFrame(central)
+        self.live_paused_banner.setObjectName("live_paused_banner")
+        self.live_paused_banner.setStyleSheet(
+            "QFrame#live_paused_banner { background: #fff3cd; border: 1px solid #ffe69c; border-radius: 4px; padding: 2px 6px; }"
+        )
+        banner_layout = QHBoxLayout(self.live_paused_banner)
+        banner_layout.setContentsMargins(6, 2, 6, 2)
+        self.lbl_live_paused = QLabel("⏸ Viewing History", self.live_paused_banner)
+        self.btn_return_live = QPushButton("📡 Return to Live (Ctrl+L)", self.live_paused_banner)
+        self.btn_return_live.clicked.connect(self._on_return_to_live_clicked)
+        banner_layout.addWidget(self.lbl_live_paused)
+        banner_layout.addStretch()
+        banner_layout.addWidget(self.btn_return_live)
+        self.live_paused_banner.setVisible(False)
+        layout.addWidget(self.live_paused_banner)
 
         self.glw = pg.GraphicsLayoutWidget()
         self.glw.setBackground("w")
@@ -239,6 +274,22 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.main_plot.addItem(self.track_window_region)
         self.track_window_region.sigRegionChangeFinished.connect(
             self._on_track_region_changed
+        )
+
+        # Draggable horizontal threshold line
+        self.threshold_line = pg.InfiniteLine(
+            angle=0,
+            movable=True,
+            pen=pg.mkPen((220, 80, 40), width=1.5, style=Qt.DashDotLine),
+            hoverPen=pg.mkPen((255, 60, 20), width=2.5),
+            label="Thresh: {value:.3f}",
+            labelOpts={"position": 0.92, "color": (200, 50, 20), "movable": True},
+        )
+        self.threshold_line.setZValue(11)
+        self.threshold_line.setVisible(False)
+        self.main_plot.addItem(self.threshold_line)
+        self.threshold_line.sigPositionChangeFinished.connect(
+            self._on_threshold_line_dragged
         )
 
         # Identified spike vertical line
@@ -406,6 +457,38 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 self.on_new_sweep(target_stim)
         else:
             self.update_figure()
+        self._update_live_paused_banner()
+
+    def _on_return_to_live_clicked(self):
+        if self.state is not None and hasattr(self.state, "set_follow_live"):
+            self.state.set_follow_live(True)
+        elif hasattr(self, "channel_bar") and self.channel_bar is not None:
+            self.channel_bar.set_follow_live_events(True)
+        self._update_live_paused_banner()
+
+    def _update_live_paused_banner(self, *args):
+        if not hasattr(self, "live_paused_banner"):
+            return
+        if self.state is None:
+            self.live_paused_banner.setVisible(False)
+            return
+        ev_sig = getattr(self.state, "event_signal", None)
+        n_sweeps = len(ev_sig) if ev_sig is not None else 0
+        follow_live = getattr(self.state, "follow_live", True)
+        is_streaming = getattr(self.state, "is_streaming", False)
+        stimno = int(getattr(self.state, "stimno", 0) or 0)
+        latest = max(0, n_sweeps - 1)
+        viewing_history = (not follow_live) or (is_streaming and n_sweeps > 0 and stimno < latest)
+        if viewing_history and n_sweeps > 0:
+            self.lbl_live_paused.setText(
+                f"⏸ Viewing History (Sweep #{stimno} / #{latest}) —"
+            )
+            self.live_paused_banner.setVisible(True)
+        elif not follow_live:
+            self.lbl_live_paused.setText("⏸ Viewing History —")
+            self.live_paused_banner.setVisible(True)
+        else:
+            self.live_paused_banner.setVisible(False)
 
     def get_target_unit(self) -> Optional[tracked_neuron_unit]:
         if hasattr(self, "channel_bar") and self.channel_bar is not None:
@@ -502,9 +585,24 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         )
         if hasattr(self.state, "onNewSpikeEvents"):
             self._connect_state(self.state.onNewSpikeEvents, self._on_new_spike_events)
+        if hasattr(self.state, "onFollowLiveChanged"):
+            self._connect_state(self.state.onFollowLiveChanged, self._update_live_paused_banner)
+        if hasattr(self.state, "onUnitParamsChanged"):
+            self._connect_state(self.state.onUnitParamsChanged, lambda *_: self._update_tracking_controls())
+        if hasattr(self.state, "onContainerVisualSettingsChanged"):
+            self._connect_state(
+                self.state.onContainerVisualSettingsChanged,
+                self._on_container_visual_settings_changed,
+            )
+        if hasattr(self.state, "onSharedVisualSettingsChanged"):
+            self._connect_state(
+                self.state.onSharedVisualSettingsChanged,
+                self._on_shared_visual_settings_changed,
+            )
 
         self._setup_done = False
         self.setup_figure()
+        self._update_live_paused_banner()
 
     def is_view_culled(self) -> bool:
         try:
@@ -986,6 +1084,40 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                     pass
         return None
 
+    def _signal_display_units(self):
+        """Return the physical units of the displayed waveform, or None."""
+        erp = self.get_erp_signal() if self.state is not None else None
+        units = getattr(erp, "units", None) if erp is not None else None
+        if units is None and self.state is not None and getattr(self.state, "analog_signal", None) is not None:
+            units = getattr(self.state.analog_signal, "units", None)
+        return units
+
+    def _threshold_mv_to_display(self, mv: float) -> float:
+        units = self._signal_display_units()
+        if units is not None:
+            try:
+                return float((float(mv) * pq.mV).rescale(units).magnitude)
+            except Exception:
+                u_str = str(units).lower()
+                if "uv" in u_str or "µv" in u_str:
+                    return float(mv) * 1000.0
+                if "v" in u_str and "mv" not in u_str:
+                    return float(mv) * 0.001
+        return float(mv)
+
+    def _display_to_threshold_mv(self, y_val: float) -> float:
+        units = self._signal_display_units()
+        if units is not None:
+            try:
+                return float((float(y_val) * units).rescale(pq.mV).magnitude)
+            except Exception:
+                u_str = str(units).lower()
+                if "uv" in u_str or "µv" in u_str:
+                    return float(y_val) / 1000.0
+                if "v" in u_str and "mv" not in u_str:
+                    return float(y_val) * 1000.0
+        return float(y_val)
+
     def _update_tracking_controls(
         self, sg: Optional[tracked_neuron_unit] = None
     ) -> None:
@@ -995,12 +1127,27 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         if sg is None:
             sg = self.get_target_unit()
         window_ms = float(getattr(sg, "tracking_window_ms", 5.0)) if sg else 5.0
+        thresh_mv = float(getattr(sg, "tracking_threshold_mv", 0.01)) if sg else 0.01
 
         self._syncing_tracking_controls = True
         try:
             with QSignalBlocker(self.track_window_spin):
                 if abs(self.track_window_spin.value() - window_ms) > 1e-9:
                     self.track_window_spin.setValue(window_ms)
+
+            if hasattr(self, "track_threshold_spin"):
+                with QSignalBlocker(self.track_threshold_spin):
+                    if abs(self.track_threshold_spin.value() - thresh_mv) > 1e-9:
+                        self.track_threshold_spin.setValue(thresh_mv)
+
+            if hasattr(self, "threshold_line"):
+                if sg is not None and self.show_track_window_check.isChecked():
+                    y_disp = self._threshold_mv_to_display(thresh_mv)
+                    with QSignalBlocker(self.threshold_line):
+                        self.threshold_line.setValue(y_disp)
+                    self.threshold_line.setVisible(True)
+                else:
+                    self.threshold_line.setVisible(False)
 
             if sg is None or not self.show_track_window_check.isChecked():
                 self.track_window_region.setVisible(False)
@@ -1018,6 +1165,42 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self.track_window_region.setVisible(True)
         finally:
             self._syncing_tracking_controls = False
+
+    def _on_track_threshold_spin_changed(self, value: float) -> None:
+        if self._syncing_tracking_controls or self.state is None:
+            return
+        sg = self.get_target_unit()
+        if sg is None:
+            return
+        sg.tracking_threshold_mv = float(value)
+        if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+            sg.event.annotations["tracking_threshold_mv"] = float(value)
+        sg._template_matcher = None
+        self._update_tracking_controls(sg)
+        if hasattr(self.state, "onUnitParamsChanged"):
+            self.state.onUnitParamsChanged.emit(self.get_target_unit_idx())
+
+    def _on_threshold_line_dragged(self) -> None:
+        if self._syncing_tracking_controls or self.state is None:
+            return
+        sg = self.get_target_unit()
+        if sg is None:
+            return
+        y_val = float(self.threshold_line.value())
+        thresh_mv = self._display_to_threshold_mv(y_val)
+        sg.tracking_threshold_mv = float(thresh_mv)
+        if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+            sg.event.annotations["tracking_threshold_mv"] = float(thresh_mv)
+        sg._template_matcher = None
+        self._syncing_tracking_controls = True
+        try:
+            if hasattr(self, "track_threshold_spin"):
+                with QSignalBlocker(self.track_threshold_spin):
+                    self.track_threshold_spin.setValue(float(thresh_mv))
+        finally:
+            self._syncing_tracking_controls = False
+        if hasattr(self.state, "onUnitParamsChanged"):
+            self.state.onUnitParamsChanged.emit(self.get_target_unit_idx())
 
     def _on_track_window_spin_changed(self, value: float) -> None:
         if self._syncing_tracking_controls or self.state is None:
@@ -1557,6 +1740,86 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         notify_view_selected(self)
         super().mousePressEvent(event)
 
+    def _plot_channel_name(self, plot: pg.PlotItem) -> str:
+        if plot is self.main_plot:
+            if hasattr(self, "channel_bar") and self.channel_bar is not None:
+                ch = self.channel_bar.get_primary_channel()
+                if ch:
+                    return ch
+            if self.state is not None and getattr(self.state, "analog_signal", None) is not None:
+                return getattr(self.state.analog_signal, "name", "") or ""
+            return ""
+        for ch_name, aux_plot in self._aux_plot_by_channel.items():
+            if aux_plot is plot:
+                return ch_name
+        return ""
+
+    def seed_new_unit_at_pos(self, x: float, channel_name: Optional[str] = None):
+        if np.isnan(x) or self.state is None:
+            return None
+        erp = None
+        if channel_name and hasattr(self.state, "get_channel_erp"):
+            erp = self.state.get_channel_erp(channel_name)
+        if erp is None or len(erp) == 0:
+            erp = self.get_erp_signal()
+        if erp is None or len(erp) == 0:
+            return None
+
+        stimno = int(getattr(self.state, "stimno", 0) or 0)
+        if stimno < 0 or stimno >= len(erp):
+            return None
+        dpts = erp[stimno]
+        if hasattr(dpts, "magnitude"):
+            dpts = dpts.magnitude
+        dpts = np.asarray(dpts).ravel()
+        n_pts = len(dpts)
+        if n_pts == 0:
+            return None
+
+        x_idx = max(0, min(n_pts - 1, int(round(x))))
+        w = max(5, int(self.select_local_maxima_width))
+        start_w = max(0, x_idx - w)
+        end_w = min(n_pts, x_idx + w + 1)
+        if end_w > start_w:
+            sub_slice = np.abs(dpts[start_w:end_w])
+            if len(sub_slice) > 0:
+                x_idx = start_w + int(np.argmax(sub_slice))
+
+        if not channel_name:
+            channel_name = self._plot_channel_name(self.main_plot)
+
+        if hasattr(self.state, "seed_unit_at"):
+            return self.state.seed_unit_at(
+                x_idx,
+                stimno=stimno,
+                channel=channel_name,
+                auto_track=True,
+            )
+
+        # Fallback for legacy ViewerState without seed_unit_at
+        self.state.addUnitGroup()
+        new_idx = len(self.state.spike_groups) - 1
+        if new_idx < 0:
+            return None
+        sg = self.state.spike_groups[new_idx]
+        if channel_name:
+            sg.channel = channel_name
+            sg.tracking_channel = channel_name
+            if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+                sg.event.annotations["channel"] = channel_name
+                sg.event.annotations["tracking_channel"] = channel_name
+        peak_disp = abs(float(dpts[x_idx]))
+        thresh_mv = max(0.001, self._display_to_threshold_mv(peak_disp * 0.7))
+        sg.tracking_threshold_mv = thresh_mv
+        sg.auto_track = True
+        if hasattr(sg, "event") and hasattr(sg.event, "annotations"):
+            sg.event.annotations["tracking_threshold_mv"] = thresh_mv
+            sg.event.annotations["auto_track"] = True
+        if hasattr(self.state, "setUnitGroup"):
+            self.state.setUnitGroup(new_idx)
+        self.state.setUnit(x_idx, stimno=stimno, unitid=new_idx)
+        return new_idx
+
     def _on_plot_clicked(self, event):
         notify_view_selected(self)
         if self.is_nav_active() or event.button() != Qt.LeftButton or self.state is None:
@@ -1578,7 +1841,75 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             return
         sr = float(self.state.sampling_rate) if self.state.sampling_rate is not None else 10000.0
         sample_x = pos.x() * sr
+        modifiers = (
+            event.modifiers()
+            if hasattr(event, "modifiers") and callable(event.modifiers)
+            else Qt.NoModifier
+        )
+        if modifiers & Qt.ShiftModifier:
+            ch_name = self._plot_channel_name(plot)
+            self.seed_new_unit_at_pos(sample_x, ch_name)
+            return
         self.set_cur_pos(sample_x)
+
+    def _on_container_visual_settings_changed(self, settings: Dict[str, Any]):
+        if isinstance(settings, dict):
+            self.apply_shared_visual_settings(settings)
+
+    def _on_shared_visual_settings_changed(self, *args):
+        set_name = None
+        settings = None
+        if len(args) == 1:
+            if isinstance(args[0], dict):
+                settings = args[0]
+            elif isinstance(args[0], str):
+                set_name = args[0]
+        elif len(args) >= 2:
+            set_name = args[0]
+            if isinstance(args[1], dict):
+                settings = args[1]
+
+        bound_set = (
+            self.channel_bar.get_bound_shared_set()
+            if hasattr(self, "channel_bar") and self.channel_bar is not None
+            and hasattr(self.channel_bar, "get_bound_shared_set")
+            else None
+        )
+        if set_name is not None and set_name != bound_set:
+            return
+        if settings is None and self.state is not None and set_name is not None:
+            if hasattr(self.state, "get_shared_visual_settings"):
+                settings = self.state.get_shared_visual_settings(set_name)
+            elif hasattr(self.state, "get_shared_channel_set"):
+                s = self.state.get_shared_channel_set(set_name)
+                if isinstance(s, dict):
+                    settings = s.get("visual_settings")
+        if isinstance(settings, dict):
+            self.apply_shared_visual_settings(settings)
+
+    def apply_shared_visual_settings(self, settings: Dict[str, Any]):
+        if not isinstance(settings, dict) or self._applying_shared_visuals:
+            return
+        self._applying_shared_visuals = True
+        try:
+            if "show_track_window" in settings and hasattr(self, "show_track_window_check"):
+                val = bool(settings["show_track_window"])
+                with QSignalBlocker(self.show_track_window_check):
+                    self.show_track_window_check.setChecked(val)
+                self._update_tracking_controls()
+            if "show_template" in settings and hasattr(self, "show_template_check"):
+                val = bool(settings["show_template"])
+                with QSignalBlocker(self.show_template_check):
+                    self.show_template_check.setChecked(val)
+                self._update_template_curve()
+            if "x_range" in settings and settings["x_range"] is not None:
+                xr = settings["x_range"]
+                if len(xr) == 2 and xr[0] is not None and xr[1] is not None:
+                    x0, x1 = float(xr[0]), float(xr[1])
+                    if x0 < x1:
+                        self.main_plot.setXRange(x0, x1, padding=0)
+        finally:
+            self._applying_shared_visuals = False
 
     def set_cur_pos(self, x: float):
         if np.isnan(x):

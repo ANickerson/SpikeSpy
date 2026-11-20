@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QMdiSubWindow,
     QMenu,
     QMenuBar,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QTableView,
@@ -41,7 +42,18 @@ from PySide6.QtWidgets import (
 from .ViewerState import ViewerState
 from .live_orchestrator import LiveFrameConsumerMixin
 from .ChannelGroupBar import ChannelGroupDialog
-from PySide6.QtWidgets import QComboBox
+
+
+SET2_COLORS = [
+    (102, 194, 165),
+    (252, 141, 98),
+    (141, 160, 203),
+    (231, 138, 195),
+    (166, 216, 84),
+    (255, 217, 47),
+    (229, 196, 148),
+    (179, 179, 179),
+]
 
 
 class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
@@ -78,6 +90,7 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
                 if state is not None and hasattr(state, "get_visible_candidates")
                 else None
             ),
+            state=state,
         )
 
         self.tbl = SpikeGroupTableView2(self)
@@ -150,16 +163,47 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
         self.autoButton.setCheckable(True)
         self.autoButton.setToolTip("Periodically scan recent sweeps while streaming")
         self.autoButton.toggled.connect(self._on_auto_toggled)
+        self.proposalConfigButton = QPushButton("⚙ Proposal Config...")
+        self.proposalConfigButton.setToolTip(
+            "Configure spike proposal algorithm, detector parameters, and search settings"
+        )
+        self.proposalConfigButton.clicked.connect(self._open_proposal_config_view)
         self.candidateStatusLabel = QLabel("")
         self.candidateStatusLabel.setContentsMargins(4, 0, 4, 0)
         button_layout.addWidget(self.scanButton)
         button_layout.addWidget(self.autoButton)
+        button_layout.addWidget(self.proposalConfigButton)
         button_layout.addWidget(self.candidateStatusLabel)
         button_layout.addStretch(1)  # Push buttons to the right
+        self.acceptCandidateButton = QPushButton("✓ Accept Candidate")
+        self.acceptCandidateButton.setToolTip(
+            "Accept the selected candidate into a tracked unit (Ctrl+Shift+A)"
+        )
+        self.acceptCandidateButton.setStyleSheet(
+            "QPushButton { background-color: #2b7a2b; color: white; font-weight: bold; "
+            "padding: 3px 10px; border-radius: 4px; border: 1px solid #1f5c1f; }"
+            "QPushButton:hover { background-color: #236623; }"
+            "QPushButton:disabled { background-color: #cbd5e1; color: #64748b; border-color: #94a3b8; }"
+        )
+        self.acceptCandidateButton.clicked.connect(self._accept_selected_candidate)
+        self.discardCandidateButton = QPushButton("✕ Discard")
+        self.discardCandidateButton.setToolTip(
+            "Discard the selected candidate (Ctrl+Shift+D)"
+        )
+        self.discardCandidateButton.setStyleSheet(
+            "QPushButton { background-color: #f1f5f9; color: #475569; "
+            "padding: 3px 10px; border-radius: 4px; border: 1px solid #cbd5e1; }"
+            "QPushButton:hover { background-color: #e2e8f0; color: #1e293b; }"
+            "QPushButton:disabled { background-color: #f8fafc; color: #94a3b8; border-color: #e2e8f0; }"
+        )
+        self.discardCandidateButton.clicked.connect(self._discard_selected_candidate)
+        button_layout.addWidget(self.acceptCandidateButton)
+        button_layout.addWidget(self.discardCandidateButton)
         self.addButton = QPushButton()
         self.addButton.setIcon(add_icon)
         self.addButton.setToolTip("Add a new event/group")
-        self.addButton.clicked.connect(self.state.addUnitGroup)
+        if self.state is not None:
+            self.addButton.clicked.connect(self.state.addUnitGroup)
         self.removeButton = QPushButton()
         self.removeButton.setIcon(remove_icon)
         self.removeButton.setToolTip("Delete the selected event/group")
@@ -293,8 +337,16 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
             lambda checked=False, r=unit_idx: self._rebuild_unit_template(r),
         )
         menu_track.addAction(
+            "Re-Anchor Active Unit at Current Sweep",
+            lambda checked=False, r=unit_idx: self._reanchor_unit_at_current_sweep(r),
+        )
+        menu_track.addAction(
             "Open Tracking View",
             lambda checked=False, r=unit_idx: self._open_tracking_view_for_unit(r),
+        )
+        menu_track.addAction(
+            "Open Active Unit Info",
+            lambda checked=False, r=unit_idx: self._open_active_unit_info(r),
         )
         auto_label = (
             "Disable Live Auto-Track"
@@ -368,6 +420,113 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
         top_win = self.window()
         if hasattr(top_win, "newWindow"):
             top_win.newWindow("TrackingView")
+
+    def _open_active_unit_info(self, unit_idx: int):
+        if self.state is None:
+            return
+        self.state.setUnitGroup(unit_idx)
+        top_win = self.window()
+        if hasattr(top_win, "newWindow"):
+            top_win.newWindow("ActiveUnitInfo")
+
+    def _reanchor_unit_at_current_sweep(self, unit_idx: int) -> Optional[int]:
+        if self.state is None or not (
+            0 <= unit_idx < len(getattr(self.state, "spike_groups", []))
+        ):
+            return None
+        import numpy as np
+        from scipy.signal import find_peaks
+
+        sg = self.state.spike_groups[unit_idx]
+        stimno = int(getattr(self.state, "stimno", 0) or 0)
+
+        ch = (
+            getattr(sg, "tracking_channel", "")
+            or getattr(sg, "channel", "")
+            or (
+                sg.event.annotations.get("channel", "")
+                if getattr(sg, "event", None) is not None
+                and getattr(sg.event, "annotations", None)
+                else ""
+            )
+        )
+        erp = None
+        if ch and hasattr(self.state, "get_channel_erp"):
+            try:
+                erp = self.state.get_channel_erp(ch)
+            except Exception:
+                erp = None
+        if erp is None and hasattr(self.state, "get_erp"):
+            try:
+                erp = self.state.get_erp()
+            except Exception:
+                erp = None
+
+        sr_raw = getattr(self.state, "sampling_rate", None)
+        if sr_raw is None and getattr(self.state, "analog_signal", None) is not None:
+            sr_raw = getattr(self.state.analog_signal, "sampling_rate", None)
+        try:
+            sr_hz = (
+                float(sr_raw.rescale("Hz").magnitude)
+                if sr_raw is not None and hasattr(sr_raw, "rescale")
+                else (float(sr_raw) if sr_raw is not None else 10000.0)
+            )
+        except Exception:
+            sr_hz = 10000.0
+
+        ref_sample: Optional[int] = None
+        idx_arr = getattr(sg, "idx_arr", None)
+        if idx_arr is not None and len(idx_arr) > 0:
+            if 0 <= stimno < len(idx_arr) and idx_arr[stimno] is not None:
+                val = idx_arr[stimno]
+                ref_sample = int(val[0] if isinstance(val, (tuple, list)) else val)
+            else:
+                for prev_s in range(min(stimno - 1, len(idx_arr) - 1), -1, -1):
+                    if idx_arr[prev_s] is not None:
+                        val = idx_arr[prev_s]
+                        ref_sample = int(
+                            val[0] if isinstance(val, (tuple, list)) else val
+                        )
+                        break
+
+        sample: Optional[int] = None
+        if erp is not None and 0 <= stimno < len(erp):
+            row_wf = erp[stimno]
+            wf = np.asarray(
+                row_wf.magnitude if hasattr(row_wf, "magnitude") else row_wf,
+                dtype=np.float64,
+            ).ravel()
+            if wf.size > 0:
+                pts_up, _ = find_peaks(wf)
+                pts_dn, _ = find_peaks(-wf)
+                pts = np.sort(np.hstack([pts_up, pts_dn]).astype(np.int64))
+                if ref_sample is not None:
+                    win_ms = float(getattr(sg, "tracking_window_ms", 5.0) or 5.0)
+                    search_rad = max(int(round((win_ms / 1000.0) * sr_hz)) * 2, 10)
+                    lo = max(0, ref_sample - search_rad)
+                    hi = min(wf.size - 1, ref_sample + search_rad)
+                    in_win = pts[(pts >= lo) & (pts <= hi)]
+                    if in_win.size > 0:
+                        sample = int(in_win[np.argmax(np.abs(wf[in_win]))])
+                    else:
+                        sample = int(lo + np.argmax(np.abs(wf[lo : hi + 1])))
+                elif pts.size > 0:
+                    sample = int(pts[np.argmax(np.abs(wf[pts]))])
+                else:
+                    sample = int(np.argmax(np.abs(wf)))
+
+        if sample is None:
+            sample = ref_sample
+        if sample is None:
+            return None
+
+        if hasattr(self.state, "reanchor_unit_at"):
+            self.state.reanchor_unit_at(unit_idx, int(sample))
+        else:
+            sg._consecutive_misses = 0
+            self.state.setUnit(int(sample), stimno=stimno, unit_idx=unit_idx)
+        self.update()
+        return int(sample)
 
     def _toggle_live_tracking(self, unit_idx: int):
         if self.state is None or not (0 <= unit_idx < len(self.state.spike_groups)):
@@ -664,7 +823,29 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
             return
         unit_idx = int(item[1])
         if 0 <= unit_idx < len(self.state.spike_groups):
-            self.state.removeUnitGroup(self.state.spike_groups[unit_idx])
+            sg = self.state.spike_groups[unit_idx]
+            app = QApplication.instance()
+            is_offscreen = app is not None and app.platformName() == "offscreen"
+            has_events = (
+                getattr(sg, "event", None) is not None and len(sg.event) > 0
+            )
+            if (
+                getattr(self.state, "is_streaming", False)
+                and has_events
+                and not is_offscreen
+            ):
+                unit_name = getattr(sg.event, "name", None) or f"unit_{unit_idx}"
+                reply = QMessageBox.question(
+                    self,
+                    "Delete Tracked Unit?",
+                    f"Unit '{unit_name}' has {len(sg.event)} spikes and a live stream is active.\n"
+                    "Are you sure you want to delete this unit?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            self.state.removeUnitGroup(sg)
 
     def add_row_and_select(self):
         if self.state is None:
@@ -717,10 +898,24 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
 
     def _update_action_buttons(self):
         if self.state is None:
+            if hasattr(self, "acceptCandidateButton"):
+                self.acceptCandidateButton.setVisible(False)
+                self.acceptCandidateButton.setEnabled(False)
+            if hasattr(self, "discardCandidateButton"):
+                self.discardCandidateButton.setVisible(False)
+                self.discardCandidateButton.setEnabled(False)
             return
         item = self._selected_row_item()
+        has_candidates = bool(self._candidate_rows())
+        is_candidate = item is not None and item[0] == "candidate"
+        if hasattr(self, "acceptCandidateButton"):
+            self.acceptCandidateButton.setVisible(is_candidate or has_candidates)
+            self.acceptCandidateButton.setEnabled(is_candidate)
+        if hasattr(self, "discardCandidateButton"):
+            self.discardCandidateButton.setVisible(is_candidate or has_candidates)
+            self.discardCandidateButton.setEnabled(is_candidate)
         style = self.style()
-        if item is not None and item[0] == "candidate":
+        if is_candidate:
             self.addButton.setIcon(
                 style.standardIcon(PySide6.QtWidgets.QStyle.SP_DialogApplyButton)
             )
@@ -788,6 +983,15 @@ class SpikeGroupTableView(LiveFrameConsumerMixin, QWidget):
         scope = "live" if getattr(self.state, "is_streaming", False) else "offline"
         self.state.request_candidate_scan(synchronous=False, scope=scope)
 
+    @Slot()
+    def _open_proposal_config_view(self):
+        top_win = self.window()
+        if hasattr(top_win, "open_or_show_spike_proposal_config"):
+            return top_win.open_or_show_spike_proposal_config()
+        if hasattr(top_win, "newWindow"):
+            return top_win.newWindow("SpikeProposalConfig")
+        return None
+
 
 class SpikeGroupTableView2(QTableView):
     pass
@@ -826,7 +1030,7 @@ class ComboBoxDelegate(QStyledItemDelegate):
 
 
 class SpikeGroupTableModel(QAbstractTableModel):
-    def __init__(self, spikegroups_func=None, candidates_func=None):
+    def __init__(self, spikegroups_func=None, candidates_func=None, state=None):
         """
         spikegroups_func is a function which returns the spike groups;
         candidates_func optionally returns the visible candidate units.
@@ -836,6 +1040,7 @@ class SpikeGroupTableModel(QAbstractTableModel):
         )
         self.spikegroups_func = spikegroups_func
         self.candidates_func = candidates_func
+        self._state = state
         self.spikegroups = self.spikegroups_func()
         self._last_row_count = len(self.spikegroups or [])
         self._rows: List[Tuple[str, int]] = [("unit", i) for i in range(len(self.spikegroups or []))]
@@ -1084,6 +1289,123 @@ class SpikeGroupTableModel(QAbstractTableModel):
                 self.dataChanged.emit(changed_index, changed_index)
         return changed
 
+    def _unit_qcolor(self, unit_idx: int) -> QColor:
+        if self._state is not None and hasattr(self._state, "get_unit_color"):
+            try:
+                c = self._state.get_unit_color(unit_idx)
+                if isinstance(c, QColor):
+                    return c
+                if isinstance(c, (tuple, list)) and len(c) >= 3:
+                    return QColor(int(c[0]), int(c[1]), int(c[2]))
+                if isinstance(c, str) and c:
+                    return QColor(c)
+            except Exception:
+                pass
+        r, g, b = SET2_COLORS[max(0, int(unit_idx)) % len(SET2_COLORS)]
+        return QColor(r, g, b)
+
+    def _tracking_health_badge(
+        self, unit_idx: int, sg
+    ) -> Tuple[str, Optional[QColor], bool, int, int]:
+        """Return (badge_text, fg_color, auto_track, misses, max_skips) for a unit row."""
+        raw_max_skips = getattr(sg, "tracking_max_skips", 1)
+        max_skips = 1 if raw_max_skips is None else int(raw_max_skips)
+        misses = int(getattr(sg, "_consecutive_misses", 0) or 0)
+        auto_track = bool(getattr(sg, "auto_track", False))
+
+        if not auto_track:
+            return ("", None, False, misses, max_skips)
+
+        # Prefer explicit get_tracking_health() if implemented as a 0-arg hook
+        # (without overwriting _consecutive_misses via ViewerState's sweep-scan method).
+        health = None
+        if hasattr(sg, "get_tracking_health"):
+            try:
+                import inspect
+                sig = inspect.signature(sg.get_tracking_health)
+                required = [
+                    p
+                    for p in sig.parameters.values()
+                    if p.default is inspect.Parameter.empty
+                    and p.kind
+                    in (
+                        inspect.Parameter.POSITIONAL_ONLY,
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    )
+                ]
+                if not required and "event_signal" not in sig.parameters:
+                    health = sg.get_tracking_health()
+            except Exception:
+                health = None
+
+        if isinstance(health, dict):
+            auto_track = bool(health.get("auto_track", auto_track))
+            misses = int(health.get("consecutive_misses", misses) or 0)
+            raw_ms = health.get("max_skips", max_skips)
+            max_skips = max_skips if raw_ms is None else int(raw_ms)
+            if not auto_track:
+                return ("", None, False, misses, max_skips)
+            status = str(health.get("status", "")).lower()
+            if status in ("locked", "ok"):
+                return ("🟢 Locked", QColor("#2b7a2b"), True, misses, max_skips)
+            if status in ("skip", "skipping"):
+                return ("🟡 Skip", QColor("#b86b11"), True, misses, max_skips)
+            if status in ("lost", "stale"):
+                return ("🔴 Lost", QColor("#c9302c"), True, misses, max_skips)
+        elif isinstance(health, str) and health:
+            s = health.lower()
+            if "lock" in s:
+                return ("🟢 Locked", QColor("#2b7a2b"), True, misses, max_skips)
+            if "skip" in s:
+                return ("🟡 Skip", QColor("#b86b11"), True, misses, max_skips)
+            if "lost" in s:
+                return ("🔴 Lost", QColor("#c9302c"), True, misses, max_skips)
+
+        if misses == 0:
+            return ("🟢 Locked", QColor("#2b7a2b"), True, misses, max_skips)
+        if 1 <= misses <= max_skips:
+            return ("🟡 Skip", QColor("#b86b11"), True, misses, max_skips)
+        return ("🔴 Lost", QColor("#c9302c"), True, misses, max_skips)
+
+    def _unit_spike_count(self, sg) -> int:
+        if hasattr(sg, "event") and sg.event is not None and len(sg.event) > 0:
+            return len(sg.event)
+        if hasattr(sg, "get_number_of_events"):
+            return int(sg.get_number_of_events())
+        if hasattr(sg, "idx_arr") and sg.idx_arr is not None:
+            return len([x for x in sg.idx_arr if x is not None])
+        return 0
+
+    def _unit_tooltip(self, unit_idx: int, sg) -> str:
+        name = getattr(getattr(sg, "event", None), "name", None) or f"unit_{unit_idx}"
+        ch = getattr(sg, "channel", "")
+        if not ch and hasattr(sg, "event") and getattr(sg.event, "annotations", None):
+            ch = sg.event.annotations.get("channel", "")
+        neigh = getattr(sg, "neighbor_channels", None)
+        if neigh is None and hasattr(sg, "event") and getattr(sg.event, "annotations", None):
+            neigh = sg.event.annotations.get("neighbor_channels", [])
+        if isinstance(neigh, (list, tuple)):
+            neigh_str = ", ".join(str(x) for x in neigh if x) or "none"
+        elif isinstance(neigh, str) and neigh:
+            neigh_str = neigh
+        else:
+            neigh_str = "none"
+        n_spikes = self._unit_spike_count(sg)
+        badge, _fg, auto_track, misses, max_skips = self._tracking_health_badge(
+            unit_idx, sg
+        )
+        auto_str = f"ON ({badge})" if auto_track else "OFF"
+        win_ms = float(getattr(sg, "tracking_window_ms", 5.0) or 5.0)
+        thresh_mv = float(getattr(sg, "tracking_threshold_mv", 0.01) or 0.01)
+        return (
+            f"{name} (Unit {unit_idx})\n"
+            f"channel: {ch or 'unassigned'}  neighbors: {neigh_str}\n"
+            f"total spikes: {n_spikes}\n"
+            f"auto-track: {auto_str}\n"
+            f"consecutive misses: {misses} (max skips: {max_skips})\n"
+            f"window: {win_ms:.2f} ms  threshold: {thresh_mv:.4g} mV"
+        )
+
     def data(
         self,
         index: Union[PySide6.QtCore.QModelIndex, PySide6.QtCore.QPersistentModelIndex],
@@ -1096,14 +1418,31 @@ class SpikeGroupTableModel(QAbstractTableModel):
             return None
         if item[0] == "candidate":
             return self._candidate_data(int(item[1]), column, role)
-        sg = self.spikegroups[int(item[1])]
+        unit_idx = int(item[1])
+        if not (0 <= unit_idx < len(self.spikegroups)):
+            return None
+        sg = self.spikegroups[unit_idx]
 
-        # Column 8: track checkbox
+        if role == Qt.ToolTipRole:
+            return self._unit_tooltip(unit_idx, sg)
+
+        if column == 0 and role == Qt.DecorationRole:
+            return self._unit_qcolor(unit_idx)
+
+        # Column 8: track checkbox + tracking health badge
         if column == 8:
             if role == Qt.CheckStateRole:
                 return Qt.Checked if getattr(sg, "auto_track", False) else Qt.Unchecked
             elif role == Qt.DisplayRole:
-                return ""
+                badge, _fg, _auto, _misses, _max = self._tracking_health_badge(
+                    unit_idx, sg
+                )
+                return badge
+            elif role == Qt.ForegroundRole:
+                _badge, fg, _auto, _misses, _max = self._tracking_health_badge(
+                    unit_idx, sg
+                )
+                return fg
             elif role == Qt.EditRole:
                 return getattr(sg, "auto_track", False)
             elif role == "SPIKEGROUP_ROLE":
@@ -1136,13 +1475,7 @@ class SpikeGroupTableModel(QAbstractTableModel):
                     return ""
                 return win[column - 1]
             elif column == 3:  # N (number of events)
-                if hasattr(sg, "event") and sg.event is not None and len(sg.event) > 0:
-                    return len(sg.event)
-                elif hasattr(sg, "get_number_of_events"):
-                    return sg.get_number_of_events()
-                elif hasattr(sg, "idx_arr") and sg.idx_arr is not None:
-                    return len([x for x in sg.idx_arr if x is not None])
-                return 0
+                return self._unit_spike_count(sg)
             elif column == 4:  # type / fibre class
                 return sg.event.annotations.get("fibre_type", getattr(sg, "fibre_type", ""))
             elif column == 5:  # notes

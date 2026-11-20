@@ -7,7 +7,7 @@ except the currently displayed stimulus index and the "follow live events"
 flag, which are local to the container.
 """
 
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from PySide6.QtCore import QObject, Signal
 
@@ -18,6 +18,7 @@ class ContainerViewerState(QObject):
     onStimNoChange = Signal(int)
     onFollowLiveChanged = Signal(bool)
     onFollowLiveEventsChanged = Signal(bool)
+    onContainerVisualSettingsChanged = Signal(dict)
 
     def __init__(self, base, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -25,6 +26,15 @@ class ContainerViewerState(QObject):
         self._base_connections = []
         self._stimno = int(getattr(base, "stimno", 0) or 0)
         self._follow_live = bool(getattr(base, "follow_live", True))
+        self.visual_settings: Dict[str, Any] = {
+            "x_range": None,
+            "y_range": None,
+            "scale_mode": "std",
+            "color_scale": (0.5, 2.0),
+            "trace_scale": 1.0,
+            "show_track_window": True,
+            "show_template": True,
+        }
         self._connect_base()
 
     # ------------------------------------------------------------------
@@ -78,6 +88,18 @@ class ContainerViewerState(QObject):
         except AttributeError as exc:
             raise AttributeError(name) from exc
         return getattr(base, name)
+
+    # ------------------------------------------------------------------
+    # Local visual settings
+    # ------------------------------------------------------------------
+    def get_visual_settings(self) -> Dict[str, Any]:
+        return dict(self.visual_settings)
+
+    def update_visual_settings(self, **kwargs) -> Dict[str, Any]:
+        self.visual_settings.update(kwargs)
+        updated = dict(self.visual_settings)
+        self.onContainerVisualSettingsChanged.emit(updated)
+        return updated
 
     # ------------------------------------------------------------------
     # Local stimulus index / follow mode

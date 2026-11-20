@@ -85,6 +85,8 @@ from .ChannelGroupBar import ChannelGroupBar, ChannelGroupDialog
 from .SharedChannelPanel import SharedChannelPanel
 from .ChannelGroupContainer import ChannelGroupContainerView
 from .ViewSettingsPanel import ViewSettingsPanel
+from .ActiveUnitInfoView import ActiveUnitInfoView
+from .SpikeProposalConfigView import SpikeProposalConfigView
 from .helpers import apply_top_bars_visibility, notify_view_selected
 from .dsp.detectors import (
     DetectorParamSpec,
@@ -124,6 +126,8 @@ window_options = {
     "SharedChannelPanel": SharedChannelPanel,
     "ChannelGroupContainer": ChannelGroupContainerView,
     "ViewSettings": ViewSettingsPanel,
+    "ActiveUnitInfo": ActiveUnitInfoView,
+    "SpikeProposalConfig": SpikeProposalConfigView,
 }
 if _has_pg:
     window_options.update(
@@ -291,6 +295,52 @@ class MdiView(QMainWindow):
                 return dw.widget()
         return self.newWindow("SharedChannelPanel", pos=QtAds.BottomDockWidgetArea)
 
+    def open_or_show_active_unit_info(self):
+        """Opens or activates the ActiveUnitInfoView dock panel."""
+        for dw in self.dock_manager.dockWidgets():
+            if isinstance(dw.widget(), ActiveUnitInfoView):
+                if dw.isClosed():
+                    dw.toggleView(True)
+                    if dw.dockAreaWidget() is None:
+                        self.dock_manager.addDockWidget(QtAds.RightDockWidgetArea, dw)
+                dw.show()
+                dw.raise_()
+                if dw.dockAreaWidget() is not None:
+                    try:
+                        dw.dockAreaWidget().setCurrentDockWidget(dw)
+                    except Exception:
+                        pass
+                if hasattr(dw, "setAsCurrentTab") and callable(getattr(dw, "setAsCurrentTab")):
+                    try:
+                        dw.setAsCurrentTab()
+                    except Exception:
+                        pass
+                return dw.widget()
+        return self.newWindow("ActiveUnitInfo", pos=QtAds.RightDockWidgetArea)
+
+    def open_or_show_spike_proposal_config(self):
+        """Opens or activates the SpikeProposalConfigView dock panel."""
+        for dw in self.dock_manager.dockWidgets():
+            if isinstance(dw.widget(), SpikeProposalConfigView):
+                if dw.isClosed():
+                    dw.toggleView(True)
+                    if dw.dockAreaWidget() is None:
+                        self.dock_manager.addDockWidget(QtAds.RightDockWidgetArea, dw)
+                dw.show()
+                dw.raise_()
+                if dw.dockAreaWidget() is not None:
+                    try:
+                        dw.dockAreaWidget().setCurrentDockWidget(dw)
+                    except Exception:
+                        pass
+                if hasattr(dw, "setAsCurrentTab") and callable(getattr(dw, "setAsCurrentTab")):
+                    try:
+                        dw.setAsCurrentTab()
+                    except Exception:
+                        pass
+                return dw.widget()
+        return self.newWindow("SpikeProposalConfig", pos=QtAds.RightDockWidgetArea)
+
     def open_or_show_view_settings_panel(self):
         """Opens or brings to front the View Settings side panel on the left side."""
         try:
@@ -378,6 +428,19 @@ class MdiView(QMainWindow):
         if new is not None:
             notify_view_selected(new, ensure_panel_visible=False)
 
+    def closeEvent(self, event):
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.focusChanged.disconnect(self._on_app_focus_changed)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                app.removeEventFilter(self)
+            except (TypeError, RuntimeError):
+                pass
+        super().closeEvent(event)
+
     def eventFilter(self, obj, event):
         if event.type() in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease):
             if isinstance(obj, QWidget):
@@ -430,6 +493,26 @@ class MdiView(QMainWindow):
         elif "Single Trace Inspector" in layout_clean:
             self.newWindow("SingleTraceView", pos=QtAds.LeftDockWidgetArea)
             self.newWindow("UnitFootprintView", pos=QtAds.RightDockWidgetArea)
+            self.newWindow("SpikeGroupTable", pos=QtAds.BottomDockWidgetArea)
+
+        elif "Live Search Layout" in layout_clean:
+            mt_key = "MultiTrace (PyQtGraph)" if _has_pg and "MultiTrace (PyQtGraph)" in self.window_options else "MultiTrace"
+            st_key = "SingleTrace (PyQtGraph)" if _has_pg and "SingleTrace (PyQtGraph)" in self.window_options else "SingleTraceView"
+            self.newWindow("OpenEphysLive", pos=QtAds.LeftDockWidgetArea)
+            self.newWindow(mt_key, pos=QtAds.LeftDockWidgetArea)
+            self.newWindow(st_key, pos=QtAds.RightDockWidgetArea)
+            self.newWindow("SpikeGroupTable", pos=QtAds.BottomDockWidgetArea)
+            if self.state is not None and hasattr(self.state, "set_auto_scan_live"):
+                self.state.set_auto_scan_live(True)
+
+        elif "Live Tracking Layout" in layout_clean:
+            mt_key = "MultiTrace (PyQtGraph)" if _has_pg and "MultiTrace (PyQtGraph)" in self.window_options else "MultiTrace"
+            st_key = "SingleTrace (PyQtGraph)" if _has_pg and "SingleTrace (PyQtGraph)" in self.window_options else "SingleTraceView"
+            uv_key = "UnitView (PyQtGraph)" if _has_pg and "UnitView (PyQtGraph)" in self.window_options else "UnitView"
+            self.newWindow(mt_key, pos=QtAds.LeftDockWidgetArea, shared_set="Shared Group A")
+            self.newWindow(st_key, pos=QtAds.RightDockWidgetArea, shared_set="Shared Group A")
+            self.newWindow(uv_key, pos=QtAds.RightDockWidgetArea, shared_set="Shared Group A")
+            self.newWindow("ActiveUnitInfo", pos=QtAds.RightDockWidgetArea)
             self.newWindow("SpikeGroupTable", pos=QtAds.BottomDockWidgetArea)
 
     def handle_version_check_result(self, result):
@@ -534,6 +617,8 @@ class MdiView(QMainWindow):
         menu_traces.addAction("OpenEphysLive", lambda: self.newWindow("OpenEphysLive"))
 
         menu_unit = add_panel_menu.addMenu("Unit Analysis")
+        menu_unit.addAction("Active Unit Info & Tracking", lambda: self.newWindow("ActiveUnitInfo"))
+        menu_unit.addAction("Spike Proposal Config", lambda: self.open_or_show_spike_proposal_config())
         menu_unit.addAction("UnitView (Matplotlib)", lambda: self.newWindow("UnitView"))
         if "UnitView (PyQtGraph)" in self.window_options:
             menu_unit.addAction("UnitView (PyQtGraph)", lambda: self.newWindow("UnitView (PyQtGraph)"))
@@ -546,6 +631,8 @@ class MdiView(QMainWindow):
         menu_channels.addAction("Shared Channel Controller", lambda: self.open_or_show_shared_channel_panel())
 
         menu_tables = add_panel_menu.addMenu("Tables & Controllers")
+        menu_tables.addAction("Active Unit Info & Tracking", lambda: self.newWindow("ActiveUnitInfo"))
+        menu_tables.addAction("Spike Proposal Config", lambda: self.open_or_show_spike_proposal_config())
         menu_tables.addAction("View Settings Panel", lambda: self.open_or_show_view_settings_panel())
         menu_tables.addAction("SharedChannelPanel", lambda: self.open_or_show_shared_channel_panel())
         menu_tables.addAction("SpikeGroupTable", lambda: self.newWindow("SpikeGroupTable"))
@@ -562,12 +649,31 @@ class MdiView(QMainWindow):
         self.act_shared_ctrl.triggered.connect(self.open_or_show_shared_channel_panel)
         self.toolbar.addAction(self.act_shared_ctrl)
 
+        self.act_unit_info = QAction("🎯 Active Unit Info", self)
+        self.act_unit_info.setToolTip("Open or bring to focus the Active Unit Info & Tracking panel")
+        self.act_unit_info.triggered.connect(self.open_or_show_active_unit_info)
+        self.toolbar.addAction(self.act_unit_info)
+
+        self.act_proposal_config = QAction("🔬 Proposal Config", self)
+        self.act_proposal_config.setToolTip("Open or bring to focus the Spike Proposal & Candidate Search Configuration panel")
+        self.act_proposal_config.triggered.connect(self.open_or_show_spike_proposal_config)
+        self.toolbar.addAction(self.act_proposal_config)
+
         # 3. [ 📐 Layouts ▾ ] QToolButton with popup menu
         self.btn_layouts = QToolButton(self)
         self.btn_layouts.setText("📐 Layouts ▾")
         self.btn_layouts.setPopupMode(QToolButton.InstantPopup)
         layout_menu = QMenu(self.btn_layouts)
 
+        layout_menu.addAction(
+            "🔍 Live Search Layout (Electrode Hunting)",
+            lambda: self.apply_default_layout("Live Search Layout (Electrode Hunting)"),
+        )
+        layout_menu.addAction(
+            "🎯 Live Tracking Layout (Protocol Execution)",
+            lambda: self.apply_default_layout("Live Tracking Layout (Protocol Execution)"),
+        )
+        layout_menu.addSeparator()
         layout_menu.addAction(
             "Shared Channel Group Suite (Synced)",
             lambda: self.apply_default_layout("Shared Channel Group Suite"),
@@ -594,6 +700,54 @@ class MdiView(QMainWindow):
 
         self.btn_layouts.setMenu(layout_menu)
         self.toolbar.addWidget(self.btn_layouts)
+
+        # 4. Live Cockpit Telemetry & Transport Bar
+        self.toolbar.addSeparator()
+        self.lbl_live_status_pill = QLabel("○ Offline", self)
+        self.lbl_live_status_pill.setToolTip("Live acquisition status and current sweep index")
+        self.toolbar.addWidget(self.lbl_live_status_pill)
+
+        self.btn_follow_live_pill = QPushButton("📡 Follow Live", self)
+        self.btn_follow_live_pill.setCheckable(True)
+        self.btn_follow_live_pill.setChecked(bool(getattr(self.state, "follow_live", True)))
+        self.btn_follow_live_pill.setToolTip("Toggle automatic following of incoming live sweeps (Space / Ctrl+L)")
+        self.btn_follow_live_pill.clicked.connect(lambda _checked=False: self._toggle_follow_live())
+        self.toolbar.addWidget(self.btn_follow_live_pill)
+
+        self.btn_add_marker = QToolButton(self)
+        self.btn_add_marker.setText("🏷 + Marker (M) ▾")
+        self.btn_add_marker.setPopupMode(QToolButton.MenuButtonPopup)
+        self.btn_add_marker.setToolTip("Add a protocol marker at the current stimulus sweep (M)")
+        self.btn_add_marker.clicked.connect(self.prompt_add_protocol_marker)
+        marker_menu = QMenu(self.btn_add_marker)
+        for preset_label in (
+            "Baseline Start",
+            "2 Hz Tetanus Start",
+            "2 Hz Tetanus End",
+            "Recovery",
+            "Mechanical Stim",
+            "Patient Movement / Artifact",
+        ):
+            marker_menu.addAction(
+                preset_label,
+                lambda _checked=False, lbl=preset_label: self.add_quick_protocol_marker(lbl),
+            )
+        marker_menu.addSeparator()
+        marker_menu.addAction("Custom Marker (M)...", self.prompt_add_protocol_marker)
+        self.btn_add_marker.setMenu(marker_menu)
+        self.toolbar.addWidget(self.btn_add_marker)
+
+        for sig_name in (
+            "onStreamStateChanged",
+            "onNewSweep",
+            "onStimNoChange",
+            "onFollowLiveChanged",
+            "onLoadNewFile",
+        ):
+            sig = getattr(self.state, sig_name, None)
+            if sig is not None and hasattr(sig, "connect"):
+                sig.connect(self._update_live_cockpit_bar)
+        self._update_live_cockpit_bar()
 
         # Menu bar
         self.menubar = self.menuBar()
@@ -758,7 +912,7 @@ class MdiView(QMainWindow):
         self.shortcut_del = QShortcut(
             QKeySequence(Qt.Key_Backspace), self, context=Qt.ApplicationShortcut
         )
-        self.shortcut_del.activated.connect(lambda: self._active_viewer_state().setUnit(None))
+        self.shortcut_del.activated.connect(self._on_backspace_pressed)
 
         self.shortcut_copylast = QShortcut(
             QKeySequence(Qt.Key_Space), self, context=Qt.ApplicationShortcut
@@ -900,6 +1054,11 @@ class MdiView(QMainWindow):
         )
         self.shortcut_toggle_live_events.activated.connect(self._toggle_follow_live)
 
+        self.shortcut_marker = QShortcut(
+            QKeySequence(Qt.Key_M), self, context=Qt.ApplicationShortcut
+        )
+        self.shortcut_marker.activated.connect(self.prompt_add_protocol_marker)
+
     def _active_viewer_state(self):
         """State backing the focused view (a container's local overlay if any)."""
         panel = getattr(self, "settings_panel", None)
@@ -919,6 +1078,7 @@ class MdiView(QMainWindow):
         state = self._active_viewer_state()
         if state is not None:
             state.set_follow_live(not bool(getattr(state, "follow_live", True)))
+            self._update_live_cockpit_bar()
             return True
         return False
 
@@ -927,6 +1087,101 @@ class MdiView(QMainWindow):
             state = self._active_viewer_state()
             if state is not None:
                 state.setUnit(-1)
+
+    def _on_backspace_pressed(self):
+        s = self._active_viewer_state()
+        if s is None:
+            return
+        if getattr(s, "is_streaming", False) and getattr(s, "follow_live", True):
+            return
+        s.setUnit(None)
+
+    def add_quick_protocol_marker(self, label: str, category: str = "protocol"):
+        if self.state is not None and hasattr(self.state, "add_protocol_marker"):
+            return self.state.add_protocol_marker(
+                label, stimno=self.state.stimno, category=category
+            )
+        return None
+
+    def prompt_add_protocol_marker(self):
+        presets = [
+            "Baseline Start",
+            "2 Hz Tetanus Start",
+            "2 Hz Tetanus End",
+            "Recovery",
+            "Mechanical Stim",
+            "Patient Movement / Artifact",
+        ]
+        app = QApplication.instance()
+        if app is not None and app.platformName() == "offscreen":
+            return self.add_quick_protocol_marker("Marker")
+        text, ok = QInputDialog.getItem(
+            self,
+            "Add Protocol Marker",
+            f"Marker at Sweep #{int(getattr(self.state, 'stimno', 0) or 0)}:",
+            presets,
+            0,
+            True,
+        )
+        if ok and text and text.strip():
+            return self.add_quick_protocol_marker(text.strip())
+        return None
+
+    @Slot()
+    @Slot(bool)
+    @Slot(int)
+    def _update_live_cockpit_bar(self, *args):
+        if not hasattr(self, "lbl_live_status_pill") or not hasattr(self, "btn_follow_live_pill"):
+            return
+        state = self.state
+        is_streaming = bool(getattr(state, "is_streaming", False)) if state is not None else False
+        follow_live = bool(getattr(state, "follow_live", True)) if state is not None else True
+        ev_sig = getattr(state, "event_signal", None) if state is not None else None
+        n_sweeps = len(ev_sig) if ev_sig is not None else 0
+        stimno = int(getattr(state, "stimno", 0) or 0) if state is not None else 0
+
+        if not is_streaming and n_sweeps == 0:
+            self.lbl_live_status_pill.setText("○ Offline | Sweep #0")
+            self.lbl_live_status_pill.setStyleSheet(
+                "background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; "
+                "border-radius: 10px; padding: 2px 8px; font-weight: bold;"
+            )
+        elif not follow_live:
+            total_idx = max(0, n_sweeps - 1)
+            self.lbl_live_status_pill.setText(f"⏸ PAUSED (#{stimno} / #{total_idx})")
+            self.lbl_live_status_pill.setStyleSheet(
+                "background: #fef3c7; color: #92400e; border: 1px solid #f59e0b; "
+                "border-radius: 10px; padding: 2px 8px; font-weight: bold;"
+            )
+        elif is_streaming:
+            self.lbl_live_status_pill.setText(f"● LIVE | Sweep #{stimno}")
+            self.lbl_live_status_pill.setStyleSheet(
+                "background: #dcfce7; color: #166534; border: 1px solid #86efac; "
+                "border-radius: 10px; padding: 2px 8px; font-weight: bold;"
+            )
+        else:
+            total_idx = max(0, n_sweeps - 1)
+            self.lbl_live_status_pill.setText(f"○ Offline | Sweep #{stimno} / #{total_idx}")
+            self.lbl_live_status_pill.setStyleSheet(
+                "background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1; "
+                "border-radius: 10px; padding: 2px 8px; font-weight: bold;"
+            )
+
+        self.btn_follow_live_pill.blockSignals(True)
+        self.btn_follow_live_pill.setChecked(follow_live)
+        if not follow_live and n_sweeps > 0:
+            self.btn_follow_live_pill.setText("⏸ History (Click to Follow Live)")
+            self.btn_follow_live_pill.setStyleSheet(
+                "background: #fef3c7; color: #92400e; border: 1px solid #f59e0b; "
+                "border-radius: 6px; padding: 2px 8px; font-weight: bold;"
+            )
+        elif follow_live:
+            self.btn_follow_live_pill.setText("📡 Following Live")
+            self.btn_follow_live_pill.setStyleSheet("")
+        else:
+            self.btn_follow_live_pill.setText("📡 Follow Live")
+            self.btn_follow_live_pill.setStyleSheet("")
+        self.btn_follow_live_pill.blockSignals(False)
 
     def export_csv(self):
         save_filename = QFileDialog.getSaveFileName(self, "Export")[0]

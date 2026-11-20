@@ -64,6 +64,8 @@ class CandidateScanConfig:
     accepted_overlap_suppress: float = 0.6
     max_scan_sweeps: int = 20000
     algorithm: str = "zscore"
+    detector_params: Dict[str, Any] = field(default_factory=dict)
+    enabled_algorithms: List[str] = field(default_factory=list)
     template_refine: bool = True
     template_corr_threshold: float = 0.35
     max_template_refine_sweeps: int = 2000
@@ -152,24 +154,44 @@ def _window_px(ms: float, fs_hz: float) -> int:
     return max(1, int(np.ceil(float(ms) * float(fs_hz) / 1000.0)))
 
 
-def _detector_params(config: CandidateScanConfig, sigma: float) -> Dict[str, Any]:
-    algorithm = str(config.algorithm or "zscore")
+def _detector_params(
+    config: CandidateScanConfig,
+    sigma: float,
+    algorithm_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    algorithm = str(algorithm_override or config.algorithm or "zscore")
     if algorithm == "zscore":
-        return {
+        params: Dict[str, Any] = {
             "polarity": "both",
             "z_thresh": float(config.min_peak_snr),
             "use_mad": True,
             "min_distance_ms": float(config.min_peak_distance_ms),
         }
-    if algorithm == "wavelet":
-        return {
+    elif algorithm == "wavelet":
+        params = {
             "threshold_sigma": float(config.min_peak_snr),
         }
-    threshold = float(config.min_peak_snr) * float(sigma)
-    return {
-        "threshold": threshold,
-        "window_ms": max(1.0, float(config.tolerance_ms) * 2.0),
-    }
+    else:
+        threshold = float(config.min_peak_snr) * float(sigma)
+        params = {
+            "threshold": threshold,
+            "window_ms": max(1.0, float(config.tolerance_ms) * 2.0),
+        }
+
+    overrides = getattr(config, "detector_params", None)
+    if isinstance(overrides, Mapping) and overrides:
+        for key, value in overrides.items():
+            if value is not None:
+                params[key] = value
+        if algorithm == "zscore":
+            if "z_thresh" not in overrides and config.min_peak_snr is not None:
+                params["z_thresh"] = float(config.min_peak_snr)
+            if (
+                "min_distance_ms" not in overrides
+                and config.min_peak_distance_ms is not None
+            ):
+                params["min_distance_ms"] = float(config.min_peak_distance_ms)
+    return params
 
 
 def _dedupe_peaks(
@@ -194,25 +216,22 @@ def _dedupe_peaks(
     return indices[keep_arr], scores[keep_arr], amplitudes[keep_arr]
 
 
-def _extract_peak_row(
+def _extract_peak_row_for_algorithm(
     sweep: np.ndarray,
     fs_hz: float,
     config: CandidateScanConfig,
     peak_finder: Callable[..., Any],
     min_idx: int,
+    algorithm_name: str,
+    sigma: float,
 ) -> _PeakRow:
-    """Find peaks on one sweep using the configured detector."""
     empty = np.empty(0, dtype=np.float64)
-    sigma = _robust_sigma(sweep)
-    if sweep.size == 0 or fs_hz <= 0:
-        return _PeakRow(empty.astype(np.int64), empty, empty, sigma)
-
-    algorithm = str(config.algorithm or "zscore")
+    algorithm = str(algorithm_name or "zscore")
     if algorithm == "template":
         # A template algorithm has no template at proposal time.
         algorithm = "zscore"
 
-    params = _detector_params(config, sigma)
+    params = _detector_params(config, sigma, algorithm_override=algorithm)
     min_distance = _samples_for_ms(config.min_peak_distance_ms, fs_hz)
     work = np.asarray(sweep, dtype=np.float64).copy()
     if min_idx > 0:
@@ -251,14 +270,17 @@ def _extract_peak_row(
     idx_parts: List[np.ndarray] = []
     score_parts: List[np.ndarray] = []
     amp_parts: List[np.ndarray] = []
-    for cand, flip in ((forwards, 1.0), (backwards, -1.0)):
-        idx = np.asarray(cand.sample_indices, dtype=np.int64)
-        idx = idx[(idx >= min_idx) & (idx < sweep.size)]
+    for cand, _flip in ((forwards, 1.0), (backwards, -1.0)):
+        raw_idx = np.asarray(cand.sample_indices, dtype=np.int64)
+        mask = (raw_idx >= min_idx) & (raw_idx < sweep.size)
+        idx = raw_idx[mask]
         if idx.size == 0:
             continue
         signed = _as_float_array(sweep)[idx] - float(np.median(sweep))
         raw_scores = np.asarray(cand.scores, dtype=np.float64)
-        if raw_scores.size != idx.size:
+        if raw_scores.shape == raw_idx.shape:
+            raw_scores = raw_scores[mask]
+        else:
             raw_scores = np.abs(signed)
         if algorithm == "basic":
             snr = np.abs(signed) / max(sigma, 1e-12)
@@ -270,11 +292,66 @@ def _extract_peak_row(
 
     if not idx_parts:
         return _PeakRow(empty.astype(np.int64), empty, empty, sigma)
-    return _dedupe_peaks(
-        np.concatenate(idx_parts),
-        np.concatenate(score_parts),
-        np.concatenate(amp_parts),
-        min_distance,
+    return _PeakRow(
+        *_dedupe_peaks(
+            np.concatenate(idx_parts),
+            np.concatenate(score_parts),
+            np.concatenate(amp_parts),
+            min_distance,
+        ),
+        sigma,
+    )
+
+
+def _extract_peak_row(
+    sweep: np.ndarray,
+    fs_hz: float,
+    config: CandidateScanConfig,
+    peak_finder: Callable[..., Any],
+    min_idx: int,
+) -> _PeakRow:
+    """Find peaks on one sweep using the configured detector(s)."""
+    empty = np.empty(0, dtype=np.float64)
+    sigma = _robust_sigma(sweep)
+    if sweep.size == 0 or fs_hz <= 0:
+        return _PeakRow(empty.astype(np.int64), empty, empty, sigma)
+
+    enabled = [
+        str(a).strip()
+        for a in (getattr(config, "enabled_algorithms", None) or [])
+        if str(a).strip()
+    ]
+    if len(enabled) > 1:
+        rows = [
+            _extract_peak_row_for_algorithm(
+                sweep, fs_hz, config, peak_finder, min_idx, algo, sigma
+            )
+            for algo in enabled
+        ]
+        idx_parts = [r.indices for r in rows if r.indices.size > 0]
+        if not idx_parts:
+            return _PeakRow(empty.astype(np.int64), empty, empty, sigma)
+        score_parts = [r.scores for r in rows if r.indices.size > 0]
+        amp_parts = [r.amplitudes for r in rows if r.indices.size > 0]
+        min_distance = _samples_for_ms(config.min_peak_distance_ms, fs_hz)
+        return _PeakRow(
+            *_dedupe_peaks(
+                np.concatenate(idx_parts),
+                np.concatenate(score_parts),
+                np.concatenate(amp_parts),
+                min_distance,
+            ),
+            sigma,
+        )
+
+    return _extract_peak_row_for_algorithm(
+        sweep,
+        fs_hz,
+        config,
+        peak_finder,
+        min_idx,
+        str(config.algorithm or "zscore"),
+        sigma,
     )
 
 

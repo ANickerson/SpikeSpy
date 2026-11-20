@@ -77,6 +77,17 @@ lru_numpy_memmap = BoundedERPCache
 
 logger = logging.getLogger(__name__)
 
+UNIT_COLORS: List[Tuple[int, int, int]] = [
+    (102, 194, 165),
+    (252, 141, 98),
+    (141, 160, 203),
+    (231, 138, 195),
+    (166, 216, 84),
+    (255, 217, 47),
+    (229, 196, 148),
+    (179, 179, 179),
+]
+
 
 @dataclass
 class tracked_neuron_unit:
@@ -443,6 +454,150 @@ class tracked_neuron_unit:
         sweeps = np.searchsorted(event_signal, self.event.times).magnitude
         return sweeps
 
+    def get_tracking_health(
+        self,
+        event_signal=None,
+        current_stimno: Optional[int] = None,
+        window_sweeps: int = 20,
+    ) -> Dict[str, Any]:
+        """Compute tracking health metrics for this unit up to ``current_stimno``."""
+        n_events = len(event_signal) if event_signal is not None else 0
+        if current_stimno is None:
+            if n_events > 0:
+                current_stimno = n_events - 1
+            elif self._idx_arr:
+                current_stimno = len(self._idx_arr) - 1
+            else:
+                current_stimno = 0
+        else:
+            current_stimno = int(current_stimno)
+            if n_events > 0:
+                current_stimno = max(0, min(current_stimno, n_events - 1))
+
+        # Collect sweep -> latency_ms (if computable) or presence from idx_arr and/or event
+        sweep_latencies_ms: Dict[int, Optional[float]] = {}
+        if self._idx_arr is not None:
+            sr_hz: Optional[float] = None
+            if (
+                event_signal is not None
+                and self.event is not None
+                and len(self.event) > 0
+                and n_events > 0
+            ):
+                # idx_arr only stores sample indices; latency_ms is derived from event timestamps when present.
+                sr_hz = None
+            for sw, item in enumerate(self._idx_arr):
+                if item is None:
+                    continue
+                sample = item[0] if isinstance(item, (tuple, list)) else item
+                if sample is not None:
+                    sweep_latencies_ms[int(sw)] = None
+
+        if (
+            event_signal is not None
+            and n_events > 0
+            and self.event is not None
+            and len(self.event) > 0
+        ):
+            ev_s = (
+                self.event.rescale(pq.s).magnitude
+                if hasattr(self.event, "rescale")
+                else np.asarray(self.event, dtype=np.float64)
+            )
+            stim_s = (
+                event_signal.rescale(pq.s).magnitude
+                if hasattr(event_signal, "rescale")
+                else np.asarray(event_signal, dtype=np.float64)
+            )
+            ev_s = np.asarray(ev_s, dtype=np.float64).ravel()
+            stim_s = np.asarray(stim_s, dtype=np.float64).ravel()
+            idx_sweeps = np.searchsorted(stim_s, ev_s, side="right") - 1
+            valid_mask = (idx_sweeps >= 0) & (idx_sweeps < len(stim_s))
+            for sw, t_ev in zip(idx_sweeps[valid_mask], ev_s[valid_mask]):
+                sw_i = int(sw)
+                dt_ms = float((t_ev - stim_s[sw_i]) * 1000.0)
+                if dt_ms >= 0.0 and sw_i not in sweep_latencies_ms:
+                    sweep_latencies_ms[sw_i] = dt_ms
+                elif dt_ms >= 0.0 and sweep_latencies_ms.get(sw_i) is None:
+                    sweep_latencies_ms[sw_i] = dt_ms
+
+        total_spikes = len(sweep_latencies_ms)
+        if total_spikes == 0 and self.event is not None and len(self.event) > 0 and n_events == 0:
+            total_spikes = len(self.event)
+
+        if n_events == 0 and not self._idx_arr:
+            recent_window = 0
+        elif current_stimno < 0:
+            recent_window = 0
+        else:
+            recent_window = min(max(1, int(window_sweeps)), current_stimno + 1)
+
+        if recent_window > 0:
+            win_start = max(0, current_stimno - recent_window + 1)
+            recent_hits = sum(
+                1 for sw in range(win_start, current_stimno + 1) if sw in sweep_latencies_ms
+            )
+            hit_rate = float(recent_hits) / float(recent_window)
+        else:
+            recent_hits = 0
+            hit_rate = 0.0
+
+        # Trailing consecutive misses up to current_stimno
+        if recent_window > 0:
+            consecutive_misses = 0
+            for sw in range(current_stimno, -1, -1):
+                if sw in sweep_latencies_ms:
+                    break
+                consecutive_misses += 1
+        else:
+            consecutive_misses = 0
+
+        self._consecutive_misses = int(consecutive_misses)
+
+        # Latencies in ms for first and latest detected spikes (up to current_stimno if sweeps exist)
+        ordered_sweeps = sorted(
+            sw for sw in sweep_latencies_ms.keys()
+            if (recent_window == 0 or sw <= current_stimno)
+        )
+        if not ordered_sweeps:
+            ordered_sweeps = sorted(sweep_latencies_ms.keys())
+
+        lat_values = [
+            sweep_latencies_ms[sw]
+            for sw in ordered_sweeps
+            if sweep_latencies_ms[sw] is not None
+        ]
+        if lat_values:
+            first_latency_ms = float(lat_values[0])
+            last_latency_ms: Optional[float] = float(lat_values[-1])
+            latency_shift_ms = float(last_latency_ms - first_latency_ms)
+        else:
+            last_latency_ms = None
+            latency_shift_ms = 0.0
+
+        max_skips = max(1, int(getattr(self, "tracking_max_skips", 1)))
+        if total_spikes == 0:
+            status = "empty"
+        elif not bool(getattr(self, "auto_track", False)):
+            status = "manual"
+        elif consecutive_misses == 0:
+            status = "locked"
+        elif consecutive_misses <= max_skips:
+            status = "skipping"
+        else:
+            status = "lost"
+
+        return {
+            "total_spikes": int(total_spikes),
+            "recent_hits": int(recent_hits),
+            "recent_window": int(recent_window),
+            "hit_rate": float(hit_rate),
+            "consecutive_misses": int(consecutive_misses),
+            "last_latency_ms": last_latency_ms,
+            "latency_shift_ms": float(latency_shift_ms),
+            "status": status,
+        }
+
 
 @dataclass
 class CandidateUnit:
@@ -531,6 +686,21 @@ class ViewerState(QObject):
     onCandidatesChanged = Signal()
     onCandidateSelectionChanged = Signal(int)
     onCandidateScanStateChanged = Signal(bool)
+    onCandidateConfigChanged = Signal()
+    onSharedVisualSettingsChanged = Signal(str, dict)
+    onProtocolMarkersChanged = Signal()
+
+    @staticmethod
+    def _default_visual_settings() -> Dict[str, Any]:
+        return {
+            "x_range": None,
+            "y_range": None,
+            "scale_mode": "std",
+            "color_scale": (0.5, 2.0),
+            "trace_scale": 1.0,
+            "show_track_window": True,
+            "show_template": True,
+        }
 
     def __init__(self, parent=None, segment=None, spike_groups=None):
         super().__init__(parent)
@@ -568,14 +738,17 @@ class ViewerState(QObject):
                 "group_name": "",
                 "unit_idx": None,
                 "multichannel": True,
+                "visual_settings": self._default_visual_settings(),
             },
             "Shared Group B": {
                 "channels": [],
                 "group_name": "",
                 "unit_idx": None,
                 "multichannel": True,
+                "visual_settings": self._default_visual_settings(),
             },
         }
+        self.protocol_markers: List[Dict[str, Any]] = []
 
         # Live streaming state attributes
         self.is_streaming: bool = False
@@ -801,6 +974,39 @@ class ViewerState(QObject):
             self.set_unit_channels(unit_idx, shifted)
         return shifted
 
+    def get_unit_color(self, unit_idx: int) -> Tuple[int, int, int]:
+        """Return consistent RGB tuple for a unit index."""
+        try:
+            idx = int(unit_idx)
+        except (TypeError, ValueError):
+            return UNIT_COLORS[0]
+        if idx < 0:
+            return UNIT_COLORS[0]
+        return UNIT_COLORS[idx % len(UNIT_COLORS)]
+
+    def get_unit_hex_color(self, unit_idx: int) -> str:
+        """Return consistent #rrggbb hex color string for a unit index."""
+        r, g, b = self.get_unit_color(unit_idx)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def get_unit_health(self, unit_idx: Optional[int] = None) -> Dict[str, Any]:
+        """Return tracking health metrics for ``unit_idx`` (defaults to ``cur_spike_group``)."""
+        if unit_idx is None:
+            unit_idx = self.cur_spike_group
+        sg = self.getUnitGroup(unit_idx)
+        if sg is None:
+            return {
+                "total_spikes": 0,
+                "recent_hits": 0,
+                "recent_window": 0,
+                "hit_rate": 0.0,
+                "consecutive_misses": 0,
+                "last_latency_ms": None,
+                "latency_shift_ms": 0.0,
+                "status": "empty",
+            }
+        return sg.get_tracking_health(self.event_signal, self.stimno)
+
     def get_shared_channel_set(self, set_name: str = "Shared Group A") -> dict:
         """Returns the dictionary configuration for a shared channel set."""
         if not set_name:
@@ -811,8 +1017,13 @@ class ViewerState(QObject):
                 "group_name": "",
                 "unit_idx": None,
                 "multichannel": True,
+                "visual_settings": self._default_visual_settings(),
             }
-        s = dict(self.shared_channel_sets[set_name])
+        entry = self.shared_channel_sets[set_name]
+        if "visual_settings" not in entry or not isinstance(entry["visual_settings"], dict):
+            entry["visual_settings"] = self._default_visual_settings()
+        s = dict(entry)
+        s["visual_settings"] = dict(entry["visual_settings"])
         if not s.get("channels"):
             avail = self.get_available_channels()
             s["channels"] = avail[:4] if len(avail) >= 4 else avail
@@ -830,13 +1041,157 @@ class ViewerState(QObject):
         if not set_name:
             set_name = "Shared Group A"
         cleaned = [str(c).strip() for c in channels if str(c).strip()]
+        existing_vis = (
+            dict(self.shared_channel_sets.get(set_name, {}).get("visual_settings") or {})
+            or self._default_visual_settings()
+        )
         self.shared_channel_sets[set_name] = {
             "channels": cleaned,
             "group_name": group_name,
             "unit_idx": unit_idx,
             "multichannel": multichannel,
+            "visual_settings": existing_vis,
         }
         self.onSharedChannelSetChanged.emit(set_name)
+
+    def get_shared_visual_settings(self, set_name: str = "Shared Group A") -> Dict[str, Any]:
+        """Return visual settings dictionary for the given shared channel set."""
+        if not set_name:
+            set_name = "Shared Group A"
+        s = self.get_shared_channel_set(set_name)
+        vis = dict(self._default_visual_settings())
+        vis.update(s.get("visual_settings") or {})
+        return vis
+
+    def update_shared_visual_settings(self, set_name: str, **kwargs) -> Dict[str, Any]:
+        """Update visual settings for ``set_name`` and emit ``onSharedVisualSettingsChanged``."""
+        if not set_name:
+            set_name = "Shared Group A"
+        self.get_shared_channel_set(set_name)
+        vis = self.shared_channel_sets[set_name].setdefault(
+            "visual_settings", self._default_visual_settings()
+        )
+        vis.update(kwargs)
+        updated = dict(vis)
+        self.onSharedVisualSettingsChanged.emit(set_name, updated)
+        return updated
+
+    def add_protocol_marker(
+        self,
+        label: str,
+        stimno: Optional[int] = None,
+        timestamp_s: Optional[float] = None,
+        category: str = "protocol",
+    ) -> Dict[str, Any]:
+        """Record a protocol marker at ``stimno`` / ``timestamp_s`` and sync ``log.other``."""
+        if stimno is None:
+            stimno = int(getattr(self, "stimno", 0) or 0)
+        else:
+            stimno = int(stimno)
+
+        if timestamp_s is None:
+            if (
+                self.event_signal is not None
+                and len(self.event_signal) > 0
+                and 0 <= stimno < len(self.event_signal)
+            ):
+                ev_t = self.event_signal[stimno]
+                timestamp_s = float(
+                    ev_t.rescale(pq.s).magnitude if hasattr(ev_t, "rescale") else ev_t
+                )
+            else:
+                timestamp_s = 0.0
+        else:
+            timestamp_s = float(timestamp_s)
+
+        marker = {
+            "stimno": int(stimno),
+            "timestamp_s": float(timestamp_s),
+            "label": str(label),
+            "category": str(category),
+        }
+        self.protocol_markers.append(marker)
+
+        if self.segment is not None:
+            existing_idx = None
+            for i, ev in enumerate(self.segment.events):
+                if getattr(ev, "name", None) == "log.other":
+                    existing_idx = i
+                    break
+            if existing_idx is not None:
+                ev_other = self.segment.events[existing_idx]
+                old_times = (
+                    np.asarray(ev_other.rescale(pq.s).magnitude, dtype=np.float64).ravel()
+                    if hasattr(ev_other, "rescale")
+                    else np.asarray(ev_other, dtype=np.float64).ravel()
+                )
+                old_msgs = list(
+                    (getattr(ev_other, "array_annotations", None) or {}).get(
+                        "message", [""] * len(old_times)
+                    )
+                )
+                new_times = np.append(old_times, float(timestamp_s)) * pq.s
+                new_msgs = np.array([str(m) for m in old_msgs] + [str(label)])
+                updated_ev = neo.Event(
+                    new_times,
+                    name="log.other",
+                    units=pq.s,
+                    array_annotations={"message": new_msgs},
+                )
+                self.segment.events[existing_idx] = updated_ev
+            else:
+                new_ev = neo.Event(
+                    np.array([float(timestamp_s)], dtype=np.float64) * pq.s,
+                    name="log.other",
+                    units=pq.s,
+                    array_annotations={"message": np.array([str(label)])},
+                )
+                self.segment.events.append(new_ev)
+
+        self.onProtocolMarkersChanged.emit()
+        self.onEventsUpdated.emit()
+        return dict(marker)
+
+    def get_protocol_markers(self) -> List[Dict[str, Any]]:
+        """Return protocol markers, populating from ``segment`` ``log.other`` if empty."""
+        if not self.protocol_markers and self.segment is not None:
+            ev_other = next(
+                (e for e in getattr(self.segment, "events", []) if getattr(e, "name", None) == "log.other"),
+                None,
+            )
+            if ev_other is not None and len(ev_other) > 0:
+                times = (
+                    np.asarray(ev_other.rescale(pq.s).magnitude, dtype=np.float64).ravel()
+                    if hasattr(ev_other, "rescale")
+                    else np.asarray(ev_other, dtype=np.float64).ravel()
+                )
+                msgs = list(
+                    (getattr(ev_other, "array_annotations", None) or {}).get(
+                        "message", [""] * len(times)
+                    )
+                )
+                stim_times = None
+                if self.event_signal is not None and len(self.event_signal) > 0:
+                    stim_times = (
+                        np.asarray(self.event_signal.rescale(pq.s).magnitude, dtype=np.float64).ravel()
+                        if hasattr(self.event_signal, "rescale")
+                        else np.asarray(self.event_signal, dtype=np.float64).ravel()
+                    )
+                for idx, t in enumerate(times):
+                    msg = str(msgs[idx]) if idx < len(msgs) else ""
+                    if stim_times is not None and len(stim_times) > 0:
+                        sw = int(np.clip(np.searchsorted(stim_times, t, side="right") - 1, 0, len(stim_times) - 1))
+                    else:
+                        sw = 0
+                    self.protocol_markers.append(
+                        {
+                            "stimno": sw,
+                            "timestamp_s": float(t),
+                            "label": msg,
+                            "category": "protocol",
+                        }
+                    )
+        return [dict(m) for m in self.protocol_markers]
 
     def shift_shared_channels(self, set_name: str, step: int = 1) -> List[str]:
         """Shifts the active channels of a shared channel set forward or backward along recording channels."""
@@ -1180,6 +1535,11 @@ class ViewerState(QObject):
             }
         )
 
+        if latency is not None:
+            latest_idx = self.get_latest_event_idx()
+            if latest_idx is None or stimno >= latest_idx:
+                sg._consecutive_misses = 0
+
         self.onUnitChange.emit(stimno)
         self.onNewSpikeEvents.emit(unit_idx)
         self.onUnitSpikeChanged.emit(unit_idx, stimno)
@@ -1481,6 +1841,7 @@ class ViewerState(QObject):
         local_samples: Dict[int, Dict[int, int]] = {ui: {} for ui, _ in units}
         tracked_counts: Dict[int, int] = {ui: 0 for ui, _ in units}
 
+        tracked_stims_by_unit: Dict[int, set] = {ui: set() for ui, _ in units}
         for item in batch.items:
             stimno = int(item.stim_index)
             if stimno < 0 or stimno >= len(self.event_signal):
@@ -1539,22 +1900,45 @@ class ViewerState(QObject):
                     template_matcher=matcher,
                     multi_channel_getter=getter,
                 )
+                tracked_stims_by_unit[unit_idx].add(stimno)
                 if hit is not None:
                     detections.append((unit_idx, int(hit), stimno))
                     local_samples[unit_idx][stimno] = int(hit)
                     tracked_counts[unit_idx] += 1
 
+        # Update _consecutive_misses for live tracked units when sweeps were evaluated
+        latest_batch_stim = max(
+            (int(it.stim_index) for it in batch.items if 0 <= int(it.stim_index) < len(self.event_signal)),
+            default=None,
+        )
+        if latest_batch_stim is not None:
+            for unit_idx, sg in units:
+                if latest_batch_stim in local_samples[unit_idx]:
+                    sg._consecutive_misses = 0
+                elif latest_batch_stim in tracked_stims_by_unit[unit_idx]:
+                    sg._consecutive_misses = int(getattr(sg, "_consecutive_misses", 0)) + 1
+
         return detections
 
     def _on_live_tracking_result(self, detections, error):
         """Apply orchestrator detections on the GUI thread."""
-        if error or not detections:
+        if error:
+            return
+        if not detections:
+            for sg in self.spike_groups:
+                if getattr(sg, "auto_track", False):
+                    sg._consecutive_misses = int(getattr(sg, "_consecutive_misses", 0)) + 1
             return
         by_unit: Dict[int, Dict[int, int]] = {}
         for unit_idx, sample, stimno in detections:
             by_unit.setdefault(int(unit_idx), {})[int(stimno)] = int(sample)
         for unit_idx, samples in by_unit.items():
             self.apply_tracked_samples(unit_idx, samples, save_undo=False)
+            if 0 <= unit_idx < len(self.spike_groups):
+                self.spike_groups[unit_idx]._consecutive_misses = 0
+        for ui, sg in enumerate(self.spike_groups):
+            if getattr(sg, "auto_track", False) and ui not in by_unit:
+                sg._consecutive_misses = int(getattr(sg, "_consecutive_misses", 0)) + 1
 
     @Slot(Event)
     def updateUnit(self, event, merge=False, unitid=None):
@@ -2006,6 +2390,133 @@ class ViewerState(QObject):
         self.update_idx_arrs()
         self.onUnitGroupChange.emit()
         self.onUnitListChanged.emit()
+
+    def seed_unit_at(
+        self,
+        sample_idx: int,
+        stimno: Optional[int] = None,
+        channel: Optional[str] = None,
+        auto_track: bool = True,
+        window_ms: float = 5.0,
+    ) -> int:
+        """Create a new unit seeded at ``(stimno, sample_idx)`` and optionally enable auto-tracking."""
+        if stimno is None:
+            stimno = int(getattr(self, "stimno", 0) or 0)
+        else:
+            stimno = int(stimno)
+        sample_idx = int(sample_idx)
+
+        primary_ch = channel or (
+            getattr(self.analog_signal, "name", "") if self.analog_signal is not None else ""
+        )
+        avail = self.get_available_channels()
+        if not primary_ch and avail:
+            primary_ch = avail[0]
+
+        neighbors: List[str] = []
+        if avail and primary_ch in avail:
+            idx = avail.index(primary_ch)
+            candidates: List[Tuple[int, int, str]] = []
+            for j, name in enumerate(avail):
+                if name == primary_ch:
+                    continue
+                candidates.append((abs(j - idx), j, name))
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            neighbors = [name for _, _, name in candidates[:3]]
+        elif avail:
+            neighbors = [c for c in avail if c != primary_ch][:3]
+
+        # Estimate threshold in mV from waveform amplitude around (stimno, sample_idx)
+        thresh_mv = 0.01
+        ch_erp = self.get_channel_erp(primary_ch) if primary_ch else self.get_erp()
+        if ch_erp is None:
+            ch_erp = self.get_erp()
+        if ch_erp is not None and 0 <= stimno < len(ch_erp):
+            row = ch_erp[stimno]
+            if hasattr(row, "rescale"):
+                try:
+                    row_mv = row.rescale(pq.mV).magnitude
+                except Exception:
+                    row_mv = row.magnitude
+            elif hasattr(row, "magnitude"):
+                row_mv = row.magnitude
+                sig = self.get_channel_signal(primary_ch) if primary_ch else self.analog_signal
+                u = getattr(ch_erp, "units", None) or getattr(sig, "units", None)
+                if u is not None:
+                    try:
+                        row_mv = (np.asarray(row_mv) * u).rescale(pq.mV).magnitude
+                    except Exception:
+                        pass
+            else:
+                row_mv = np.asarray(row)
+                sig = self.get_channel_signal(primary_ch) if primary_ch else self.analog_signal
+                u = getattr(sig, "units", None)
+                if u is not None:
+                    try:
+                        row_mv = (row_mv * u).rescale(pq.mV).magnitude
+                    except Exception:
+                        pass
+            row_arr = np.asarray(row_mv, dtype=np.float64).ravel()
+            if row_arr.size > 0:
+                clamped_idx = max(0, min(sample_idx, row_arr.size - 1))
+                val_in_mv = float(row_arr[clamped_idx])
+                thresh_mv = max(0.005, 0.75 * abs(val_in_mv))
+
+        self.addUnitGroup()
+        new_idx = len(self.spike_groups) - 1
+        sg = self.spike_groups[new_idx]
+        sg.channel = str(primary_ch or "")
+        sg.neighbor_channels = list(neighbors)
+        sg.tracking_threshold_mv = float(thresh_mv)
+        sg.tracking_window_ms = float(window_ms)
+        sg.auto_track = bool(auto_track)
+        if getattr(sg, "event", None) is not None:
+            sg.event.annotations["channel"] = sg.channel
+            sg.event.annotations["neighbor_channels"] = list(neighbors)
+            sg.event.annotations["tracking_threshold_mv"] = float(thresh_mv)
+            sg.event.annotations["tracking_window_ms"] = float(window_ms)
+            sg.event.annotations["auto_track"] = bool(auto_track)
+
+        self.setUnit(sample_idx, stimno=stimno, unit_idx=new_idx)
+        self.setUnitGroup(new_idx)
+        self.onUnitParamsChanged.emit(new_idx)
+        if auto_track and getattr(self, "is_streaming", False):
+            self.ensure_live_tracking_processor()
+        return new_idx
+
+    def reanchor_unit_at(
+        self,
+        unit_idx: int,
+        sample_idx: int,
+        stimno: Optional[int] = None,
+        enable_auto_track: bool = True,
+    ) -> bool:
+        """Re-anchor ``unit_idx`` at ``(stimno, sample_idx)`` and reset miss counters."""
+        if unit_idx < 0 or unit_idx >= len(self.spike_groups):
+            return False
+        if stimno is None:
+            stimno = int(getattr(self, "stimno", 0) or 0)
+        else:
+            stimno = int(stimno)
+        if (
+            self.event_signal is None
+            or len(self.event_signal) == 0
+            or stimno < 0
+            or stimno >= len(self.event_signal)
+        ):
+            return False
+
+        sg = self.spike_groups[unit_idx]
+        self.setUnit(int(sample_idx), stimno=stimno, unit_idx=unit_idx)
+        sg._consecutive_misses = 0
+        if enable_auto_track:
+            sg.auto_track = True
+            if getattr(sg, "event", None) is not None:
+                sg.event.annotations["auto_track"] = True
+        self.onUnitParamsChanged.emit(unit_idx)
+        if getattr(sg, "auto_track", False) and getattr(self, "is_streaming", False):
+            self.ensure_live_tracking_processor()
+        return True
 
     def mergeUnitGroups(self, keep_idx: int, remove_idx: int, save_undo: bool = True):
         """Merge unit ``remove_idx`` into unit ``keep_idx``.
@@ -2727,6 +3238,30 @@ class ViewerState(QObject):
         self._candidate_scan_generation = int(generation)
         self._candidate_last_scan_stim = int(snapshot["scan_end_stim"])
         return True
+
+    def update_candidate_config(self, **kwargs: Any) -> CandidateScanConfig:
+        """Update fields on ``self.candidate_config`` and notify listeners."""
+        cfg = self.candidate_config
+        scan_interval_updated = False
+        for key, value in kwargs.items():
+            if not hasattr(cfg, key):
+                continue
+            if key == "detector_params":
+                if isinstance(value, dict):
+                    cfg.detector_params = dict(value)
+                elif value is None:
+                    cfg.detector_params = {}
+                continue
+            if key == "enabled_algorithms":
+                cfg.enabled_algorithms = [str(a) for a in (value or []) if str(a).strip()]
+                continue
+            setattr(cfg, key, value)
+            if key == "scan_interval_ms":
+                scan_interval_updated = True
+        if scan_interval_updated and self.auto_scan_live and self.is_streaming:
+            self._update_candidate_auto_scan()
+        self.onCandidateConfigChanged.emit()
+        return cfg
 
     def set_auto_scan_live(self, enabled: bool) -> None:
         self.auto_scan_live = bool(enabled)
