@@ -588,14 +588,18 @@ class ChannelGroupContainerView(LiveFrameConsumerMixin, QMainWindow):
                         mode, val = sel_mode
                         if mode == ChannelGroupBar.MODE_FOLLOW_UNIT:
                             cbar.set_channel_mode_unit()
+                        elif mode == ChannelGroupBar.MODE_UNIT_DETECTED:
+                            cbar.set_channel_mode_unit_detected()
                         elif mode == ChannelGroupBar.MODE_FOLLOW_GLOBAL:
                             idx = cbar.find_channel_data_index(ChannelGroupBar.MODE_FOLLOW_GLOBAL)
                             if idx >= 0:
                                 cbar.combo_channel.setCurrentIndex(idx)
                         elif mode == ChannelGroupBar.MODE_FOLLOW_LIVE:
                             cbar.set_channel_mode_live()
-                        elif mode in (ChannelGroupBar.MODE_GROUP, ChannelGroupBar.MODE_SINGLE):
-                            cbar.bind_to_channels(self.channel_bar.get_selected_channels())
+                        elif mode == ChannelGroupBar.MODE_GROUP:
+                            cbar.bind_to_group(str(val))
+                        elif mode == ChannelGroupBar.MODE_SINGLE:
+                            cbar.bind_to_channel(str(val))
 
             # Sync multichannel checkbox
             cbar.chk_multichannel.setChecked(self.channel_bar.is_multichannel())

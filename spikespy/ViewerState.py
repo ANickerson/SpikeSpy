@@ -903,6 +903,51 @@ class ViewerState(QObject):
             chans.append(self.analog_signal.name)
         return chans
 
+    def get_unit_detected_channels(
+        self,
+        unit_idx: int,
+        last_n: int = 50,
+        window_ms: float = 15.0,
+    ) -> List[str]:
+        """Return dynamically detected channels for a unit based on its spatiotemporal footprint (amplitude & SNR)."""
+        if unit_idx < 0 or unit_idx >= len(self.spike_groups):
+            return []
+        sg = self.spike_groups[unit_idx]
+        try:
+            from .dsp.footprint import (
+                compute_unit_footprint_from_state,
+                auto_detect_channels_from_footprint,
+            )
+
+            fp = compute_unit_footprint_from_state(
+                self,
+                sg,
+                last_n=last_n,
+                window_ms=window_ms,
+                align_peaks=True,
+                include_latest_sweep=False,
+            )
+            if fp is not None:
+                res = auto_detect_channels_from_footprint(fp)
+                if res is not None:
+                    primary, neighbors = res
+                    detected = [primary] + [c for c in neighbors if c != primary]
+                    if detected:
+                        return detected
+                det_list = fp.get("detected_channels", [])
+                if det_list:
+                    return list(det_list)
+        except Exception:
+            pass
+        return self.get_unit_channels(unit_idx)
+
+    def auto_assign_unit_detected_channels(self, unit_idx: int) -> List[str]:
+        """Detects the unit's active footprint channels and assigns them as its configured primary + neighbor channels."""
+        detected = self.get_unit_detected_channels(unit_idx)
+        if detected:
+            self.set_unit_channels(unit_idx, detected)
+        return detected
+
     def emit_unit_params_changed(self, unit_idx: int = -1):
         """Emit onUnitParamsChanged for a specific unit or -1 for all units."""
         self.onUnitParamsChanged.emit(unit_idx)

@@ -480,3 +480,76 @@ def test_layout_presets_and_named_perspectives(qtbot, mock_multichannel_state):
     assert ok is True
     assert len(spy.dock_manager.dockWidgets()) >= 2
 
+
+def test_simplified_channel_selector_and_unit_detected_vs_assigned(qtbot, mock_multichannel_state):
+    """
+    Verify:
+    1. Top channel bars on individual views are hidden by default.
+    2. Simplified channel selector exposes Auto, Unit Assigned Channels, Unit Detected Channels,
+       Predefined Groups, and Individual Channels with a settings button (⚙).
+    3. Unit Assigned vs Unit Detected channels resolve appropriately (assigned uses explicit configuration,
+       detected dynamically computes from footprint SNR/amplitude).
+    4. Clicking the settings button opens the Channel Groups editor pane in ViewSettingsPanel.
+    """
+    state = mock_multichannel_state
+
+    # Unit 0 actually has spikes on CH0, CH1, CH2, CH3 in mock_multichannel_state
+    # Let's explicitly assign only ["CH0", "CH1"] to Unit 0 so Assigned != Detected
+    state.set_unit_channels(0, ["CH0", "CH1"])
+    assert state.get_unit_channels(0) == ["CH0", "CH1"]
+    detected_u0 = state.get_unit_detected_channels(0)
+    assert "CH0" in detected_u0 and "CH1" in detected_u0 and "CH2" in detected_u0
+    assert len(detected_u0) > len(state.get_unit_channels(0))
+
+    # 1. Individual view has channel_bar hidden by default
+    st_view = SingleTraceView(state=state)
+    qtbot.addWidget(st_view)
+    assert st_view.channel_bar.isHidden() is True
+
+    # 2. ChannelGroupBar modes: Auto, Unit Assigned, Unit Detected
+    bar = st_view.channel_bar
+    bar.bind_to_unit(0)
+
+    # Unit Assigned mode
+    bar.set_channel_mode_unit()
+    assert bar.get_channel_mode()[0] == ChannelGroupBar.MODE_UNIT_ASSIGNED
+    assert bar.get_selected_channels() == ["CH0", "CH1"]
+
+    # Unit Detected mode
+    bar.set_channel_mode_unit_detected()
+    assert bar.get_channel_mode()[0] == ChannelGroupBar.MODE_UNIT_DETECTED
+    assert bar.get_selected_channels() == detected_u0
+
+    # Auto / Global mode
+    bar.set_channel_mode_global()
+    assert bar.get_channel_mode()[0] == ChannelGroupBar.MODE_AUTO
+    assert bar.get_primary_channel() == "CH0"
+
+    # 3. Settings button (⚙) opens ChannelGroupEditorPane in ViewSettingsPanel
+    spy = MdiView(state=state, check_updates=False)
+    qtbot.addWidget(spy)
+    spy.show()
+
+    w_mt = spy.newWindow("MultiTrace")
+    assert w_mt.channel_bar.isHidden() is True
+
+    cgc = spy.newWindow("ChannelGroupContainer")
+    assert cgc.channel_bar.isHidden() is False
+    assert cgc.channel_bar.btn_settings is not None
+
+    # Click settings button on container's channel_bar
+    spy.settings_panel.setActiveView(cgc)
+    cgc.channel_bar.btn_settings.click()
+    assert spy.settings_panel.channel_groups_editor.isVisible() is True
+
+    # Use editor pane to create and save a new group
+    editor = spy.settings_panel.channel_groups_editor
+    editor.set_active_bar(cgc.channel_bar)
+    editor.set_checked_channels(["CH2", "CH3", "CH4"])
+    editor.txt_group_name.setText("CustomTriplet")
+    editor.save_checked_as_group()
+
+    assert state.get_channel_group("CustomTriplet") == ["CH2", "CH3", "CH4"]
+    assert cgc.channel_bar.get_channel_mode() == (ChannelGroupBar.MODE_GROUP, "CustomTriplet")
+    assert cgc.channel_bar.get_selected_channels() == ["CH2", "CH3", "CH4"]
+

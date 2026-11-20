@@ -144,11 +144,12 @@ class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
         self.toolbar.addWidget(self.chk_unit_neighbors_only)
         self.toolbar.addWidget(self.spin_chan_spacing)
 
-        # Independent channel group and unit binding toolbar
+        # Independent channel group and unit binding toolbar (hidden by default; controlled via ViewSettingsPanel or container)
         self.channel_bar = ChannelGroupBar(parent=self, state=self.state)
         self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
         self.addToolBarBreak()
         self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+        self.channel_bar.setVisible(False)
 
         self.aux_trace_lines = []
         self.aux_trace_labels = []

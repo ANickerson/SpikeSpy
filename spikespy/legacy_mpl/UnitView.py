@@ -86,6 +86,7 @@ class UnitView(QMatplotlib):
         self.channel_bar = ChannelGroupBar(parent=self, state=state)
         self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
         self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+        self.channel_bar.setVisible(False)
         self.update_window_title()
 
         def draw_evt(evt):

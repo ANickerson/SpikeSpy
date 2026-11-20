@@ -37,6 +37,7 @@ class MultiTraceFixedView(QMatplotlib):
         self.channel_bar.setParent(self)
         self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
         self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+        self.channel_bar.setVisible(False)
         if state is not None:
             self.channel_bar.setState(state)
         self.update_window_title()

@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from .ActiveUnitInfoView import ActiveUnitInfoView
-from .ChannelGroupBar import ChannelGroupBar
+from .ChannelGroupBar import ChannelGroupBar, ChannelGroupEditorPane
 from .MultiTracePlotManager import MultiTracePlotManager
 
 
@@ -104,47 +104,29 @@ class ViewSettingsPanel(QWidget):
         row_unit.addWidget(self.combo_unit, 1)
         grp_layout.addLayout(row_unit)
 
-        # Channel / Group selection row
+        # Channel / Group selection row + Settings Button
         row_chan = QHBoxLayout()
         row_chan.addWidget(QLabel("Channel:"))
         self.combo_channel = QComboBox(self.grp_unit_selector)
         self.combo_channel.setToolTip(
             "Select channel or channel group:\n"
-            "- (Follow Global Channel): follow global active recording channel\n"
-            "- (📡 Follow Live Input): track incoming live streaming channels\n"
-            "- (Bound Unit Channels): display all channels where the bound unit is identified\n"
+            "- Auto (Active Channel): follow global active recording channel\n"
+            "- Unit Assigned Channels: primary & neighbor channels configured for the unit\n"
+            "- Unit Detected Channels: channels dynamically detected from the unit's footprint\n"
+            "- Auto (Live Stream Input): track incoming live streaming channels\n"
             "- [Group] ...: use a saved channel group\n"
             "- Individual Channel: pick a specific channel"
         )
         self.combo_channel.currentIndexChanged.connect(self._on_channel_selection_changed)
         row_chan.addWidget(self.combo_channel, 1)
+
+        self.btn_channel_settings = QToolButton(self.grp_unit_selector)
+        self.btn_channel_settings.setText("⚙")
+        self.btn_channel_settings.setCheckable(True)
+        self.btn_channel_settings.setToolTip("Open / toggle Channel Groups editor pane")
+        self.btn_channel_settings.toggled.connect(self._on_toggle_channel_groups_editor)
+        row_chan.addWidget(self.btn_channel_settings)
         grp_layout.addLayout(row_chan)
-
-        # Multi-Ch, Quick Shifts, and Group Menu buttons row
-        row_opts = QHBoxLayout()
-        self.chk_multichannel = QCheckBox("Multi-Ch", self.grp_unit_selector)
-        self.chk_multichannel.setToolTip("Display or integrate all channels in the selected group/unit")
-        self.chk_multichannel.toggled.connect(self._on_multichannel_toggled)
-        row_opts.addWidget(self.chk_multichannel)
-
-        self.btn_shift_prev = QPushButton("<", self.grp_unit_selector)
-        self.btn_shift_prev.setFixedWidth(24)
-        self.btn_shift_prev.setToolTip("Shift channel group by -1 channel")
-        self.btn_shift_prev.clicked.connect(lambda: self._shift_channel_group(-1))
-        row_opts.addWidget(self.btn_shift_prev)
-
-        self.btn_shift_next = QPushButton(">", self.grp_unit_selector)
-        self.btn_shift_next.setFixedWidth(24)
-        self.btn_shift_next.setToolTip("Shift channel group by +1 channel")
-        self.btn_shift_next.clicked.connect(lambda: self._shift_channel_group(1))
-        row_opts.addWidget(self.btn_shift_next)
-
-        self.btn_group_menu = QToolButton(self.grp_unit_selector)
-        self.btn_group_menu.setText("Group ▾")
-        self.btn_group_menu.setPopupMode(QToolButton.InstantPopup)
-        self._build_panel_group_menu()
-        row_opts.addWidget(self.btn_group_menu)
-        grp_layout.addLayout(row_opts)
 
         # Follow Live Events and Sync Visuals checkboxes row
         row_live = QHBoxLayout()
@@ -163,6 +145,40 @@ class ViewSettingsPanel(QWidget):
         )
         row_live.addWidget(self.chk_sync_group_visuals)
         grp_layout.addLayout(row_live)
+
+        # Compatibility controls kept hidden in layout (so existing tests or callers can still use them)
+        row_opts = QHBoxLayout()
+        self.chk_multichannel = QCheckBox("Multi-Ch", self.grp_unit_selector)
+        self.chk_multichannel.setToolTip("Display or integrate all channels in the selected group/unit")
+        self.chk_multichannel.toggled.connect(self._on_multichannel_toggled)
+        self.chk_multichannel.setVisible(False)
+        row_opts.addWidget(self.chk_multichannel)
+
+        self.btn_shift_prev = QPushButton("<", self.grp_unit_selector)
+        self.btn_shift_prev.setFixedWidth(24)
+        self.btn_shift_prev.clicked.connect(lambda: self._shift_channel_group(-1))
+        self.btn_shift_prev.setVisible(False)
+        row_opts.addWidget(self.btn_shift_prev)
+
+        self.btn_shift_next = QPushButton(">", self.grp_unit_selector)
+        self.btn_shift_next.setFixedWidth(24)
+        self.btn_shift_next.clicked.connect(lambda: self._shift_channel_group(1))
+        self.btn_shift_next.setVisible(False)
+        row_opts.addWidget(self.btn_shift_next)
+
+        self.btn_group_menu = QToolButton(self.grp_unit_selector)
+        self.btn_group_menu.setText("Group ▾")
+        self.btn_group_menu.setPopupMode(QToolButton.InstantPopup)
+        self._build_panel_group_menu()
+        self.btn_group_menu.setVisible(False)
+        row_opts.addWidget(self.btn_group_menu)
+        grp_layout.addLayout(row_opts)
+
+        # Collapsible Channel Groups Editor Pane
+        self.channel_groups_editor = ChannelGroupEditorPane(parent=self, state=self.state)
+        self.channel_groups_editor.setVisible(False)
+        self.channel_groups_editor.groupsChanged.connect(self._on_editor_groups_changed)
+        grp_layout.addWidget(self.channel_groups_editor)
 
         main_layout.addWidget(self.grp_unit_selector)
 
@@ -654,6 +670,8 @@ class ViewSettingsPanel(QWidget):
         self.state = state
         if hasattr(self, "unit_info_widget") and self.unit_info_widget is not None:
             self.unit_info_widget.set_state(state)
+        if hasattr(self, "channel_groups_editor") and self.channel_groups_editor is not None:
+            self.channel_groups_editor.setState(state)
         if self.state is not None:
             self._connect_state_signals()
             self._refresh_unit_combo()
@@ -664,6 +682,31 @@ class ViewSettingsPanel(QWidget):
 
     def setState(self, state):
         self.set_state(state)
+
+    def show_channel_groups_editor(self, open_pane: bool = True, target_bar: Optional[ChannelGroupBar] = None):
+        """Shows or hides the Channel Groups editor pane inside the View Settings panel."""
+        self.grp_unit_selector.setVisible(True)
+        with QSignalBlocker(self.btn_channel_settings):
+            self.btn_channel_settings.setChecked(bool(open_pane))
+        self.channel_groups_editor.setVisible(bool(open_pane))
+        if open_pane:
+            bar = target_bar if target_bar is not None else self._get_active_channel_bar()
+            self.channel_groups_editor.set_active_bar(bar)
+            self.channel_groups_editor.refresh()
+
+    def _on_toggle_channel_groups_editor(self, checked: bool):
+        self.channel_groups_editor.setVisible(checked)
+        if checked:
+            self.channel_groups_editor.set_active_bar(self._get_active_channel_bar())
+            self.channel_groups_editor.refresh()
+
+    def _on_editor_groups_changed(self):
+        self._refresh_channel_combo()
+        self._sync_channel_selection_from_bar()
+        container = self._find_parent_container(self.active_view)
+        if container is not None and hasattr(container, "_sync_all_children"):
+            container._sync_all_children()
+        self.settingsChanged.emit()
 
     def _connect_state_signals(self):
         if self.state is None:
@@ -834,11 +877,10 @@ class ViewSettingsPanel(QWidget):
 
         with QSignalBlocker(self.combo_channel):
             self.combo_channel.clear()
-            self.combo_channel.addItem("(Follow Global Channel)", userData=(ChannelGroupBar.MODE_FOLLOW_GLOBAL, None))
-            self.combo_channel.addItem("(📡 Follow Live Input)", userData=(ChannelGroupBar.MODE_FOLLOW_LIVE, None))
-            self.combo_channel.addItem("(Bound Unit Channels)", userData=(ChannelGroupBar.MODE_FOLLOW_UNIT, None))
-            self.combo_channel.addItem("(🔗 Shared Group A)", userData=(ChannelGroupBar.MODE_SHARED_SET, "Shared Group A"))
-            self.combo_channel.addItem("(🔗 Shared Group B)", userData=(ChannelGroupBar.MODE_SHARED_SET, "Shared Group B"))
+            self.combo_channel.addItem("Auto (Active Channel)", userData=(ChannelGroupBar.MODE_FOLLOW_GLOBAL, None))
+            self.combo_channel.addItem("Unit Assigned Channels", userData=(ChannelGroupBar.MODE_FOLLOW_UNIT, None))
+            self.combo_channel.addItem("Unit Detected Channels", userData=(ChannelGroupBar.MODE_UNIT_DETECTED, None))
+            self.combo_channel.addItem("Auto (Live Stream Input)", userData=(ChannelGroupBar.MODE_FOLLOW_LIVE, None))
 
             if self.state:
                 all_groups = self.state.get_all_channel_groups() if hasattr(self.state, "get_all_channel_groups") else {}
@@ -847,6 +889,10 @@ class ViewSettingsPanel(QWidget):
                     for g_name, g_chans in all_groups.items():
                         preview = f" ({len(g_chans)} ch: {', '.join(g_chans[:3])}{'...' if len(g_chans)>3 else ''})"
                         self.combo_channel.addItem(f"[Group] {g_name}{preview}", userData=(ChannelGroupBar.MODE_GROUP, g_name))
+
+                self.combo_channel.insertSeparator(self.combo_channel.count())
+                self.combo_channel.addItem("Shared Group A", userData=(ChannelGroupBar.MODE_SHARED_SET, "Shared Group A"))
+                self.combo_channel.addItem("Shared Group B", userData=(ChannelGroupBar.MODE_SHARED_SET, "Shared Group B"))
 
                 avail = self.state.get_available_channels() if hasattr(self.state, "get_available_channels") else []
                 if avail:
@@ -903,6 +949,8 @@ class ViewSettingsPanel(QWidget):
                     target_bar.set_channel_mode_live()
                 elif mode == ChannelGroupBar.MODE_FOLLOW_UNIT:
                     target_bar.set_channel_mode_unit()
+                elif mode == ChannelGroupBar.MODE_UNIT_DETECTED:
+                    target_bar.set_channel_mode_unit_detected()
                 elif mode == ChannelGroupBar.MODE_SHARED_SET:
                     target_bar.bind_to_shared_set(str(val))
 
@@ -1014,6 +1062,8 @@ class ViewSettingsPanel(QWidget):
                         break
             with QSignalBlocker(self.chk_multichannel):
                 self.chk_multichannel.setChecked(target_bar.is_multichannel())
+            if hasattr(self, "channel_groups_editor") and self.channel_groups_editor is not None:
+                self.channel_groups_editor.set_active_bar(target_bar)
         self._sync_follow_events_checkbox()
 
     def is_following_live_events(self) -> bool:

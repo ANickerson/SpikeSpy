@@ -131,10 +131,11 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         # Graphics items (all persistent; per-sweep updates only call setData/setValue)
         self.conv_curve: Optional[pg.PlotDataItem] = None
 
-        # Independent channel group and unit binding toolbar
+        # Independent channel group and unit binding toolbar (hidden by default; controlled via ViewSettingsPanel or container)
         self.channel_bar = ChannelGroupBar(parent=self, state=self.state)
         self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
         self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+        self.channel_bar.setVisible(False)
 
         # Axis layout toolbar: one stacked axis per channel, or combined
         self.axis_bar = QToolBar("Axes", self)

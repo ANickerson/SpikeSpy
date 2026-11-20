@@ -530,10 +530,11 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.add_navigation_actions(toolbar)
         self.init_navigation()
 
-        # Independent channel group and unit binding toolbar
+        # Independent channel group and unit binding toolbar (hidden by default; controlled via ViewSettingsPanel or container)
         self.channel_bar = ChannelGroupBar(parent=self, state=self.state)
         self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
         self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+        self.channel_bar.setVisible(False)
         self.addToolBarBreak()
         self.addToolBar(Qt.TopToolBarArea, toolbar)
         self._update_toolbar_visibility()

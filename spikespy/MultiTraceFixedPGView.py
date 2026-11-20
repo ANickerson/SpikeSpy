@@ -95,10 +95,11 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
         self._last_render_key = None
         self.on_new_sweep_throttled = qsignal_throttle(self._on_new_sweep_core, 40)
 
-        # Independent channel group and unit binding toolbar
+        # Independent channel group and unit binding toolbar (hidden by default; controlled via ViewSettingsPanel or container)
         self.channel_bar = ChannelGroupBar(parent=self, state=state)
         self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
         self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+        self.channel_bar.setVisible(False)
 
         self._init_ui()
 

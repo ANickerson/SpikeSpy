@@ -58,10 +58,11 @@ class UnitPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.selected_curve = pg.PlotDataItem(pen=pg.mkPen("purple", width=2.5))
         self.zero_line = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen("black", width=1, style=Qt.DashLine))
 
-        # Independent channel group and unit binding toolbar
+        # Independent channel group and unit binding toolbar (hidden by default; controlled via ViewSettingsPanel or container)
         self.channel_bar = ChannelGroupBar(parent=self, state=state)
         self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
         self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+        self.channel_bar.setVisible(False)
 
         self._init_ui()
 

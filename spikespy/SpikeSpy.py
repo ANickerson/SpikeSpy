@@ -393,6 +393,13 @@ class MdiView(QMainWindow):
                 pass
         return self.dock_settings.widget()
 
+    def open_channel_groups_editor_pane(self):
+        """Opens the View Settings panel and expands the Channel Groups editor pane."""
+        panel = self.open_or_show_view_settings_panel()
+        if panel is not None and hasattr(panel, "show_channel_groups_editor"):
+            panel.show_channel_groups_editor(open_pane=True)
+        return panel
+
     def _on_hide_top_bars_changed(self, hide: bool):
         if hasattr(self, "act_hide_top_bars") and self.act_hide_top_bars.isChecked() != hide:
             self.act_hide_top_bars.setChecked(hide)
@@ -1296,6 +1303,10 @@ class MdiView(QMainWindow):
 
             # Apply target unit, channels, or shared set binding if component supports it
             if hasattr(w, "channel_bar") and w.channel_bar is not None:
+                # By default, hide the top channel bar on individual views so the simplified selector
+                # lives in the View Settings side panel and ChannelGroupContainer headers.
+                if not isinstance(w, ChannelGroupContainerView):
+                    w.channel_bar.setVisible(False)
                 if shared_set is not None:
                     w.channel_bar.bind_to_shared_set(shared_set)
                 if target_unit is not None:

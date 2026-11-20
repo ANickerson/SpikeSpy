@@ -10,6 +10,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFrame,
+    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -19,6 +21,8 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
+    QSpinBox,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -222,94 +226,496 @@ class ChannelGroupDialog(QDialog):
                     )
 
 
+class ChannelGroupEditorPane(QWidget):
+    """
+    Standard pane to edit available channel groups and unit channel assignments.
+    Can be embedded in the ViewSettingsPanel or docked independently.
+    """
+
+    groupsChanged = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None, state: Optional[ViewerState] = None):
+        super().__init__(parent)
+        self.state: Optional[ViewerState] = state
+        self._state_connections: List[tuple] = []
+        self._active_bar: Optional["ChannelGroupBar"] = None
+
+        self.setWindowTitle("Channel Groups Editor")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        # 1. Saved Channel Groups list & actions
+        grp_presets = QGroupBox("Available Channel Groups", self)
+        presets_layout = QVBoxLayout(grp_presets)
+        presets_layout.setContentsMargins(6, 6, 6, 6)
+        presets_layout.setSpacing(4)
+
+        self.list_groups = QListWidget(grp_presets)
+        self.list_groups.setMaximumHeight(110)
+        self.list_groups.currentItemChanged.connect(self._on_group_item_selected)
+        presets_layout.addWidget(self.list_groups)
+
+        grp_btn_row = QHBoxLayout()
+        self.txt_group_name = QLineEdit(grp_presets)
+        self.txt_group_name.setPlaceholderText("Group name (e.g. Tetrode 1)...")
+        grp_btn_row.addWidget(self.txt_group_name, 1)
+
+        self.btn_save_group = QPushButton("Save Group", grp_presets)
+        self.btn_save_group.setToolTip("Save checked channels under the given group name")
+        self.btn_save_group.clicked.connect(self.save_checked_as_group)
+        grp_btn_row.addWidget(self.btn_save_group)
+
+        self.btn_delete_group = QPushButton("Delete", grp_presets)
+        self.btn_delete_group.setToolTip("Delete selected saved channel group")
+        self.btn_delete_group.clicked.connect(self.delete_selected_group)
+        grp_btn_row.addWidget(self.btn_delete_group)
+        presets_layout.addLayout(grp_btn_row)
+
+        # Quick Auto-Split row
+        split_row = QHBoxLayout()
+        split_row.addWidget(QLabel("Auto-split by:", grp_presets))
+        self.spin_split_size = QSpinBox(grp_presets)
+        self.spin_split_size.setRange(1, 64)
+        self.spin_split_size.setValue(4)
+        split_row.addWidget(self.spin_split_size)
+        self.btn_auto_split = QPushButton("Create Groups", grp_presets)
+        self.btn_auto_split.setToolTip("Automatically split recording channels into groups of N")
+        self.btn_auto_split.clicked.connect(self._on_auto_split)
+        split_row.addWidget(self.btn_auto_split)
+        split_row.addStretch()
+        presets_layout.addLayout(split_row)
+
+        layout.addWidget(grp_presets)
+
+        # 2. Channels Checklist & Unit Assignment
+        grp_chans = QGroupBox("Edit Channels in Group / Unit", self)
+        chans_layout = QVBoxLayout(grp_chans)
+        chans_layout.setContentsMargins(6, 6, 6, 6)
+        chans_layout.setSpacing(4)
+
+        filter_row = QHBoxLayout()
+        self.txt_filter = QLineEdit(grp_chans)
+        self.txt_filter.setPlaceholderText("Filter channels...")
+        self.txt_filter.textChanged.connect(self._filter_channels)
+        filter_row.addWidget(self.txt_filter, 1)
+
+        btn_all = QPushButton("All", grp_chans)
+        btn_all.setFixedWidth(36)
+        btn_all.clicked.connect(lambda: self._set_all_checked(True))
+        filter_row.addWidget(btn_all)
+
+        btn_none = QPushButton("None", grp_chans)
+        btn_none.setFixedWidth(44)
+        btn_none.clicked.connect(lambda: self._set_all_checked(False))
+        filter_row.addWidget(btn_none)
+        chans_layout.addLayout(filter_row)
+
+        self.list_channels = QListWidget(grp_chans)
+        self.list_channels.setMinimumHeight(110)
+        self.list_channels.itemChanged.connect(lambda _: self._update_summary_label())
+        chans_layout.addWidget(self.list_channels)
+
+        self.lbl_summary = QLabel("0 channels selected", grp_chans)
+        self.lbl_summary.setStyleSheet("color: #555; font-size: 11px;")
+        chans_layout.addWidget(self.lbl_summary)
+
+        # Quick Tetrode & Shift Row
+        shift_row = QHBoxLayout()
+        self.btn_tetrode = QPushButton("4-Ch", grp_chans)
+        self.btn_tetrode.setToolTip("Select 4 consecutive channels")
+        self.btn_tetrode.clicked.connect(self._select_tetrode)
+        shift_row.addWidget(self.btn_tetrode)
+
+        self.btn_shift_m4 = QPushButton("-4", grp_chans)
+        self.btn_shift_m4.setFixedWidth(32)
+        self.btn_shift_m4.clicked.connect(lambda: self.shift_checked(-4))
+        shift_row.addWidget(self.btn_shift_m4)
+
+        self.btn_shift_m1 = QPushButton("-1", grp_chans)
+        self.btn_shift_m1.setFixedWidth(32)
+        self.btn_shift_m1.clicked.connect(lambda: self.shift_checked(-1))
+        shift_row.addWidget(self.btn_shift_m1)
+
+        self.btn_shift_p1 = QPushButton("+1", grp_chans)
+        self.btn_shift_p1.setFixedWidth(32)
+        self.btn_shift_p1.clicked.connect(lambda: self.shift_checked(1))
+        shift_row.addWidget(self.btn_shift_p1)
+
+        self.btn_shift_p4 = QPushButton("+4", grp_chans)
+        self.btn_shift_p4.setFixedWidth(32)
+        self.btn_shift_p4.clicked.connect(lambda: self.shift_checked(4))
+        shift_row.addWidget(self.btn_shift_p4)
+        chans_layout.addLayout(shift_row)
+
+        # Apply to View or Unit Row
+        apply_row = QHBoxLayout()
+        self.btn_apply_view = QPushButton("Apply to View", grp_chans)
+        self.btn_apply_view.setToolTip("Set the checked channels on the active view")
+        self.btn_apply_view.clicked.connect(self.apply_checked_to_active_bar)
+        apply_row.addWidget(self.btn_apply_view)
+
+        self.btn_assign_unit = QPushButton("Assign to Unit", grp_chans)
+        self.btn_assign_unit.setToolTip("Save checked channels as the target unit's assigned channels")
+        self.btn_assign_unit.clicked.connect(self.assign_checked_to_unit)
+        apply_row.addWidget(self.btn_assign_unit)
+
+        self.btn_detect_unit = QPushButton("Detect Unit Footprint", grp_chans)
+        self.btn_detect_unit.setToolTip("Auto-detect channels from the unit's waveform footprint")
+        self.btn_detect_unit.clicked.connect(self.detect_and_check_unit_channels)
+        apply_row.addWidget(self.btn_detect_unit)
+        chans_layout.addLayout(apply_row)
+
+        layout.addWidget(grp_chans)
+
+        if state is not None:
+            self.setState(state)
+
+    def unset_connections(self):
+        for sig, slot in self._state_connections:
+            try:
+                sig.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+        self._state_connections.clear()
+
+    def setState(self, state: Optional[ViewerState]):
+        self.unset_connections()
+        self.state = state
+        if self.state is not None:
+            for sig_name in ("onChannelGroupsChanged", "onLoadNewFile", "onUnitGroupChange"):
+                sig = getattr(self.state, sig_name, None)
+                if sig is not None:
+                    sig.connect(self.refresh)
+                    self._state_connections.append((sig, self.refresh))
+        self.refresh()
+
+    def set_active_bar(self, bar: Optional["ChannelGroupBar"]):
+        self._active_bar = bar
+        if bar is not None:
+            self.set_checked_channels(bar.get_selected_channels())
+
+    def refresh(self):
+        if not self.state:
+            return
+        # Refresh saved groups list
+        curr_group = self.list_groups.currentItem().data(Qt.UserRole) if self.list_groups.currentItem() else None
+        with QSignalBlocker(self.list_groups):
+            self.list_groups.clear()
+            all_groups = self.state.get_all_channel_groups() if hasattr(self.state, "get_all_channel_groups") else {}
+            for g_name, g_chans in all_groups.items():
+                item = QListWidgetItem(f"{g_name} ({len(g_chans)} ch: {', '.join(g_chans[:4])}{'...' if len(g_chans) > 4 else ''})")
+                item.setData(Qt.UserRole, g_name)
+                self.list_groups.addItem(item)
+                if g_name == curr_group:
+                    self.list_groups.setCurrentItem(item)
+
+        # Refresh channels checklist
+        checked = set(self.get_checked_channels())
+        if not checked and self._active_bar is not None:
+            checked = set(self._active_bar.get_selected_channels())
+        avail = self.state.get_available_channels() if hasattr(self.state, "get_available_channels") else []
+        with QSignalBlocker(self.list_channels):
+            self.list_channels.clear()
+            for ch in avail:
+                item = QListWidgetItem(ch, self.list_channels)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if ch in checked else Qt.Unchecked)
+        self._update_summary_label()
+
+    def _filter_channels(self, text: str):
+        q = text.lower().strip()
+        for i in range(self.list_channels.count()):
+            item = self.list_channels.item(i)
+            item.setHidden(q not in item.text().lower() if q else False)
+
+    def _set_all_checked(self, checked: bool):
+        st = Qt.Checked if checked else Qt.Unchecked
+        with QSignalBlocker(self.list_channels):
+            for i in range(self.list_channels.count()):
+                self.list_channels.item(i).setCheckState(st)
+        self._update_summary_label()
+
+    def get_checked_channels(self) -> List[str]:
+        res = []
+        for i in range(self.list_channels.count()):
+            item = self.list_channels.item(i)
+            if item.checkState() == Qt.Checked:
+                res.append(item.text())
+        return res
+
+    def set_checked_channels(self, channels: List[str]):
+        ch_set = set(channels or [])
+        with QSignalBlocker(self.list_channels):
+            for i in range(self.list_channels.count()):
+                item = self.list_channels.item(i)
+                item.setCheckState(Qt.Checked if item.text() in ch_set else Qt.Unchecked)
+        self._update_summary_label()
+
+    def _update_summary_label(self):
+        chans = self.get_checked_channels()
+        if chans:
+            preview = ", ".join(chans[:5]) + ("..." if len(chans) > 5 else "")
+            self.lbl_summary.setText(f"<b>{len(chans)} ch:</b> {preview}")
+        else:
+            self.lbl_summary.setText("0 channels selected")
+
+    def _on_group_item_selected(self, current: Optional[QListWidgetItem], previous: Optional[QListWidgetItem]):
+        if current is None or not self.state:
+            return
+        g_name = current.data(Qt.UserRole)
+        if not g_name:
+            return
+        all_groups = self.state.get_all_channel_groups() if hasattr(self.state, "get_all_channel_groups") else {}
+        chans = all_groups.get(g_name, [])
+        if chans:
+            self.set_checked_channels(chans)
+        if g_name in getattr(self.state, "channel_groups", {}):
+            self.txt_group_name.setText(g_name)
+
+    def _select_tetrode(self):
+        curr_row = self.list_channels.currentRow()
+        if curr_row < 0:
+            curr_row = 0
+        self._set_all_checked(False)
+        with QSignalBlocker(self.list_channels):
+            for r in range(curr_row, min(curr_row + 4, self.list_channels.count())):
+                self.list_channels.item(r).setCheckState(Qt.Checked)
+        self._update_summary_label()
+
+    def shift_checked(self, step: int):
+        if not self.state:
+            return
+        curr = self.get_checked_channels()
+        if not curr:
+            return
+        shifted = self.state.shift_channels(curr, step=step)
+        self.set_checked_channels(shifted)
+        if self._active_bar is not None:
+            self._active_bar.shift_group(step)
+
+    def save_checked_as_group(self):
+        if not self.state:
+            return
+        chans = self.get_checked_channels()
+        if not chans:
+            return
+        name = self.txt_group_name.text().strip()
+        if not name:
+            name = f"Group ({len(chans)} ch: {chans[0]}..{chans[-1]})"
+            self.txt_group_name.setText(name)
+        self.state.add_channel_group(name, chans)
+        self.refresh()
+        if self._active_bar is not None:
+            self._active_bar.bind_to_group(name)
+        self.groupsChanged.emit()
+
+    def delete_selected_group(self):
+        if not self.state:
+            return
+        item = self.list_groups.currentItem()
+        if item is None:
+            return
+        g_name = item.data(Qt.UserRole)
+        if g_name and hasattr(self.state, "remove_channel_group"):
+            self.state.remove_channel_group(g_name)
+            self.refresh()
+            self.groupsChanged.emit()
+
+    def _on_auto_split(self):
+        if not self.state or not hasattr(self.state, "auto_create_channel_groups"):
+            return
+        self.state.auto_create_channel_groups(group_size=self.spin_split_size.value())
+        self.refresh()
+        self.groupsChanged.emit()
+
+    def apply_checked_to_active_bar(self):
+        chans = self.get_checked_channels()
+        if not chans or self._active_bar is None:
+            return
+        if len(chans) == 1:
+            self._active_bar.bind_to_channel(chans[0])
+        else:
+            name = self.txt_group_name.text().strip() or f"Custom ({len(chans)} ch: {chans[0]}..{chans[-1]})"
+            if self.state:
+                self.state.add_channel_group(name, chans)
+            self._active_bar.bind_to_group(name)
+        self.groupsChanged.emit()
+
+    def assign_checked_to_unit(self):
+        if not self.state:
+            return
+        chans = self.get_checked_channels()
+        if not chans:
+            return
+        u_idx = self._active_bar.get_target_unit_idx() if self._active_bar is not None else getattr(self.state, "cur_spike_group", 0)
+        self.state.set_unit_channels(u_idx, chans)
+        if self._active_bar is not None:
+            self._active_bar.set_channel_mode_unit()
+        self.refresh()
+        self.groupsChanged.emit()
+
+    def detect_and_check_unit_channels(self):
+        if not self.state:
+            return
+        u_idx = self._active_bar.get_target_unit_idx() if self._active_bar is not None else getattr(self.state, "cur_spike_group", 0)
+        if hasattr(self.state, "get_unit_detected_channels"):
+            detected = self.state.get_unit_detected_channels(u_idx)
+        else:
+            detected = self.state.get_unit_channels(u_idx)
+        if detected:
+            self.set_checked_channels(detected)
+            if self._active_bar is not None:
+                self._active_bar.set_channel_mode_unit_detected()
+        self.groupsChanged.emit()
+
+
 class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
     """
-    A reusable toolbar component for independent channel selection and unit binding.
-    Every view (MultiTraceView, SingleTraceView, MultiTraceFixedView, UnitView, UnitFootprintView)
-    can include this bar to allow independent channel selection, multi-channel integration,
-    and binding to specific units.
+    A clean, standard toolbar component for selecting a channel or channel group
+    with a settings button to open the Channel Groups editor pane.
+
+    Supports:
+    - Auto / General selection (follows global active channel or live input)
+    - Unit Assigned Channels (explicitly configured primary + neighbor channels for the unit)
+    - Unit Detected Channels (dynamically computed from the unit's waveform footprint)
+    - Predefined / Saved Channel Groups & Shared Groups
+    - Individual Channels
     """
 
     bindingChanged = Signal()
+    settingsRequested = Signal()
 
+    MODE_AUTO = "__global__"
     MODE_FOLLOW_GLOBAL = "__global__"
     MODE_FOLLOW_LIVE = "__live__"
     MODE_FOLLOW_UNIT = "__unit__"
+    MODE_UNIT_ASSIGNED = "__unit__"
+    MODE_UNIT_DETECTED = "__unit_detected__"
     MODE_GROUP = "__group__"
     MODE_SINGLE = "__single__"
     MODE_SHARED_SET = "__shared__"
 
     def __init__(self, parent: Optional[QWidget] = None, state: Optional[ViewerState] = None):
-        super().__init__("Channels & Unit", parent)
+        super().__init__("Channel Selector", parent)
         self.state: Optional[ViewerState] = state
         self._block_updates = False
         self._state_connections: list[tuple] = []
 
-        # Target Unit Selector
+        # Compact Unit Selector (can be shown in containers or synced from View Settings)
         self.lbl_unit = QLabel(" Unit: ", self)
-        self.addWidget(self.lbl_unit)
+        self.act_lbl_unit = self.addWidget(self.lbl_unit)
 
         self.combo_unit = QComboBox(self)
         self.combo_unit.setToolTip(
-            "Select target unit. Choose '(Active Unit)' to follow global selection,\n"
-            "or lock this window to a specific unit (e.g. Unit 1)."
+            "Select target unit. Choose '(Follow Active Unit)' to follow global selection,\n"
+            "or lock this window to a specific unit."
         )
         self.combo_unit.currentIndexChanged.connect(self._on_unit_selection_changed)
-        self.addWidget(self.combo_unit)
+        self.act_combo_unit = self.addWidget(self.combo_unit)
 
-        self.addSeparator()
-
-        # Channel / Group Selector
-        self.lbl_chan = QLabel(" Chans: ", self)
+        # Channel / Group Selector (primary simple selector)
+        self.lbl_chan = QLabel(" Channel: ", self)
         self.addWidget(self.lbl_chan)
 
         self.combo_channel = QComboBox(self)
+        self.combo_channel.setMinimumWidth(160)
         self.combo_channel.setToolTip(
             "Select channel or channel group:\n"
-            "- (Active Channel): follow global active recording channel\n"
-            "- (Unit Channels): display all channels where the bound unit is identified\n"
-            "- [Group] ...: use a saved channel group\n"
-            "- Individual Channel: pick a specific channel"
+            "- Auto (Active / General): follow global active channel or live stream\n"
+            "- Unit Assigned Channels: primary & neighbor channels configured for the unit\n"
+            "- Unit Detected Channels: channels dynamically detected from the unit's footprint\n"
+            "- [Group] ...: predefined or saved channel group\n"
+            "- Individual Channel: single recording channel"
         )
         self.combo_channel.currentIndexChanged.connect(self._on_channel_selection_changed)
         self.addWidget(self.combo_channel)
 
-        # Multi-Channel Toggle
+        # Settings button to open the Channel Groups Editor pane
+        self.btn_settings = QToolButton(self)
+        self.btn_settings.setText("⚙")
+        self.btn_settings.setToolTip("Open Channel Groups editor pane to configure groups and unit channels")
+        self.btn_settings.clicked.connect(self.open_channel_group_settings_pane)
+        self.addWidget(self.btn_settings)
+
+        # Hidden / programmatic compatibility controls (kept as attributes so existing views & tests continue to work)
         self.chk_multichannel = QCheckBox("Multi-Ch", self)
         self.chk_multichannel.setToolTip("Display or integrate all channels in the selected group/unit")
         self.chk_multichannel.toggled.connect(self._on_multichannel_toggled)
-        self.addWidget(self.chk_multichannel)
+        self.act_multichannel = self.addWidget(self.chk_multichannel)
+        self.act_multichannel.setVisible(False)
 
-        # Quick Shift Buttons
         self.btn_shift_prev = QPushButton("<", self)
         self.btn_shift_prev.setFixedWidth(24)
-        self.btn_shift_prev.setToolTip("Shift channel group by -1 channel")
         self.btn_shift_prev.clicked.connect(lambda: self.shift_group(-1))
-        self.addWidget(self.btn_shift_prev)
+        self.act_shift_prev = self.addWidget(self.btn_shift_prev)
+        self.act_shift_prev.setVisible(False)
 
         self.btn_shift_next = QPushButton(">", self)
         self.btn_shift_next.setFixedWidth(24)
-        self.btn_shift_next.setToolTip("Shift channel group by +1 channel")
         self.btn_shift_next.clicked.connect(lambda: self.shift_group(1))
-        self.addWidget(self.btn_shift_next)
+        self.act_shift_next = self.addWidget(self.btn_shift_next)
+        self.act_shift_next.setVisible(False)
 
-        # Channel Group Menu Button
         self.btn_group_menu = QToolButton(self)
         self.btn_group_menu.setText("Group ▾")
         self.btn_group_menu.setPopupMode(QToolButton.InstantPopup)
         self._build_group_menu()
-        self.addWidget(self.btn_group_menu)
+        self.act_group_menu = self.addWidget(self.btn_group_menu)
+        self.act_group_menu.setVisible(False)
 
-        # Follow Live Events Checkbox
         self.chk_follow_events = QCheckBox("Follow Events", self)
-        self.chk_follow_events.setToolTip(
-            "Follow live new events (keep event index in sync with latest). Shortcut: Ctrl+L"
-        )
         self.chk_follow_events.toggled.connect(self._on_follow_events_toggled)
-        self.addWidget(self.chk_follow_events)
+        self.act_follow_events = self.addWidget(self.chk_follow_events)
+        self.act_follow_events.setVisible(False)
+
+        # Hide redundant unit selector on the compact bar by default (controlled via ViewSettingsPanel or bind_to_unit)
+        self.act_lbl_unit.setVisible(False)
+        self.act_combo_unit.setVisible(False)
 
         if state is not None:
             self.setState(state)
+
+    def open_channel_group_settings_pane(self):
+        """
+        Opens or focuses the Channel Groups editor pane in the View Settings side panel
+        (or opens a standalone pane/dialog if no MdiView settings panel is present).
+        """
+        self.settingsRequested.emit()
+        from .helpers import notify_view_selected
+
+        target_widget = self.parentWidget() or self
+        notify_view_selected(target_widget, ensure_panel_visible=True)
+
+        # Look for MdiView's settings_panel
+        curr = self.parentWidget()
+        mdi = None
+        while curr is not None:
+            if hasattr(curr, "settings_panel") and hasattr(curr, "open_or_show_view_settings_panel"):
+                mdi = curr
+                break
+            curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
+        if mdi is None:
+            win = self.window()
+            if win is not None and hasattr(win, "open_or_show_view_settings_panel"):
+                mdi = win
+            else:
+                app = QApplication.instance()
+                if app is not None:
+                    for top_w in app.topLevelWidgets():
+                        if hasattr(top_w, "open_or_show_view_settings_panel"):
+                            mdi = top_w
+                            break
+
+        if mdi is not None:
+            panel = mdi.open_or_show_view_settings_panel()
+            if panel is not None and hasattr(panel, "show_channel_groups_editor"):
+                panel.show_channel_groups_editor(open_pane=True, target_bar=self)
+                return panel
+
+        # Fallback when used standalone outside MdiView
+        self.open_channel_group_dialog()
+        return None
 
     def find_channel_data_index(self, mode: str, val: Any = None) -> int:
         """Finds index in combo_channel matching (mode, val) without relying on C++ QVariant equality."""
@@ -343,13 +749,17 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
 
     def _on_state_unit_changed(self, *args):
         self.refresh_units()
+        mode, _ = self.get_channel_mode()
+        if mode in (self.MODE_FOLLOW_UNIT, self.MODE_UNIT_DETECTED):
+            self.refresh_channels()
+            self.bindingChanged.emit()
 
     def setState(self, state: ViewerState):
         self.unset_connections()
         self.state = state
         if self.state is not None:
-            self._state_connections.append((self.state.onUnitGroupChange, self.refresh_units))
-            self.state.onUnitGroupChange.connect(self.refresh_units)
+            self._state_connections.append((self.state.onUnitGroupChange, self._on_state_unit_changed))
+            self.state.onUnitGroupChange.connect(self._on_state_unit_changed)
 
             if hasattr(self.state, "onActiveUnitChanged"):
                 self._state_connections.append((self.state.onActiveUnitChanged, self._on_state_unit_changed))
@@ -456,14 +866,13 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
         with QSignalBlocker(self.combo_channel):
             self.combo_channel.clear()
 
-            # Dynamic options
-            self.combo_channel.addItem("(Follow Global Channel)", userData=(self.MODE_FOLLOW_GLOBAL, None))
-            self.combo_channel.addItem("(📡 Follow Live Input)", userData=(self.MODE_FOLLOW_LIVE, None))
-            self.combo_channel.addItem("(Bound Unit Channels)", userData=(self.MODE_FOLLOW_UNIT, None))
-            self.combo_channel.addItem("(🔗 Shared Group A)", userData=(self.MODE_SHARED_SET, "Shared Group A"))
-            self.combo_channel.addItem("(🔗 Shared Group B)", userData=(self.MODE_SHARED_SET, "Shared Group B"))
+            # 1. Automatic & Unit-Linked Channel Selection Modes
+            self.combo_channel.addItem("Auto (Active Channel)", userData=(self.MODE_FOLLOW_GLOBAL, None))
+            self.combo_channel.addItem("Unit Assigned Channels", userData=(self.MODE_FOLLOW_UNIT, None))
+            self.combo_channel.addItem("Unit Detected Channels", userData=(self.MODE_UNIT_DETECTED, None))
+            self.combo_channel.addItem("Auto (Live Stream Input)", userData=(self.MODE_FOLLOW_LIVE, None))
 
-            # Available individual channels and groups
+            # 2. Predefined / Saved Channel Groups & Shared Sets
             if self.state:
                 avail = self.state.get_available_channels()
                 all_groups = self.state.get_all_channel_groups() if hasattr(self.state, "get_all_channel_groups") else {}
@@ -474,6 +883,11 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
                         preview = f" ({len(g_chans)} ch: {', '.join(g_chans[:3])}{'...' if len(g_chans)>3 else ''})"
                         self.combo_channel.addItem(f"[Group] {g_name}{preview}", userData=(self.MODE_GROUP, g_name))
 
+                self.combo_channel.insertSeparator(self.combo_channel.count())
+                self.combo_channel.addItem("Shared Group A", userData=(self.MODE_SHARED_SET, "Shared Group A"))
+                self.combo_channel.addItem("Shared Group B", userData=(self.MODE_SHARED_SET, "Shared Group B"))
+
+                # 3. Individual Recording Channels
                 if avail:
                     self.combo_channel.insertSeparator(self.combo_channel.count())
                     for ch in avail:
@@ -496,9 +910,17 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
     def _on_channel_selection_changed(self, index: int):
         if not self._block_updates:
             mode, val = self.get_channel_mode()
-            if mode in (self.MODE_FOLLOW_UNIT, self.MODE_GROUP, self.MODE_SHARED_SET):
+            if mode in (
+                self.MODE_FOLLOW_UNIT,
+                self.MODE_UNIT_DETECTED,
+                self.MODE_GROUP,
+                self.MODE_SHARED_SET,
+            ):
                 with QSignalBlocker(self.chk_multichannel):
                     self.chk_multichannel.setChecked(True)
+            elif mode == self.MODE_SINGLE:
+                with QSignalBlocker(self.chk_multichannel):
+                    self.chk_multichannel.setChecked(False)
             self.bindingChanged.emit()
 
     def _on_shared_set_changed(self, set_name: str):
@@ -600,7 +1022,7 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
     def get_selected_channels(self) -> List[str]:
         """
         Returns the resolved list of channels selected for this component.
-        Handles Follow Global, Bound Unit, Channel Groups, and Single Channels.
+        Handles Auto/Global, Unit Assigned, Unit Detected, Predefined Channel Groups, and Single Channels.
         """
         if not self.state:
             return []
@@ -651,6 +1073,17 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
             if not u_chans and avail:
                 u_chans = [avail[0]]
             return u_chans if self.is_multichannel() else u_chans[:1]
+
+        elif mode == self.MODE_UNIT_DETECTED:
+            u_idx = self.get_target_unit_idx()
+            det_chans = (
+                self.state.get_unit_detected_channels(u_idx)
+                if hasattr(self.state, "get_unit_detected_channels")
+                else (self.state.get_unit_channels(u_idx) if hasattr(self.state, "get_unit_channels") else [])
+            )
+            if not det_chans and avail:
+                det_chans = [avail[0]]
+            return det_chans if self.is_multichannel() else det_chans[:1]
 
         elif mode == self.MODE_GROUP:
             g_chans = self.state.get_channel_group(val) if hasattr(self.state, "get_channel_group") else []
@@ -714,8 +1147,8 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
 
         return f"[{unit_str}] ({chan_str})"
 
-    def bind_to_unit(self, unit_idx: int):
-        """Programmatically locks this component to the specified unit."""
+    def bind_to_unit(self, unit_idx: Optional[int]):
+        """Programmatically locks this component to the specified unit (or None for active unit)."""
         if self.get_bound_unit() == unit_idx:
             return
         idx = self.find_unit_data_index(unit_idx)
@@ -755,20 +1188,27 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
         self.bindingChanged.emit()
 
     def set_channel_mode_unit(self):
-        """Sets channel selection to '(Bound Unit Channels)'."""
+        """Sets channel selection to 'Unit Assigned Channels'."""
         idx = self.find_channel_data_index(self.MODE_FOLLOW_UNIT)
         if idx >= 0:
             self.combo_channel.setCurrentIndex(idx)
             self.chk_multichannel.setChecked(True)
 
+    def set_channel_mode_unit_detected(self):
+        """Sets channel selection to 'Unit Detected Channels'."""
+        idx = self.find_channel_data_index(self.MODE_UNIT_DETECTED)
+        if idx >= 0:
+            self.combo_channel.setCurrentIndex(idx)
+            self.chk_multichannel.setChecked(True)
+
     def set_channel_mode_global(self):
-        """Sets channel selection to '(Follow Global Channel)'."""
+        """Sets channel selection to 'Auto (Active Channel)'."""
         idx = self.find_channel_data_index(self.MODE_FOLLOW_GLOBAL)
         if idx >= 0:
             self.combo_channel.setCurrentIndex(idx)
 
     def set_channel_mode_live(self):
-        """Sets channel selection to '(Follow Live Input)'."""
+        """Sets channel selection to 'Auto (Live Stream Input)'."""
         idx = self.find_channel_data_index(self.MODE_FOLLOW_LIVE)
         if idx >= 0:
             self.combo_channel.setCurrentIndex(idx)
@@ -892,15 +1332,18 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
                 self.combo_channel.setCurrentIndex(idx)
 
     def auto_detect_unit_channels(self):
-        """Auto-detects the 4 best channels for the bound unit based on waveform amplitude."""
+        """Auto-detects the best channels for the bound unit based on waveform footprint."""
         u_idx = self.get_target_unit_idx()
         if not self.state or u_idx >= len(self.state.spike_groups):
             return
-        sg = self.state.spike_groups[u_idx]
-        from .UnitFootprintView import UnitFootprintView
+        if hasattr(self.state, "auto_assign_unit_detected_channels"):
+            self.state.auto_assign_unit_detected_channels(u_idx)
+        else:
+            sg = self.state.spike_groups[u_idx]
+            from .UnitFootprintView import UnitFootprintView
 
-        temp_view = UnitFootprintView(state=self.state)
-        temp_view.auto_detect_unit_channels(sg=sg)
+            temp_view = UnitFootprintView(state=self.state)
+            temp_view.auto_detect_unit_channels(sg=sg)
         self.refresh_units()
         self.set_channel_mode_unit()
         self.bindingChanged.emit()

@@ -216,8 +216,8 @@ def apply_top_bars_visibility(widget, hide: bool):
         win = tb.window()
         if win is not None and win.__class__.__name__ == "MdiView" and tb.parent() is win:
             continue
-        # If inside a channel group container, child view's channel_bar was deferred and should stay hidden
-        if is_inside_container and hasattr(widget, "channel_bar") and tb is widget.channel_bar:
+        # Top channel_bar on individual views stays hidden so the simplified selector lives in View Settings & container headers
+        if hasattr(widget, "channel_bar") and tb is widget.channel_bar:
             tb.setVisible(False)
         else:
             tb.setVisible(not hide)

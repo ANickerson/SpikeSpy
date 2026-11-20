@@ -151,11 +151,12 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow
         self.init_navigation()
         self.addToolBar(self.control_toolbar)
 
-        # Independent channel group and unit binding toolbar
+        # Independent channel group and unit binding toolbar (hidden by default; controlled via ViewSettingsPanel or container)
         self.channel_bar = ChannelGroupBar(parent=self, state=state)
         self.channel_bar.bindingChanged.connect(self._on_channel_bar_changed)
         self.addToolBarBreak()
         self.addToolBar(Qt.TopToolBarArea, self.channel_bar)
+        self.channel_bar.setVisible(False)
 
         # Throttled render timer (30 FPS or configured)
         self.render_timer = QTimer(self)
