@@ -4431,9 +4431,12 @@ class ViewerState(QObject):
         analog_signal=None,
         event_signal=None,
         spike_groups=None,
+        segment=None,
     ):
         self._get_erp.cache_clear()
         self._peaks = None
+        if segment is not None:
+            self.segment = segment
         if analog_signal is not None:
             self.analog_signal = analog_signal
         if event_signal is not None:

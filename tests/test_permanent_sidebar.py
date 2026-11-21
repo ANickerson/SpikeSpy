@@ -57,8 +57,11 @@ def test_permanent_sidebar_initial_state(qtbot, sidebar_state):
     assert area.currentDockWidget() is mdi.dock_settings
 
     for dw in mdi._permanent_sidebar_docks:
-        assert not dw.features().testFlag(QtAds.CDockWidget.DockWidgetClosable)
-        assert dw.features().testFlag(QtAds.CDockWidget.DockWidgetPinnable)
+        features = dw.features()
+        is_closable = features.testFlag(QtAds.CDockWidget.DockWidgetClosable) if hasattr(features, "testFlag") else bool(features & QtAds.CDockWidget.DockWidgetClosable)
+        is_pinnable = features.testFlag(QtAds.CDockWidget.DockWidgetPinnable) if hasattr(features, "testFlag") else bool(features & QtAds.CDockWidget.DockWidgetPinnable)
+        assert not is_closable
+        assert is_pinnable
 
 
 def test_permanent_sidebar_survives_closing_all_windows(qtbot, sidebar_state):
