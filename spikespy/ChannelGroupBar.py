@@ -754,6 +754,16 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
             self.refresh_channels()
             self.bindingChanged.emit()
 
+    def _on_state_candidate_changed(self, *args):
+        if self.is_unit_locked():
+            return
+        mode, _ = self.get_channel_mode()
+        if mode in (self.MODE_FOLLOW_UNIT, self.MODE_UNIT_DETECTED) or (
+            mode == self.MODE_FOLLOW_GLOBAL and self.is_multichannel()
+        ):
+            self.refresh_channels()
+        self.bindingChanged.emit()
+
     def setState(self, state: ViewerState):
         self.unset_connections()
         self.state = state
@@ -767,6 +777,16 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
             if hasattr(self.state, "onUnitListChanged"):
                 self._state_connections.append((self.state.onUnitListChanged, self._on_state_unit_changed))
                 self.state.onUnitListChanged.connect(self._on_state_unit_changed)
+            if hasattr(self.state, "onCandidateSelectionChanged"):
+                self._state_connections.append(
+                    (self.state.onCandidateSelectionChanged, self._on_state_candidate_changed)
+                )
+                self.state.onCandidateSelectionChanged.connect(self._on_state_candidate_changed)
+            if hasattr(self.state, "onCandidatesChanged"):
+                self._state_connections.append(
+                    (self.state.onCandidatesChanged, self._on_state_candidate_changed)
+                )
+                self.state.onCandidatesChanged.connect(self._on_state_candidate_changed)
 
             if hasattr(self.state, "onLoadNewFile"):
                 self._register_data_reload(
@@ -985,9 +1005,41 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
             return data
         return getattr(self.state, "cur_spike_group", 0) if self.state else 0
 
+    def _get_active_candidate(self):
+        """Return the active CandidateUnit when following the active unit (not unit-locked)."""
+        if self.is_unit_locked() or self.state is None:
+            return None
+        if hasattr(self.state, "get_active_candidate"):
+            return self.state.get_active_candidate()
+        return None
+
+    def _get_target_unit_channels(self) -> List[str]:
+        cand = self._get_active_candidate()
+        if cand is not None:
+            chans: List[str] = []
+            primary = str(getattr(cand, "channel", "") or "")
+            if primary:
+                chans.append(primary)
+            for c in getattr(cand, "neighbor_channels", None) or []:
+                s = str(c or "")
+                if s and s not in chans:
+                    chans.append(s)
+            return chans
+        u_idx = self.get_target_unit_idx()
+        return (
+            self.state.get_unit_channels(u_idx)
+            if self.state is not None and hasattr(self.state, "get_unit_channels")
+            else []
+        )
+
     def get_target_unit(self) -> Optional[tracked_neuron_unit]:
-        """Returns the bound unit object."""
-        if not self.state or not self.state.spike_groups:
+        """Returns the bound unit object (or the active candidate's unit when following active)."""
+        if not self.state:
+            return None
+        cand = self._get_active_candidate()
+        if cand is not None and getattr(cand, "unit", None) is not None:
+            return cand.unit
+        if not self.state.spike_groups:
             return None
         u_idx = self.get_target_unit_idx()
         if 0 <= u_idx < len(self.state.spike_groups):
@@ -1037,9 +1089,8 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
                 else (avail[0] if avail else "")
             )
             if self.is_multichannel():
-                # Include bound unit's neighbors or nearby channels
-                u_idx = self.get_target_unit_idx()
-                u_chans = self.state.get_unit_channels(u_idx) if hasattr(self.state, "get_unit_channels") else []
+                # Include bound unit's (or active candidate's) neighbors or nearby channels
+                u_chans = self._get_target_unit_channels()
                 res = [global_name] if global_name else []
                 for c in u_chans:
                     if c and c not in res:
@@ -1068,19 +1119,22 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
             return [live_primary] if live_primary else (avail[:1] if avail else [])
 
         elif mode == self.MODE_FOLLOW_UNIT:
-            u_idx = self.get_target_unit_idx()
-            u_chans = self.state.get_unit_channels(u_idx) if hasattr(self.state, "get_unit_channels") else []
+            u_chans = self._get_target_unit_channels()
             if not u_chans and avail:
                 u_chans = [avail[0]]
             return u_chans if self.is_multichannel() else u_chans[:1]
 
         elif mode == self.MODE_UNIT_DETECTED:
-            u_idx = self.get_target_unit_idx()
-            det_chans = (
-                self.state.get_unit_detected_channels(u_idx)
-                if hasattr(self.state, "get_unit_detected_channels")
-                else (self.state.get_unit_channels(u_idx) if hasattr(self.state, "get_unit_channels") else [])
-            )
+            cand = self._get_active_candidate()
+            if cand is not None:
+                det_chans = self._get_target_unit_channels()
+            else:
+                u_idx = self.get_target_unit_idx()
+                det_chans = (
+                    self.state.get_unit_detected_channels(u_idx)
+                    if hasattr(self.state, "get_unit_detected_channels")
+                    else (self.state.get_unit_channels(u_idx) if hasattr(self.state, "get_unit_channels") else [])
+                )
             if not det_chans and avail:
                 det_chans = [avail[0]]
             return det_chans if self.is_multichannel() else det_chans[:1]
@@ -1103,8 +1157,7 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
             ch = str(val)
             if self.is_multichannel():
                 # If multi-ch is checked on a single channel, include unit neighbors
-                u_idx = self.get_target_unit_idx()
-                u_chans = self.state.get_unit_channels(u_idx) if hasattr(self.state, "get_unit_channels") else []
+                u_chans = self._get_target_unit_channels()
                 res = [ch]
                 for c in u_chans:
                     if c != ch and c not in res:
@@ -1126,14 +1179,18 @@ class ChannelGroupBar(LiveFrameConsumerMixin, QToolBar):
 
     def get_title_summary(self) -> str:
         """Returns a concise summary string suitable for window / dock titles."""
-        u_idx = self.get_target_unit_idx()
-        unit_str = f"Unit {u_idx}"
-        if self.state and 0 <= u_idx < len(self.state.spike_groups):
-            u_name = getattr(self.state.spike_groups[u_idx].event, "name", "")
-            if u_name:
-                unit_str = f"Unit {u_idx}: {u_name}"
-        if not self.is_unit_locked():
-            unit_str = "(Active Unit)"
+        cand = self._get_active_candidate()
+        if cand is not None:
+            unit_str = f"Candidate: {cand.name}"
+        else:
+            u_idx = self.get_target_unit_idx()
+            unit_str = f"Unit {u_idx}"
+            if self.state and 0 <= u_idx < len(self.state.spike_groups):
+                u_name = getattr(self.state.spike_groups[u_idx].event, "name", "")
+                if u_name:
+                    unit_str = f"Unit {u_idx}: {u_name}"
+            if not self.is_unit_locked():
+                unit_str = "(Active Unit)"
 
         chans = self.get_selected_channels()
         if not chans:

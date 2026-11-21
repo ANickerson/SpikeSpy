@@ -201,8 +201,23 @@ class UnitPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self._register_live_frames(state, lambda _stimno: self.on_new_sweep_throttled())
         if hasattr(self.state, "onNewSpikeEvents"):
             self._connect_state(self.state.onNewSpikeEvents, self._on_new_spike_events)
+        if hasattr(self.state, "onCandidateSelectionChanged"):
+            self._connect_state(
+                self.state.onCandidateSelectionChanged, self._on_candidate_change
+            )
+        if hasattr(self.state, "onCandidatesChanged"):
+            self._connect_state(
+                self.state.onCandidatesChanged, self._on_candidate_change
+            )
 
         self.update_all()
+
+    @Slot()
+    @Slot(int)
+    def _on_candidate_change(self, *args):
+        if hasattr(self, "channel_bar") and self.channel_bar is not None and self.channel_bar.is_unit_locked():
+            return
+        self.update_all(force=True)
 
     def is_view_culled(self) -> bool:
         try:
@@ -363,8 +378,20 @@ class UnitPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         sg = self._get_target_unit()
         ug_spikes = len(sg.event) if sg is not None and getattr(sg, "event", None) is not None else 0
         ug_idx = self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else 0
+        cand = (
+            self.state.get_active_candidate()
+            if self.state is not None
+            and hasattr(self.state, "get_active_candidate")
+            and not (hasattr(self, "channel_bar") and self.channel_bar is not None and self.channel_bar.is_unit_locked())
+            else None
+        )
+        cand_key = (
+            (int(cand.candidate_id), int(cand.hit_count))
+            if cand is not None
+            else None
+        )
         n_sweeps = len(self.state.event_signal) if getattr(self.state, "event_signal", None) is not None else 0
-        render_key = (primary_ch, n_sweeps, ug_idx, ug_spikes)
+        render_key = (primary_ch, n_sweeps, ug_idx, ug_spikes, cand_key)
         if not force and self._last_render_key == render_key:
             return
         self._last_render_key = render_key

@@ -351,3 +351,168 @@ def test_mdi_and_spike_group_table_integration(qtbot):
         if isinstance(dw.widget(), SpikeProposalConfigView)
     ]
     assert len(docks_after) == 1
+
+
+def _make_multichannel_state(channel_peaks, *, n_sweeps=20, n_samples=1000):
+    """Build a multi-channel ViewerState with per-channel peak locations by sweep."""
+    state = ViewerState()
+    times = np.arange(n_sweeps) * 0.1 * pq.s
+    event = neo.Event(times, name="stim", units=pq.s)
+    seg = neo.Segment("multich_candidate_test")
+    signals = []
+    for ch_name, peaks_by_sweep in channel_peaks.items():
+        data = np.zeros((n_sweeps, n_samples), dtype=np.float32)
+        for i, peak in enumerate(peaks_by_sweep):
+            if peak is not None and i < n_sweeps:
+                data[i, int(peak)] = 1.5
+        sig = neo.AnalogSignal(
+            data.flatten(), units=pq.mV, sampling_rate=10000.0 * pq.Hz, name=ch_name
+        )
+        seg.analogsignals.append(sig)
+        signals.append(sig)
+    seg.events.append(event)
+    state.segment = seg
+    state.window_size = 40 * pq.ms
+    state.set_data(analog_signal=signals[0], event_signal=event, spike_groups=[])
+    return state
+
+
+def test_specify_scan_channels_controls_which_channels_are_scanned(qtbot):
+    state = _make_multichannel_state(
+        {
+            "CH0": [120] * 20,
+            "CH1": [200] * 20,
+            "CH2": [280] * 20,
+        }
+    )
+    view = SpikeProposalConfigView(state=state)
+    qtbot.addWidget(view)
+
+    # Defaults to Auto (active channel CH0 only)
+    assert view.chk_scan_use_active_channels.isChecked()
+    assert state.candidate_config.scan_channels == []
+    assert view.list_scan_channels.count() == 3
+    assert view.trigger_scan(synchronous=True)
+    assert {c.channel for c in state.get_visible_candidates()} == {"CH0"}
+
+    # Select only CH1 and CH2 via the channel checklist
+    state.clear_candidates()
+    view.btn_scan_channels_none.click()
+    assert not view.chk_scan_use_active_channels.isChecked()
+    for row in range(view.list_scan_channels.count()):
+        item = view.list_scan_channels.item(row)
+        if item.text() in ("CH1", "CH2"):
+            item.setCheckState(Qt.Checked)
+
+    assert state.candidate_config.scan_channels == ["CH1", "CH2"]
+    assert "2 of 3" in view.lbl_scan_channels_summary.text()
+    assert view.trigger_scan(synchronous=True)
+    assert {c.channel for c in state.get_visible_candidates()} == {"CH1", "CH2"}
+
+    # Settings roundtrip preserves scan_channels
+    saved = view.get_settings()
+    assert saved["scan_channels"] == ["CH1", "CH2"]
+    state2 = _make_multichannel_state({"CH0": [120] * 10, "CH1": [200] * 10, "CH2": [280] * 10})
+    view2 = SpikeProposalConfigView(state=state2)
+    qtbot.addWidget(view2)
+    view2.set_settings(saved)
+    assert state2.candidate_config.scan_channels == ["CH1", "CH2"]
+    assert not view2.chk_scan_use_active_channels.isChecked()
+
+    # Clicking "All" scans all available channels
+    state.clear_candidates()
+    view.btn_scan_channels_all.click()
+    assert state.candidate_config.scan_channels == ["CH0", "CH1", "CH2"]
+    assert view.trigger_scan(synchronous=True)
+    assert {c.channel for c in state.get_visible_candidates()} == {"CH0", "CH1", "CH2"}
+
+    # Re-enabling Auto resets scan_channels to []
+    view.chk_scan_use_active_channels.setChecked(True)
+    assert state.candidate_config.scan_channels == []
+
+
+def test_clicking_candidate_displays_as_current_unit_across_ui_and_quick_discard(qtbot):
+    from spikespy.ActiveUnitInfoView import ActiveUnitInfoView
+    from spikespy.MultiTraceFixedPGView import MultiTraceFixedPGView
+    from spikespy.SingleTracePGView import SingleTracePGView
+    from spikespy.UnitFootprintPGView import UnitFootprintPGView
+    from spikespy.UnitPGView import UnitPGView
+
+    # CH0 fires on all sweeps; CH2 fires only on sweeps 10..19
+    state = _make_multichannel_state(
+        {
+            "CH0": [120] * 20,
+            "CH1": [None] * 20,
+            "CH2": [None] * 10 + [260] * 10,
+        }
+    )
+    state.stimno = 0
+
+    proposal_view = SpikeProposalConfigView(state=state)
+    info_view = ActiveUnitInfoView(state=state)
+    unit_view = UnitPGView(state=state)
+    footprint_view = UnitFootprintPGView(state=state)
+    single_view = SingleTracePGView(state=state)
+    fixed_view = MultiTraceFixedPGView(state=state)
+    for w in (proposal_view, info_view, unit_view, footprint_view, single_view, fixed_view):
+        qtbot.addWidget(w)
+
+    # Scan all channels
+    proposal_view.btn_scan_channels_all.click()
+    assert proposal_view.trigger_scan(synchronous=True)
+    assert proposal_view.list_candidates.count() == 2
+
+    # Find the CH2 candidate row and click it
+    ch2_row = None
+    ch2_cid = None
+    for row in range(proposal_view.list_candidates.count()):
+        item = proposal_view.list_candidates.item(row)
+        cid = int(item.data(Qt.UserRole))
+        if state.candidate_units[cid].channel == "CH2":
+            ch2_row = row
+            ch2_cid = cid
+            break
+    assert ch2_row is not None and ch2_cid is not None
+
+    ch2_cand = state.candidate_units[ch2_cid]
+    proposal_view.list_candidates.setCurrentRow(ch2_row)
+    proposal_view._on_candidate_item_clicked(proposal_view.list_candidates.item(ch2_row))
+
+    # State focused on CH2 and jumped to sweep 10 (nearest sweep with a detection)
+    assert state.active_candidate_id == ch2_cid
+    assert state.analog_signal.name == "CH2"
+    assert state.stimno == 10
+
+    # UnitPGView, UnitFootprintPGView, ActiveUnitInfoView, SingleTrace, MultiTraceFixed all reflect the candidate
+    assert unit_view._get_target_unit() is ch2_cand.unit
+    assert len(unit_view.lines) == 10
+    assert footprint_view.get_target_unit() is ch2_cand.unit
+    assert ch2_cand.name in footprint_view.windowTitle()
+
+    assert info_view.lbl_health_badge.text() == "CANDIDATE"
+    assert ch2_cand.name in info_view.lbl_unit_title.text()
+    assert not info_view.candidate_actions_widget.isHidden()
+
+    single_view.update_figure(force=True)
+    assert single_view.candidate_line.isVisible()
+    assert single_view.candidate_marker.isVisible()
+
+    fixed_view.update_figure(force=True)
+    assert fixed_view.candidate_scatter.isVisible()
+
+    # Quick discard removes CH2 candidate and auto-advances to the remaining CH0 candidate
+    proposal_view.btn_discard_candidate.click()
+    assert state.candidate_units[ch2_cid].status == "discarded"
+    assert proposal_view.list_candidates.count() == 1
+    remaining_cid = int(proposal_view.list_candidates.item(0).data(Qt.UserRole))
+    assert state.active_candidate_id == remaining_cid
+    assert state.analog_signal.name == "CH0"
+    assert unit_view._get_target_unit() is state.candidate_units[remaining_cid].unit
+
+    # Selecting a regular unit cleanly exits candidate preview across the UI
+    state.setUnitGroup(0)
+    assert state.active_candidate_id is None
+    assert info_view.candidate_actions_widget.isHidden()
+    assert unit_view._get_target_unit() is state.spike_groups[0]
+    assert footprint_view.get_target_unit() is state.spike_groups[0]
+
