@@ -149,9 +149,226 @@ class MdiView(QMainWindow):
     # signals
     loadFile = Signal(str, str)
 
-    def clear_dock_area(self):
-        """Closes all open dock widgets and clears the dock area."""
-        for dw in list(self.dock_manager.dockWidgets()):
+    def _is_permanent_sidebar_dock(self, dw) -> bool:
+        if dw is None:
+            return False
+        return dw in getattr(self, "_permanent_sidebar_docks", [])
+
+    def _configure_permanent_sidebar_dock(self, dock: QtAds.CDockWidget):
+        dock.setFeature(QtAds.CDockWidget.DockWidgetClosable, False)
+        dock.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
+        dock.setFeature(QtAds.CDockWidget.DockWidgetForceCloseWithArea, False)
+        dock.setFeature(QtAds.CDockWidget.DockWidgetPinnable, True)
+
+    def _init_permanent_sidebar(self):
+        """Creates the permanent, collapsible left sidebar containing core tool panels."""
+        self._permanent_sidebar_docks: List[QtAds.CDockWidget] = []
+
+        self.settings_panel = ViewSettingsPanel(parent=self, state=self.state)
+        self.dock_settings = QtAds.CDockWidget("View Settings")
+        self.dock_settings.setWidget(self.settings_panel)
+        self._configure_permanent_sidebar_dock(self.dock_settings)
+
+        self.active_unit_info_panel = ActiveUnitInfoView(parent=self, state=self.state)
+        self.dock_active_unit_info = QtAds.CDockWidget("Active Unit Info")
+        self.dock_active_unit_info.setWidget(self.active_unit_info_panel)
+        self._configure_permanent_sidebar_dock(self.dock_active_unit_info)
+
+        self.shared_channel_panel = SharedChannelPanel(parent=self, state=self.state)
+        self.dock_shared_channel = QtAds.CDockWidget("Shared Channels")
+        self.dock_shared_channel.setWidget(self.shared_channel_panel)
+        self._configure_permanent_sidebar_dock(self.dock_shared_channel)
+
+        self.neo_settings_panel = NeoSettingsView(parent=self, state=self.state)
+        self.dock_neo_settings = QtAds.CDockWidget("Recording Settings")
+        self.dock_neo_settings.setWidget(self.neo_settings_panel)
+        self._configure_permanent_sidebar_dock(self.dock_neo_settings)
+
+        self._permanent_sidebar_docks = [
+            self.dock_settings,
+            self.dock_active_unit_info,
+            self.dock_shared_channel,
+            self.dock_neo_settings,
+        ]
+
+        sidebar_area = self.dock_manager.addDockWidget(
+            QtAds.LeftDockWidgetArea, self.dock_settings
+        )
+        for dock in self._permanent_sidebar_docks[1:]:
+            self.dock_manager.addDockWidgetTabToArea(dock, sidebar_area)
+
+        self._sidebar_area = sidebar_area
+        if sidebar_area is not None:
+            try:
+                sidebar_area.setCurrentDockWidget(self.dock_settings)
+            except Exception:
+                pass
+        if hasattr(self.dock_settings, "setAsCurrentTab"):
+            try:
+                self.dock_settings.setAsCurrentTab()
+            except Exception:
+                pass
+
+    def _ensure_permanent_sidebar(self):
+        """Ensures all permanent sidebar panels exist and remain accessible (docked or auto-hidden)."""
+        if not getattr(self, "_permanent_sidebar_docks", None):
+            self._init_permanent_sidebar()
+            return
+
+        all_docks = set(self.dock_manager.dockWidgetsMap().values())
+        sidebar_area = None
+        for dw in self._permanent_sidebar_docks:
+            try:
+                if dw.autoHideDockContainer() is None and dw.dockAreaWidget() is not None and not dw.isClosed():
+                    sidebar_area = dw.dockAreaWidget()
+                    break
+            except RuntimeError:
+                pass
+
+        for dw in list(self._permanent_sidebar_docks):
+            try:
+                self._configure_permanent_sidebar_dock(dw)
+                in_autohide = dw.autoHideDockContainer() is not None
+                if in_autohide:
+                    continue
+                if dw not in all_docks or dw.dockAreaWidget() is None:
+                    if sidebar_area is None:
+                        sidebar_area = self.dock_manager.addDockWidget(
+                            QtAds.LeftDockWidgetArea, dw
+                        )
+                    else:
+                        self.dock_manager.addDockWidgetTabToArea(dw, sidebar_area)
+                elif dw.isClosed():
+                    dw.toggleView(True)
+                    if dw.dockAreaWidget() is None:
+                        if sidebar_area is None:
+                            sidebar_area = self.dock_manager.addDockWidget(
+                                QtAds.LeftDockWidgetArea, dw
+                            )
+                        else:
+                            self.dock_manager.addDockWidgetTabToArea(dw, sidebar_area)
+            except RuntimeError:
+                pass
+
+        if sidebar_area is not None:
+            self._sidebar_area = sidebar_area
+
+    def is_sidebar_collapsed(self) -> bool:
+        """Returns True if all permanent sidebar panels are currently collapsed into the auto-hide rail."""
+        docks = getattr(self, "_permanent_sidebar_docks", [])
+        if not docks:
+            return False
+        for dw in docks:
+            try:
+                if dw.autoHideDockContainer() is None:
+                    return False
+            except RuntimeError:
+                return False
+        return True
+
+    def set_sidebar_collapsed(self, collapsed: bool):
+        """Collapses the permanent sidebar into the left auto-hide rail or expands it back to a left dock area."""
+        self._ensure_permanent_sidebar()
+        docks = getattr(self, "_permanent_sidebar_docks", [])
+        if not docks:
+            return
+
+        if collapsed:
+            for dw in docks:
+                try:
+                    if dw.autoHideDockContainer() is None:
+                        dw.setAutoHide(True, QtAds.SideBarLeft)
+                except RuntimeError:
+                    pass
+        else:
+            active_dock = self.dock_settings
+            first_area = None
+            for dw in docks:
+                try:
+                    if dw.autoHideDockContainer() is not None:
+                        dw.setAutoHide(False)
+                    if dw.isClosed():
+                        dw.toggleView(True)
+                    if first_area is None:
+                        if dw.dockAreaWidget() is None:
+                            first_area = self.dock_manager.addDockWidget(
+                                QtAds.LeftDockWidgetArea, dw
+                            )
+                        else:
+                            first_area = dw.dockAreaWidget()
+                    else:
+                        if dw.dockAreaWidget() is not first_area:
+                            self.dock_manager.addDockWidgetTabToArea(dw, first_area)
+                except RuntimeError:
+                    pass
+            if first_area is not None:
+                self._sidebar_area = first_area
+                try:
+                    first_area.setCurrentDockWidget(active_dock)
+                except Exception:
+                    pass
+            if hasattr(active_dock, "setAsCurrentTab"):
+                try:
+                    active_dock.setAsCurrentTab()
+                except Exception:
+                    pass
+
+    def toggle_sidebar_collapsed(self) -> bool:
+        """Toggles the permanent left sidebar between collapsed (auto-hide) and expanded."""
+        new_collapsed = not self.is_sidebar_collapsed()
+        self.set_sidebar_collapsed(new_collapsed)
+        return new_collapsed
+
+    def _activate_sidebar_dock(
+        self,
+        dock: QtAds.CDockWidget,
+        reveal_if_collapsed: bool = True,
+        switch_tab: bool = True,
+    ):
+        self._ensure_permanent_sidebar()
+        if dock is None:
+            return None
+        container = dock.autoHideDockContainer()
+        if container is not None:
+            if reveal_if_collapsed:
+                try:
+                    container.collapseView(False)
+                except Exception:
+                    dock.show()
+            return dock.widget()
+        if dock.isClosed():
+            dock.toggleView(True)
+            if dock.dockAreaWidget() is None:
+                self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, dock)
+        dock.show()
+        if switch_tab:
+            dock.raise_()
+            if dock.dockAreaWidget() is not None:
+                try:
+                    dock.dockAreaWidget().setCurrentDockWidget(dock)
+                except Exception:
+                    pass
+            if hasattr(dock, "setAsCurrentTab") and callable(getattr(dock, "setAsCurrentTab")):
+                try:
+                    dock.setAsCurrentTab()
+                except Exception:
+                    pass
+        return dock.widget()
+
+    def clear_dock_area(self, include_sidebar: bool = False):
+        """Closes all open workspace dock widgets while preserving the permanent sidebar."""
+        all_docks: List[QtAds.CDockWidget] = list(self.dock_manager.dockWidgets())
+        for ahc in list(self.dock_manager.autoHideWidgets()):
+            try:
+                dw = ahc.dockWidget()
+                if dw is not None and dw not in all_docks:
+                    all_docks.append(dw)
+            except RuntimeError:
+                pass
+
+        for dw in all_docks:
+            if not include_sidebar and self._is_permanent_sidebar_dock(dw):
+                continue
             w = dw.widget()
             # Cancel pending idle draws on canvases before close/deletion
             for target in ([w] + (w.get_child_views() if hasattr(w, "get_child_views") else [])):
@@ -166,11 +383,22 @@ class MdiView(QMainWindow):
             dw.closeDockWidget()
             self.dock_manager.removeDockWidget(dw)
         self.cur_windows.clear()
-        self.dock_settings = None
-        self.settings_panel = None
         self._open_ephys_live_dock = None
         if hasattr(self, "extra_settings_panels"):
             self.extra_settings_panels.clear()
+        if include_sidebar:
+            self._permanent_sidebar_docks = []
+            self.dock_settings = None
+            self.settings_panel = None
+            self.dock_active_unit_info = None
+            self.active_unit_info_panel = None
+            self.dock_shared_channel = None
+            self.shared_channel_panel = None
+            self.dock_neo_settings = None
+            self.neo_settings_panel = None
+            self._sidebar_area = None
+        else:
+            self._ensure_permanent_sidebar()
 
     def save_perspective_as(self, name: str):
         if not name:
@@ -184,7 +412,8 @@ class MdiView(QMainWindow):
         view_widgets = [
             x
             for x in self.dock_manager.dockWidgets()
-            if not isinstance(x.widget(), ViewSettingsPanel)
+            if not self._is_permanent_sidebar_dock(x)
+            and not isinstance(x.widget(), ViewSettingsPanel)
             and x is not getattr(self, "dock_settings", None)
             and x.windowTitle() != "View Settings"
         ]
@@ -237,12 +466,15 @@ class MdiView(QMainWindow):
             self.dock_manager.openPerspective(name)
             opened = True
 
-        # Reconnect or open the view settings panel
-        self.open_or_show_view_settings_panel()
+        # Ensure permanent sidebar panels remain intact after perspective restore
+        self._ensure_permanent_sidebar()
+        self.open_or_show_view_settings_panel(reveal_if_collapsed=False, switch_tab=False)
 
         # Follow the active or first configurable view in the newly loaded layout
         first_view = None
         for dw in self.dock_manager.dockWidgets():
+            if self._is_permanent_sidebar_dock(dw):
+                continue
             w = dw.widget()
             if w is not None and w is not getattr(self, "settings_panel", None):
                 if hasattr(self, "settings_panel") and self.settings_panel is not None:
@@ -251,7 +483,7 @@ class MdiView(QMainWindow):
                         first_view = resolved
                         break
         if first_view is not None:
-            notify_view_selected(first_view, ensure_panel_visible=True)
+            notify_view_selected(first_view, ensure_panel_visible=False)
 
         return opened
 
@@ -292,12 +524,13 @@ class MdiView(QMainWindow):
             self.load_perspective(selected)
 
     def open_or_show_shared_channel_panel(self):
-        """Opens or activates the SharedChannelPanel controller."""
-        for dw in self.dock_manager.dockWidgets():
+        """Opens or activates the permanent SharedChannelPanel tab in the sidebar."""
+        self._ensure_permanent_sidebar()
+        if getattr(self, "dock_shared_channel", None) is not None:
+            return self._activate_sidebar_dock(self.dock_shared_channel)
+        for dw in self.dock_manager.dockWidgetsMap().values():
             if isinstance(dw.widget(), SharedChannelPanel):
-                dw.show()
-                dw.raise_()
-                return dw.widget()
+                return self._activate_sidebar_dock(dw)
         return self.newWindow("SharedChannelPanel", pos=QtAds.BottomDockWidgetArea)
 
     def open_or_show_channel_purpose_panel(self):
@@ -343,27 +576,24 @@ class MdiView(QMainWindow):
         return dlg
 
     def open_or_show_active_unit_info(self):
-        """Opens or activates the ActiveUnitInfoView dock panel."""
-        for dw in self.dock_manager.dockWidgets():
+        """Opens or activates the permanent ActiveUnitInfoView tab in the sidebar."""
+        self._ensure_permanent_sidebar()
+        if getattr(self, "dock_active_unit_info", None) is not None:
+            return self._activate_sidebar_dock(self.dock_active_unit_info)
+        for dw in self.dock_manager.dockWidgetsMap().values():
             if isinstance(dw.widget(), ActiveUnitInfoView):
-                if dw.isClosed():
-                    dw.toggleView(True)
-                    if dw.dockAreaWidget() is None:
-                        self.dock_manager.addDockWidget(QtAds.RightDockWidgetArea, dw)
-                dw.show()
-                dw.raise_()
-                if dw.dockAreaWidget() is not None:
-                    try:
-                        dw.dockAreaWidget().setCurrentDockWidget(dw)
-                    except Exception:
-                        pass
-                if hasattr(dw, "setAsCurrentTab") and callable(getattr(dw, "setAsCurrentTab")):
-                    try:
-                        dw.setAsCurrentTab()
-                    except Exception:
-                        pass
-                return dw.widget()
+                return self._activate_sidebar_dock(dw)
         return self.newWindow("ActiveUnitInfo", pos=QtAds.RightDockWidgetArea)
+
+    def open_or_show_neo_settings(self):
+        """Opens or activates the permanent Recording Settings (NeoSettingsView) tab in the sidebar."""
+        self._ensure_permanent_sidebar()
+        if getattr(self, "dock_neo_settings", None) is not None:
+            return self._activate_sidebar_dock(self.dock_neo_settings)
+        for dw in self.dock_manager.dockWidgetsMap().values():
+            if isinstance(dw.widget(), NeoSettingsView):
+                return self._activate_sidebar_dock(dw)
+        return self.newWindow("Settings", pos=QtAds.LeftDockWidgetArea)
 
     def open_or_show_spike_proposal_config(self):
         """Opens or activates the SpikeProposalConfigView dock panel."""
@@ -388,57 +618,16 @@ class MdiView(QMainWindow):
                 return dw.widget()
         return self.newWindow("SpikeProposalConfig", pos=QtAds.RightDockWidgetArea)
 
-    def open_or_show_view_settings_panel(self):
-        """Opens or brings to front the View Settings side panel on the left side."""
-        try:
-            if hasattr(self, "settings_panel") and self.settings_panel is not None:
-                self.settings_panel.isVisible()
-            else:
-                self.settings_panel = ViewSettingsPanel(parent=self, state=self.state)
-        except RuntimeError:
-            self.settings_panel = ViewSettingsPanel(parent=self, state=self.state)
-
-        dock_valid = False
-        if hasattr(self, "dock_settings") and self.dock_settings is not None:
-            try:
-                if self.dock_settings in self.dock_manager.dockWidgets():
-                    dock_valid = True
-            except RuntimeError:
-                self.dock_settings = None
-
-        if not dock_valid:
-            for dw in self.dock_manager.dockWidgets():
-                if dw.windowTitle() == "View Settings" or isinstance(dw.widget(), ViewSettingsPanel):
-                    self.dock_settings = dw
-                    if isinstance(dw.widget(), ViewSettingsPanel):
-                        self.settings_panel = dw.widget()
-                    else:
-                        self.dock_settings.setWidget(self.settings_panel)
-                    dock_valid = True
-                    break
-
-        if not dock_valid:
-            self.dock_settings = QtAds.CDockWidget("View Settings")
-            self.dock_settings.setWidget(self.settings_panel)
-            self.dock_settings.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
-            self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
-        elif self.dock_settings.isClosed():
-            self.dock_settings.toggleView(True)
-            if self.dock_settings.dockAreaWidget() is None:
-                self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
-        self.dock_settings.show()
-        self.dock_settings.raise_()
-        if self.dock_settings.dockAreaWidget() is not None:
-            try:
-                self.dock_settings.dockAreaWidget().setCurrentDockWidget(self.dock_settings)
-            except Exception:
-                pass
-        if hasattr(self.dock_settings, "setAsCurrentTab") and callable(getattr(self.dock_settings, "setAsCurrentTab")):
-            try:
-                self.dock_settings.setAsCurrentTab()
-            except Exception:
-                pass
-        return self.dock_settings.widget()
+    def open_or_show_view_settings_panel(
+        self, reveal_if_collapsed: bool = True, switch_tab: bool = True
+    ):
+        """Opens or brings to front the permanent View Settings panel in the left sidebar."""
+        self._ensure_permanent_sidebar()
+        return self._activate_sidebar_dock(
+            self.dock_settings,
+            reveal_if_collapsed=reveal_if_collapsed,
+            switch_tab=switch_tab,
+        )
 
     def _refresh_all_settings_panel_targets(self):
         panels: List[ViewSettingsPanel] = []
@@ -519,6 +708,8 @@ class MdiView(QMainWindow):
         if not hasattr(self, "dock_manager") or self.dock_manager is None:
             return
         for dw in self.dock_manager.dockWidgets():
+            if self._is_permanent_sidebar_dock(dw):
+                continue
             w = dw.widget()
             if w is not None and w is not getattr(self, "settings_panel", None):
                 apply_top_bars_visibility(w, hide)
@@ -591,7 +782,7 @@ class MdiView(QMainWindow):
             self.newWindow("MultiTrace", pos=QtAds.LeftDockWidgetArea, shared_set="Shared Group A")
             self.newWindow("SingleTraceView", pos=QtAds.RightDockWidgetArea, shared_set="Shared Group A")
             self.newWindow("UnitView", pos=QtAds.RightDockWidgetArea, shared_set="Shared Group A")
-            self.newWindow("SharedChannelPanel", pos=QtAds.BottomDockWidgetArea)
+            self.open_or_show_shared_channel_panel()
 
         elif layout_clean in ("Default Analysis Layout", "Reset to Default Layout"):
             self.newWindow("MultiTrace", pos=QtAds.LeftDockWidgetArea)
@@ -627,7 +818,7 @@ class MdiView(QMainWindow):
             self.newWindow(mt_key, pos=QtAds.LeftDockWidgetArea, shared_set="Shared Group A")
             self.newWindow(st_key, pos=QtAds.RightDockWidgetArea, shared_set="Shared Group A")
             self.newWindow(uv_key, pos=QtAds.RightDockWidgetArea, shared_set="Shared Group A")
-            self.newWindow("ActiveUnitInfo", pos=QtAds.RightDockWidgetArea)
+            self.open_or_show_active_unit_info()
             self.newWindow("SpikeGroupTable", pos=QtAds.BottomDockWidgetArea)
 
     def handle_version_check_result(self, result):
@@ -672,6 +863,13 @@ class MdiView(QMainWindow):
             )
         )
         self._open_ephys_live_dock = None
+        QtAds.CDockManager.setAutoHideConfigFlags(QtAds.CDockManager.DefaultAutoHideConfig)
+        QtAds.CDockManager.setAutoHideConfigFlag(
+            QtAds.CDockManager.AutoHideButtonTogglesArea, True
+        )
+        QtAds.CDockManager.setAutoHideConfigFlag(
+            QtAds.CDockManager.AutoHideHasCloseButton, False
+        )
         self.dock_manager = QtAds.CDockManager(self)
         self.dock_manager.addPerspective("main")
         self.dock_manager.dockAreaCreated.connect(self._on_dock_area_created)
@@ -679,12 +877,8 @@ class MdiView(QMainWindow):
             for da in self.dock_manager.openedDockAreas():
                 self._on_dock_area_created(da)
 
-        # Active View Settings Side Panel (follows focused window)
-        self.settings_panel = ViewSettingsPanel(parent=self, state=self.state)
-        self.dock_settings = QtAds.CDockWidget("View Settings")
-        self.dock_settings.setWidget(self.settings_panel)
-        self.dock_settings.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, False)
-        self.dock_manager.addDockWidget(QtAds.LeftDockWidgetArea, self.dock_settings)
+        # Permanent collapsible Left Sidebar (expanded by default)
+        self._init_permanent_sidebar()
         self.dock_manager.focusedDockWidgetChanged.connect(self._on_focused_dock_widget_changed)
 
         if hasattr(self.state, "onHideViewTopBarsChanged"):
@@ -733,7 +927,7 @@ class MdiView(QMainWindow):
         menu_traces.addAction("OpenEphysLive", lambda: self.newWindow("OpenEphysLive"))
 
         menu_unit = add_panel_menu.addMenu("Unit Analysis")
-        menu_unit.addAction("Active Unit Info & Tracking", lambda: self.newWindow("ActiveUnitInfo"))
+        menu_unit.addAction("Active Unit Info & Tracking", lambda: self.open_or_show_active_unit_info())
         menu_unit.addAction("Spike Proposal Config", lambda: self.open_or_show_spike_proposal_config())
         menu_unit.addAction("UnitView (Matplotlib)", lambda: self.newWindow("UnitView"))
         if "UnitView (PyQtGraph)" in self.window_options:
@@ -748,7 +942,7 @@ class MdiView(QMainWindow):
         menu_channels.addAction("Channel Purposes & Preprocessing", lambda: self.open_or_show_channel_purpose_panel())
 
         menu_tables = add_panel_menu.addMenu("Tables & Controllers")
-        menu_tables.addAction("Active Unit Info & Tracking", lambda: self.newWindow("ActiveUnitInfo"))
+        menu_tables.addAction("Active Unit Info & Tracking", lambda: self.open_or_show_active_unit_info())
         menu_tables.addAction("Spike Proposal Config", lambda: self.open_or_show_spike_proposal_config())
         menu_tables.addAction("Channel Purposes & Preprocessing", lambda: self.open_or_show_channel_purpose_panel())
         menu_tables.addAction("View Settings Panel", lambda: self.open_or_show_view_settings_panel())
@@ -759,7 +953,7 @@ class MdiView(QMainWindow):
         menu_tables.addAction("SpikeGroupTable", lambda: self.newWindow("SpikeGroupTable"))
         menu_tables.addAction("Events", lambda: self.newWindow("Events"))
         menu_tables.addAction("Data", lambda: self.newWindow("Data"))
-        menu_tables.addAction("Settings", lambda: self.newWindow("Settings"))
+        menu_tables.addAction("Recording Settings", lambda: self.open_or_show_neo_settings())
 
         self.btn_add_panel.setMenu(add_panel_menu)
         self.toolbar.addWidget(self.btn_add_panel)
@@ -985,6 +1179,19 @@ class MdiView(QMainWindow):
         )
 
         view_menu = self.menubar.addMenu("&View")
+        self.act_toggle_sidebar = QAction("Toggle Left Sidebar", self, shortcut="Ctrl+B")
+        self.act_toggle_sidebar.setToolTip(
+            "Collapse or expand the permanent left sidebar (auto-hide rail)"
+        )
+        self.act_toggle_sidebar.triggered.connect(lambda _checked=False: self.toggle_sidebar_collapsed())
+        view_menu.addAction(self.act_toggle_sidebar)
+        self.act_close_all_windows = QAction("Close All Windows", self)
+        self.act_close_all_windows.setToolTip(
+            "Close all workspace windows while keeping the permanent left sidebar"
+        )
+        self.act_close_all_windows.triggered.connect(lambda _checked=False: self.clear_dock_area())
+        view_menu.addAction(self.act_close_all_windows)
+        view_menu.addSeparator()
         self.act_hide_top_bars = QAction("Remove View Top Bars", self, checkable=True)
         self.act_hide_top_bars.setChecked(getattr(self.state, "hide_view_top_bars", False))
         self.act_hide_top_bars.setToolTip(
@@ -993,7 +1200,10 @@ class MdiView(QMainWindow):
         self.act_hide_top_bars.triggered.connect(lambda checked: self.state.set_hide_view_top_bars(checked))
         view_menu.addAction(self.act_hide_top_bars)
         view_menu.addAction(
-            QAction("View Settings Panel...", self, triggered=self.open_or_show_view_settings_panel)
+            QAction("View Settings Panel...", self, triggered=lambda: self.open_or_show_view_settings_panel())
+        )
+        view_menu.addAction(
+            QAction("Recording Settings...", self, triggered=self.open_or_show_neo_settings)
         )
         view_menu.addAction(
             QAction(
@@ -1514,7 +1724,15 @@ class MdiView(QMainWindow):
             w2.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, True)
         w2.setFeature(QtAds.CDockWidget.DockWidgetForceCloseWithArea, True)
         if pos is not None and pos != QtAds.NoDockWidgetArea:
-            self.dock_manager.addDockWidget(pos, w2)
+            target_pos = pos
+            if pos == QtAds.LeftDockWidgetArea and not self.is_sidebar_collapsed():
+                has_workspace_docks = any(
+                    not self._is_permanent_sidebar_dock(dw)
+                    for dw in self.dock_manager.dockWidgets()
+                )
+                if not has_workspace_docks:
+                    target_pos = QtAds.RightDockWidgetArea
+            self.dock_manager.addDockWidget(target_pos, w2)
         else:
             self.dock_manager.addDockWidget(QtAds.NoDockWidgetArea, w2)
         self.cur_windows.append(w2)

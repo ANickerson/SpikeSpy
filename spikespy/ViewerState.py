@@ -1822,6 +1822,9 @@ class ViewerState(QObject):
     def setUnitGroup(self, unitid: int):
         if unitid > len(self.spike_groups):
             return
+        if self.active_candidate_id is not None:
+            self.active_candidate_id = None
+            self.onCandidateSelectionChanged.emit(-1)
         self.cur_spike_group = unitid
         if 0 <= unitid < len(self.spike_groups):
             sg = self.spike_groups[unitid]
@@ -3119,6 +3122,17 @@ class ViewerState(QObject):
         return names[0] if names else ""
 
     def _candidate_scan_channels(self) -> List[str]:
+        configured = [
+            str(c).strip()
+            for c in (getattr(self.candidate_config, "scan_channels", None) or [])
+            if str(c).strip()
+        ]
+        if configured:
+            avail = self.get_available_channels()
+            if avail:
+                avail_set = set(avail)
+                return [c for c in configured if c in avail_set]
+            return configured
         names = [str(c) for c in (getattr(self, "active_channel_names", None) or []) if c]
         primary = getattr(self.analog_signal, "name", "") or ""
         if primary and primary not in names:
@@ -3160,13 +3174,44 @@ class ViewerState(QObject):
     def set_active_candidate(self, candidate_id: Optional[int]) -> None:
         if candidate_id is not None and candidate_id not in self.candidate_units:
             candidate_id = None
-        if self.active_candidate_id == candidate_id:
-            return
+        changed = self.active_candidate_id != candidate_id
         self.active_candidate_id = candidate_id
         self._touch_candidate_review()
-        self.onCandidateSelectionChanged.emit(
-            -1 if candidate_id is None else int(candidate_id)
+
+        candidate = (
+            self.candidate_units.get(candidate_id)
+            if candidate_id is not None
+            else None
         )
+        if candidate is not None:
+            target_ch = str(getattr(candidate, "channel", "") or "")
+            cur_ch = getattr(self.analog_signal, "name", "") or ""
+            if target_ch and target_ch != cur_ch:
+                avail = self.get_available_channels()
+                if not avail or target_ch in avail:
+                    self.set_active_channel(target_ch)
+
+            idx_arr = getattr(getattr(candidate, "unit", None), "idx_arr", None) or []
+            n_events = len(self.event_signal) if self.event_signal is not None else 0
+            if n_events > 0 and idx_arr:
+                cur_stim = int(getattr(self, "stimno", 0) or 0)
+                has_at_cur = (
+                    0 <= cur_stim < len(idx_arr) and idx_arr[cur_stim] is not None
+                )
+                if not has_at_cur:
+                    detected_stims = [
+                        i
+                        for i, item in enumerate(idx_arr)
+                        if item is not None and 0 <= i < n_events
+                    ]
+                    if detected_stims:
+                        nearest = min(detected_stims, key=lambda s: abs(s - cur_stim))
+                        self.setStimNo(nearest)
+
+        if changed:
+            self.onCandidateSelectionChanged.emit(
+                -1 if candidate_id is None else int(candidate_id)
+            )
 
     def clear_candidates(self, emit: bool = True) -> None:
         self.candidate_units = {}
@@ -3717,6 +3762,16 @@ class ViewerState(QObject):
                 continue
             if key == "enabled_algorithms":
                 cfg.enabled_algorithms = [str(a) for a in (value or []) if str(a).strip()]
+                continue
+            if key == "scan_channels":
+                seen = set()
+                cleaned: List[str] = []
+                for ch in value or []:
+                    s = str(ch).strip()
+                    if s and s not in seen:
+                        seen.add(s)
+                        cleaned.append(s)
+                cfg.scan_channels = cleaned
                 continue
             setattr(cfg, key, value)
             if key == "scan_interval_ms":
