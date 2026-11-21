@@ -285,9 +285,7 @@ def notify_view_selected(view_or_child, ensure_panel_visible: bool = True):
                         mdi.settings_panel.setActiveView(resolved)
                     if ensure_panel_visible and hasattr(mdi, "open_or_show_view_settings_panel"):
                         try:
-                            mdi.open_or_show_view_settings_panel(
-                                reveal_if_collapsed=False, switch_tab=False
-                            )
+                            mdi.open_or_show_view_settings_panel(reveal_if_collapsed=False)
                         except TypeError:
                             mdi.open_or_show_view_settings_panel()
             except RuntimeError:
