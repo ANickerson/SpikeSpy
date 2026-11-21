@@ -72,7 +72,7 @@ class falling_leaf_plotter:
         self.partial = False
         self.hline = None
 
-    def setup(self, ax: Axes, erp, sampling_rate=1000, mode="heatmap"):
+    def setup(self, ax: Axes, erp, sampling_rate=1000, mode="heatmap", pre_offset_s=0.0):
         if erp is not None and hasattr(erp, "magnitude"):
             erp = erp.magnitude
         if erp is None or erp.size == 0 or erp.shape[0] == 0:
@@ -85,12 +85,14 @@ class falling_leaf_plotter:
 
         # self.cb2 = ax.callbacks.connect("ylim_changed", self.setup)
 
+        sr_val = float(sampling_rate.rescale(pq.Hz).magnitude) if hasattr(sampling_rate, "rescale") else float(sampling_rate)
+        pre_samples = int(round(pre_offset_s * sr_val))
         func_formatter = matplotlib.ticker.FuncFormatter(
-            lambda x, pos: "{0:g}".format(1000 * x / sampling_rate)
+            lambda x, pos: "{0:g}".format(1000 * (x - pre_samples) / sr_val)
         )
         ax.xaxis.set_major_formatter(func_formatter)
         loc = matplotlib.ticker.MultipleLocator(
-            base=sampling_rate / 100
+            base=sr_val / 100
         )  # this locator puts ticks at regular intervals
         ax.xaxis.set_major_locator(loc)
 
@@ -895,6 +897,7 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
                 "spike_groups": self.state.spike_groups,
                 "sampling_rate": self.state.sampling_rate,
                 "current_unit_idx": self.channel_bar.get_target_unit_idx() if hasattr(self, "channel_bar") else self.state.cur_spike_group,
+                "pre_offset_s": getattr(self.state, "pre_offset_s", 0.0),
             },
             priority=TaskPriority.NORMAL,
         )
@@ -1290,8 +1293,9 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
             except:
                 pass
 
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
         self.plotter.setup(
-            self.ax, erp, sampling_rate=self.state.sampling_rate, mode=mode
+            self.ax, erp, sampling_rate=self.state.sampling_rate, mode=mode, pre_offset_s=pre_offset_s
         )
         self.plotter.plot_main(
             mode=self.mode,
@@ -1427,8 +1431,10 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
         if sr is None:
             sr = 1000
         sr = float(sr.magnitude) if hasattr(sr, "magnitude") else float(sr)
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        pre_samples = int(round(pre_offset_s * sr))
 
-        func = lambda x, pos: "{0:g}".format(1000 * x / sr)
+        func = lambda x, pos: "{0:g}".format(1000 * (x - pre_samples) / sr)
         func_formatter = matplotlib.ticker.FuncFormatter(func)
 
         self.ax.xaxis.set_major_formatter(func_formatter)
@@ -1441,7 +1447,11 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
         loc = matplotlib.ticker.MultipleLocator(sr / 100)
         self.ax.xaxis.set_minor_locator(loc)
 
-        self.ax.xaxis.set_major_formatter(func_formatter)
+        if not hasattr(self, "stim_zero_line") or self.stim_zero_line is None:
+            self.stim_zero_line = self.ax.axvline(pre_samples, color="gray", linestyle="--", alpha=0.6, zorder=10)
+        else:
+            self.stim_zero_line.set_xdata([pre_samples, pre_samples])
+            self.stim_zero_line.set_visible(pre_samples > 0)
 
         # loc = matplotlib.ticker.MultipleLocator(
         #     base=self.state.sampling_rate / 100

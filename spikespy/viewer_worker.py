@@ -478,19 +478,23 @@ class ViewerWorker(QThread):
         # Check if this is a convolution-only task (LIFO buffer flush)
         convolution_only = p.get("convolution_only", False)
         decimate = p.get("decimate", True)
+        pre_offset_s = float(p.get("pre_offset_s", 0.0))
         
         # Primary trace
         if not convolution_only:
             raw_primary = p["primary_erp"]
             sr = float(p["sampling_rate"])
             if decimate:
-                primary_x, primary_y = self._decimate_trace(raw_primary, sr)
+                primary_x, primary_y = self._decimate_trace(
+                    raw_primary, sr, pre_offset_s=pre_offset_s
+                )
             else:
                 if raw_primary is None or len(raw_primary) == 0:
                     primary_x, primary_y = np.array([]), np.array([])
                 else:
                     arr = np.asarray(getattr(raw_primary, "magnitude", raw_primary), dtype=np.float32)
-                    primary_x = np.arange(len(arr)) / sr
+                    pre_samples = int(round(pre_offset_s * sr))
+                    primary_x = (np.arange(len(arr)) - pre_samples) / sr
                     primary_y = arr
         else:
             primary_x, primary_y = np.array([]), np.array([])
@@ -502,10 +506,13 @@ class ViewerWorker(QThread):
             for ch_name, ch_erp in p["overlay_erps"].items():
                 if ch_erp is not None and len(ch_erp) > 0:
                     if decimate:
-                        ch_x, ch_y = self._decimate_trace(ch_erp, sr)
+                        ch_x, ch_y = self._decimate_trace(
+                            ch_erp, sr, pre_offset_s=pre_offset_s
+                        )
                     else:
                         arr = np.asarray(getattr(ch_erp, "magnitude", ch_erp), dtype=np.float32)
-                        ch_x = np.arange(len(arr)) / sr
+                        pre_samples = int(round(pre_offset_s * sr))
+                        ch_x = (np.arange(len(arr)) - pre_samples) / sr
                         ch_y = arr
                     overlay_data[ch_name] = {"x": ch_x, "y": ch_y}
         
@@ -568,26 +575,31 @@ class ViewerWorker(QThread):
         idx_arr = getattr(sg, "idx_arr", None) if sg is not None else None
         prev_latency = None
         next_latency = None
+        pre_offset_s = float(p.get("pre_offset_s", 0.0))
+        pre_samples = int(round(pre_offset_s * sr))
         if idx_arr:
             for offset in range(1, 10):
                 i = stimno - offset
                 if 0 <= i < len(idx_arr) and idx_arr[i] is not None:
-                    prev_latency = idx_arr[i][0] / sr
+                    prev_latency = (idx_arr[i][0] - pre_samples) / sr
                     break
             for offset in range(1, 10):
                 i = stimno + offset
                 if 0 <= i < len(idx_arr) and idx_arr[i] is not None:
-                    next_latency = idx_arr[i][0] / sr
+                    next_latency = (idx_arr[i][0] - pre_samples) / sr
                     break
 
         return cur_latency, prev_latency, next_latency
     
-    def _decimate_trace(self, trace: np.ndarray, sr: float, max_points: int = 2500) -> tuple:
+    def _decimate_trace(
+        self, trace: np.ndarray, sr: float, max_points: int = 2500, pre_offset_s: float = 0.0
+    ) -> tuple:
         """Decimate trace for efficient display."""
         if trace is None or len(trace) == 0:
             return np.array([]), np.array([])
         
-        x_arr = np.arange(len(trace)) / sr
+        pre_samples = int(round(pre_offset_s * sr))
+        x_arr = (np.arange(len(trace)) - pre_samples) / sr
         n_samples = len(x_arr)
         if n_samples <= max_points:
             return x_arr, trace
@@ -907,6 +919,7 @@ class ViewerWorker(QThread):
         p = task.payload
         spikegroup_points = {}
         sr = p["sampling_rate"]
+        pre_offset_s = float(p.get("pre_offset_s", 0.0))
         for i, sg in enumerate(p["spike_groups"]):
             if sg is None or sg.event is None or len(sg.event) == 0:
                 continue
@@ -919,7 +932,10 @@ class ViewerWorker(QThread):
                 float(lats[s].rescale(pq.s).magnitude) if hasattr(lats[s], "rescale") else float(lats[s])
                 for s in sweeps
             ]
-            samples = np.array([int(round(lv * sr)) for lv in lat_vals], dtype=float)
+            samples = np.array(
+                [int(round((lv + pre_offset_s) * sr)) for lv in lat_vals],
+                dtype=float,
+            )
             spikegroup_points[i] = {
                 "samples": samples,
                 "sweeps": sweeps,

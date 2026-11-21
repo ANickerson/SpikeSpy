@@ -63,15 +63,19 @@ def test_replay_loaded_signal_as_live(qtbot):
     )
 
     erp = state.get_erp()
-    assert erp.shape == (3, 100)
-    np.testing.assert_allclose(erp.magnitude[:, 0], [500.0, 1000.0, 1500.0])
+    assert erp.shape == (3, 110)
+    np.testing.assert_allclose(erp.magnitude[:, 10], [500.0, 1000.0, 1500.0])
 
     assert "CH1" in state._live_aux_erp_buffers
     ch1_erp = state._live_aux_erp_buffers["CH1"].data
-    np.testing.assert_allclose(ch1_erp.magnitude[:, 0], [1000.0, 2000.0, 3000.0])
+    np.testing.assert_allclose(ch1_erp.magnitude[:, 10], [1000.0, 2000.0, 3000.0])
 
     np.testing.assert_array_equal(
-        [state.spike_groups[0].idx_arr[i][0] for i in range(3)], [20, 20, 20]
+        [state.spike_groups[0].idx_arr[i][0] for i in range(3)], [30, 30, 30]
+    )
+    np.testing.assert_allclose(
+        state.spike_groups[0].get_latencies(state.event_signal).rescale(pq.ms).magnitude,
+        [20.0, 20.0, 20.0],
     )
 
     assert "Replay complete" in view.lbl_status.text()

@@ -69,15 +69,27 @@ SET2_COLORS = [
 class EphysTimeAxisItem(pg.AxisItem):
     """Custom AxisItem converting sample index to milliseconds (stimulus-locked time)."""
 
-    def __init__(self, get_sampling_rate, orientation="bottom", *args, **kwargs):
+    def __init__(
+        self,
+        get_sampling_rate,
+        orientation="bottom",
+        get_pre_offset_s=None,
+        *args,
+        **kwargs,
+    ):
         super().__init__(orientation, *args, **kwargs)
         self.get_sampling_rate = get_sampling_rate
+        self.get_pre_offset_s = get_pre_offset_s
 
     def tickStrings(self, values, scale, spacing):
         sr = self.get_sampling_rate()
         if not sr or sr <= 0:
             return [f"{v:g}" for v in values]
-        return [f"{1000 * v / sr:g}" for v in values]
+        pre_offset_s = (
+            self.get_pre_offset_s() if callable(self.get_pre_offset_s) else 0.0
+        )
+        pre_samples = int(round(pre_offset_s * sr))
+        return [f"{1000 * (v - pre_samples) / sr:g}" for v in values]
 
 
 class ChannelPlotPanel:
@@ -97,6 +109,7 @@ class ChannelPlotPanel:
         time_axis: Optional[EphysTimeAxisItem] = None,
         highlight_segments: Optional[pg.PlotDataItem] = None,
         points_scatter: Optional[pg.ScatterPlotItem] = None,
+        stim_zero_line: Optional[pg.InfiniteLine] = None,
     ):
         self.slot_idx: int = slot_idx
         self.channel_name: Optional[str] = channel_name
@@ -107,6 +120,7 @@ class ChannelPlotPanel:
         self.highlight_segments: Optional[pg.PlotDataItem] = highlight_segments
         self.points_scatter: Optional[pg.ScatterPlotItem] = points_scatter
         self.stim_line: pg.InfiniteLine = stim_line
+        self.stim_zero_line: Optional[pg.InfiniteLine] = stim_zero_line
         self.tracked_unit_scatter: pg.ScatterPlotItem = tracked_unit_scatter
         self.other_unit_scatters: List[pg.ScatterPlotItem] = []
         self.legend_items: List[pg.TextItem] = []
@@ -1175,6 +1189,9 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             time_axis = EphysTimeAxisItem(
                 lambda: self.state.sampling_rate if self.state else None,
                 orientation="bottom",
+                get_pre_offset_s=lambda: getattr(self.state, "pre_offset_s", 0.0)
+                if self.state
+                else 0.0,
             )
             plot = self.glw.addPlot(row=0, col=i, axisItems={"bottom": time_axis})
             plot.invertY(True)
@@ -1219,6 +1236,17 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             stim_line.setValue(cur_stim)
             plot.addItem(stim_line)
 
+            # 3b. Stimulus onset vertical dashed line at x = pre_samples
+            stim_zero_line = pg.InfiniteLine(
+                angle=90, pen=pg.mkPen("gray", style=Qt.DashLine), movable=False
+            )
+            pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+            sr = self.state.sampling_rate if self.state and self.state.sampling_rate else 10000.0
+            pre_samples = int(round(pre_offset_s * sr))
+            stim_zero_line.setValue(pre_samples)
+            stim_zero_line.setVisible(pre_samples > 0)
+            plot.addItem(stim_zero_line)
+
             # 4. Spike group scatter points
             tracked_scatter = pg.ScatterPlotItem(
                 size=8, symbol="s", pen=None, brush=pg.mkBrush(255, 0, 0, 200)
@@ -1262,6 +1290,7 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 time_axis=time_axis,
                 highlight_segments=highlight_segments,
                 points_scatter=points_scatter,
+                stim_zero_line=stim_zero_line,
             )
             panel.candidate_band = candidate_band
             panel.candidate_scatter = candidate_scatter
@@ -2396,6 +2425,9 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 "spike_groups": self.state.spike_groups,
                 "sampling_rate": self.state.sampling_rate,
                 "current_unit_idx": self.get_target_unit_idx(),
+                "pre_offset_s": getattr(self.state, "pre_offset_s", 0.0)
+                if self.state
+                else 0.0,
             },
             priority=TaskPriority.NORMAL,
         )
@@ -2960,7 +2992,14 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self.setup_figure()
             return
 
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        sr = self.state.sampling_rate if self.state and self.state.sampling_rate else 10000.0
+        pre_samples = int(round(pre_offset_s * sr))
+
         for p in self.channel_panels:
+            if hasattr(p, "stim_zero_line") and p.stim_zero_line is not None:
+                p.stim_zero_line.setValue(pre_samples)
+                p.stim_zero_line.setVisible(pre_samples > 0)
             if hasattr(p, "stim_line"):
                 p.stim_line.setValue(stimNo)
             if self.mode == "lines" and p.has_data and p.channel_name and self.state is not None:

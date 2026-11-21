@@ -161,7 +161,7 @@ def test_open_ephys_mock_server_and_bidirectional_sync(qtbot):
         qtbot.waitUntil(lambda: len(state.event_signal) >= 2, timeout=4000)
 
         assert state.get_erp().shape[0] >= 2
-        assert state.get_erp().shape[1] == int(30000 * 0.1)
+        assert state.get_erp().shape[1] == int(30000 * 0.11)
 
         # 3. Annotate a unit in SpikeSpy and verify bidirectional sync to Open Ephys HTTP server
         state.setUnit(750, stimno=0)
@@ -268,9 +268,9 @@ def test_realistic_microneurography_and_event_marker_alignment(qtbot):
 
         # 1. Action potential morphology: clear positive peak (> 40 uV)
         sweep0 = erp_ch0[0].magnitude if hasattr(erp_ch0[0], "magnitude") else erp_ch0[0]
-        # Peak should be around 25 ms (750 samples at 30 kHz)
-        search_window = sweep0[650:850]
-        peak_sample_sweep0 = 650 + int(np.argmax(search_window))
+        # Peak should be around 25 ms post-stimulus (750 samples post-stimulus + 300 pre-stim = 1050 samples at 30 kHz)
+        search_window = sweep0[950:1150]
+        peak_sample_sweep0 = 950 + int(np.argmax(search_window))
         assert sweep0[peak_sample_sweep0] > 30.0, f"Expected positive peak > 30 uV, got {sweep0[peak_sample_sweep0]}"
 
         # 2. Event marker alignment: verify unit_0 marker matches peak_sample_sweep0!
@@ -285,8 +285,8 @@ def test_realistic_microneurography_and_event_marker_alignment(qtbot):
 
         # 3. Activity-dependent slowing: sweep 3 peak should have shifted to the right (higher latency)
         sweep3 = erp_ch0[3].magnitude if hasattr(erp_ch0[3], "magnitude") else erp_ch0[3]
-        search_window3 = sweep3[650:950]
-        peak_sample_sweep3 = 650 + int(np.argmax(search_window3))
+        search_window3 = sweep3[950:1250]
+        peak_sample_sweep3 = 950 + int(np.argmax(search_window3))
         assert peak_sample_sweep3 >= peak_sample_sweep0, (
             f"Expected slowing: sweep 3 ({peak_sample_sweep3}) should be >= sweep 0 ({peak_sample_sweep0})"
         )
@@ -310,14 +310,14 @@ def test_realistic_microneurography_and_event_marker_alignment(qtbot):
         assert sweep0[peak_sample_sweep0] > sweep0_ch2[peak_ch2]
 
         # 5. Distinct noise profiles: CH0, CH2 (clean low-noise), and CH3 (broadband hash) have distinct noise profiles
-        # Measure noise in baseline period (samples 100:600)
-        std_ch0 = np.std(sweep0[100:600])
+        # Measure noise in baseline period (samples 400:900)
+        std_ch0 = np.std(sweep0[400:900])
         erp_ch2 = state._live_aux_erp_buffers["CH2"].data
         sweep0_ch2 = erp_ch2[0].magnitude if hasattr(erp_ch2[0], "magnitude") else erp_ch2[0]
-        std_ch2 = np.std(sweep0_ch2[100:600])
+        std_ch2 = np.std(sweep0_ch2[400:900])
         erp_ch3 = state._live_aux_erp_buffers["CH3"].data
         sweep0_ch3 = erp_ch3[0].magnitude if hasattr(erp_ch3[0], "magnitude") else erp_ch3[0]
-        std_ch3 = np.std(sweep0_ch3[100:600])
+        std_ch3 = np.std(sweep0_ch3[400:900])
 
         # CH2 is a low-noise contact (significantly lower RMS than CH0)
         assert std_ch2 < std_ch0 - 0.5

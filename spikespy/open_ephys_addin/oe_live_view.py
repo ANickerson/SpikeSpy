@@ -948,6 +948,7 @@ class OpenEphysLiveView(QWidget):
                 channel_name=f"CH{self.spin_rec_chan.value()}",
                 units=pq.uV,
                 aux_channels=[f"CH{c}" for c in active_chans],
+                pre_ms=self.spin_pre_ms.value(),
             )
 
         self.worker.start()
@@ -1019,6 +1020,7 @@ class OpenEphysLiveView(QWidget):
                 units=pq.uV,
                 aux_channels=[f"CH{c}" for c in active_chans],
                 resume=False,
+                pre_ms=self.spin_pre_ms.value(),
             )
 
         self.lbl_sweeps_count.setText("0")
@@ -1074,6 +1076,7 @@ class OpenEphysLiveView(QWidget):
             units=self._replay_units,
             aux_channels=[name for name, _ in self._replay_channels[1:]],
             resume=False,
+            pre_ms=float(self._replay_pre_s * 1000.0),
         )
 
         self._replay_index = 0
@@ -1194,6 +1197,7 @@ class OpenEphysLiveView(QWidget):
             units=self._replay_units,
             aux_channels=[name for name, _ in self._replay_channels[1:]],
             resume=False,
+            pre_ms=float(self._replay_pre_s * 1000.0),
         )
         self.lbl_spikes_count.setText("0")
         self.lbl_stim_freq.setText("0.0 Hz")
@@ -1428,7 +1432,9 @@ class OpenEphysLiveView(QWidget):
         )
         primary_name, primary_signal = selected[0]
 
-        window_samples = max(1, int(sr * window_ms / 1000.0))
+        window_samples = max(
+            1, int(sr * (window_ms + float(self.spin_pre_ms.value())) / 1000.0)
+        )
 
         sorted_event = Event(
             events_s * pq.s,
@@ -1757,6 +1763,9 @@ class OpenEphysLiveView(QWidget):
                     channel_name=f"CH{self.spin_rec_chan.value()}",
                     units=pq.uV,
                     aux_channels=[f"CH{c}" for c in active_chans],
+                    pre_ms=float(pre_offset_s * 1000.0)
+                    if pre_offset_s > 0
+                    else self.spin_pre_ms.value(),
                 )
             try:
                 self.state.append_sweep(

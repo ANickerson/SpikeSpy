@@ -202,9 +202,10 @@ def test_multi_unit_live_sweeps_and_annotations(qtbot):
         lat2_samples = sg2.idx_arr[0][0]
 
         sr = 30000.0
-        lat0_ms = (lat0_samples / sr) * 1000.0
-        lat1_ms = (lat1_samples / sr) * 1000.0
-        lat2_ms = (lat2_samples / sr) * 1000.0
+        pre_samples = int(round(state.pre_offset_s * sr))
+        lat0_ms = ((lat0_samples - pre_samples) / sr) * 1000.0
+        lat1_ms = ((lat1_samples - pre_samples) / sr) * 1000.0
+        lat2_ms = ((lat2_samples - pre_samples) / sr) * 1000.0
 
         # Unit 0 (Fast A-fiber): ~12 ms (±0.5 ms jitter)
         assert 11.0 <= lat0_ms <= 13.0, f"Unit 0 latency unexpected: {lat0_ms} ms"

@@ -291,6 +291,7 @@ class MultiTraceFixedView(QMatplotlib):
         self.ax.xaxis.set_minor_formatter(CustomFormatter(self.ax))
         self.ax.set_ylim(n_lines + n_lines_post + 1, -1)
         self.ax.set_xlim(0, 0.5)
+        self.stim_zero_line = self.ax.axvline(0.0, color="gray", linestyle="--", alpha=0.6, zorder=0)
         self.ax.callbacks.connect("ylim_changed", self.on_limits_change)
 
     def draw_figure(self):
@@ -330,10 +331,12 @@ class MultiTraceFixedView(QMatplotlib):
             if hasattr(self.state.sampling_rate, "rescale")
             else float(self.state.sampling_rate)
         )
-        total_time = erp.shape[-1] / sr
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        pre_samples = int(round(pre_offset_s * sr))
+        total_time = (erp.shape[-1] - pre_samples) / sr
         cur_xlim = self.ax.get_xlim()
-        if cur_xlim == (0.0, 0.5) or cur_xlim[1] != total_time:
-            self.ax.set_xlim(0, total_time)
+        if cur_xlim == (0.0, 0.5) or cur_xlim != (-pre_offset_s, total_time):
+            self.ax.set_xlim(-pre_offset_s, total_time)
 
         stimno = self.state.stimno
         start = max(stimno - n_lines_pre, 0)
@@ -370,7 +373,7 @@ class MultiTraceFixedView(QMatplotlib):
                         ch_d = ch_matrix[i]
                         if hasattr(ch_d, "magnitude"):
                             ch_d = ch_d.magnitude
-                        x = np.arange(len(ch_d)) / self.state.sampling_rate
+                        x = (np.arange(len(ch_d)) - pre_samples) / sr
                         y = (ch_d * eff_scale * -1) + i
                         segments.append(np.column_stack([x, y]))
                         c = ch_palette[ch_i % len(ch_palette)]
@@ -380,7 +383,7 @@ class MultiTraceFixedView(QMatplotlib):
                             colors.append("grey" if ch_i == 0 else c)
         else:
             for i in range(len(dpts)):
-                x = np.arange(erp.shape[-1]) / self.state.sampling_rate
+                x = (np.arange(erp.shape[-1]) - pre_samples) / sr
                 y = (dpts[i] * eff_scale * -1) + i
                 segments.append(np.column_stack([x, y]))
                 if i == stimno - start:
@@ -397,13 +400,15 @@ class MultiTraceFixedView(QMatplotlib):
                 if np.isnan(l):
                     continue
                 l = l.rescale("s")
-                sample_no = int(l * self.state.sampling_rate)
+                sample_no = int(round((float(l.magnitude) + pre_offset_s) * sr))
                 if sample_no >= len(dpts[i]) or sample_no < 0:
                     continue
                 r = 20
-                x = np.arange(sample_no - r, sample_no + r)
-                y = ((dpts[i][x] * eff_scale) * -1) + i
-                segments.append(np.column_stack([x / self.state.sampling_rate, y]))
+                r_start = max(0, sample_no - r)
+                r_end = min(len(dpts[i]), sample_no + r)
+                x = (np.arange(r_start, r_end) - pre_samples) / sr
+                y = ((dpts[i][r_start:r_end] * eff_scale) * -1) + i
+                segments.append(np.column_stack([x, y]))
                 colors.append("red")
                 x_ys.append((float(l.magnitude), (dpts[i][sample_no] * eff_scale * -1) + i))
 

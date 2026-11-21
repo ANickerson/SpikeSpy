@@ -165,6 +165,11 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
         self.main_plot.addItem(self.candidate_band)
         self.main_plot.addItem(self.candidate_scatter)
 
+        self.stim_zero_line = pg.InfiniteLine(
+            pos=0.0, angle=90, pen=pg.mkPen("gray", style=Qt.DashLine), movable=False
+        )
+        self.main_plot.addItem(self.stim_zero_line)
+
         self.main_plot.scene().sigMouseClicked.connect(self._on_click)
 
         layout.addWidget(self.glw)
@@ -495,7 +500,9 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
         erp = self.get_erp_signal()
         if erp is not None and len(erp) > 0:
             sr = float(self.state.sampling_rate) if self.state and self.state.sampling_rate else 10000.0
-            self.main_plot.setXRange(0, (erp.shape[-1] - 1) / sr, padding=0)
+            pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+            pre_samples = int(round(pre_offset_s * sr))
+            self.main_plot.setXRange(-pre_offset_s, (erp.shape[-1] - 1 - pre_samples) / sr, padding=0)
         self._auto_scale()
         self.update_figure()
 
@@ -665,7 +672,9 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
             if hasattr(self.state.sampling_rate, "rescale")
             else float(self.state.sampling_rate)
         )
-        x = np.arange(erp.shape[-1]) / sr
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        pre_samples = int(round(pre_offset_s * sr))
+        x = (np.arange(erp.shape[-1]) - pre_samples) / sr
 
         if scale_mode == "std":
             dpts_arr = np.asarray(dpts_mag)
@@ -721,10 +730,10 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
                     sample_no = int(entry[0])
                     if sample_no < 0 or sample_no >= len(dpts_mag[i]):
                         continue
-                    l_sec = sample_no / sr
+                    l_sec = (sample_no - pre_samples) / sr
                     r_start = max(0, sample_no - r)
                     r_end = min(len(dpts_mag[i]), sample_no + r)
-                    seg_x = np.arange(r_start, r_end) / sr
+                    seg_x = (np.arange(r_start, r_end) - pre_samples) / sr
                     seg_y = (dpts_mag[i][r_start:r_end] * eff_scale * -1.0) + y_baselines[i]
 
                     hl_x.append(np.append(seg_x, np.nan))
@@ -741,13 +750,13 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
                     if np.isnan(l):
                         continue
                     l_sec = float(l.rescale("s").magnitude)
-                    sample_no = int(l_sec * sr)
+                    sample_no = int(round((l_sec + pre_offset_s) * sr))
                     if sample_no < 0 or sample_no >= len(dpts_mag[i]):
                         continue
 
                     r_start = max(0, sample_no - r)
                     r_end = min(len(dpts_mag[i]), sample_no + r)
-                    seg_x = np.arange(r_start, r_end) / sr
+                    seg_x = (np.arange(r_start, r_end) - pre_samples) / sr
                     seg_y = (dpts_mag[i][r_start:r_end] * eff_scale * -1.0) + y_baselines[i]
 
                     hl_x.append(np.append(seg_x, np.nan))
@@ -803,7 +812,7 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
                 if 0 <= sample_no < len(dpts_mag[i]):
                     cand_pts.append(
                         (
-                            sample_no / sr,
+                            (sample_no - pre_samples) / sr,
                             (dpts_mag[i][sample_no] * eff_scale * -1.0)
                             + y_baselines[i],
                         )
@@ -817,7 +826,7 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
             else:
                 self.candidate_scatter.clear()
                 self.candidate_scatter.setVisible(False)
-            center_s = float(candidate.latency_center_samples) / sr
+            center_s = (float(candidate.latency_center_samples) - pre_samples) / sr
             half_s = max(1.0 / sr, float(candidate.latency_tolerance_samples) / sr)
             self.candidate_band.setRegion((center_s - half_s, center_s + half_s))
             self.candidate_band.setVisible(True)
@@ -838,7 +847,7 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
 
         # Only initialize X-range on first sweep or reset; preserve zoom and pan across live sweeps
         if not self._has_initialized_xrange:
-            self.main_plot.setXRange(0, (erp.shape[-1] - 1) / sr, padding=0)
+            self.main_plot.setXRange(-pre_offset_s, (erp.shape[-1] - 1 - pre_samples) / sr, padding=0)
             self._has_initialized_xrange = True
 
     def keyPressEvent(self, e):
@@ -854,7 +863,9 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
                     if hasattr(self.state.sampling_rate, "rescale")
                     else float(self.state.sampling_rate)
                 )
-                self.main_plot.setXRange(0, (erp.shape[-1] - 1) / sr, padding=0)
+                pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+                pre_samples = int(round(pre_offset_s * sr))
+                self.main_plot.setXRange(-pre_offset_s, (erp.shape[-1] - 1 - pre_samples) / sr, padding=0)
         else:
             super().keyPressEvent(e)
 

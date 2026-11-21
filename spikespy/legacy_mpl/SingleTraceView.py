@@ -345,7 +345,8 @@ class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
             if np.isnan(e.xdata):
                 return
             sr = float(self.state.sampling_rate) if self.state and self.state.sampling_rate is not None else 10000.0
-            self.set_cur_pos(e.xdata * sr)
+            pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+            self.set_cur_pos((e.xdata + pre_offset_s) * sr)
         except Exception:
             pass
 
@@ -385,7 +386,16 @@ class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
         self.aux_trace_lines = []
         self.aux_trace_labels = []
 
-        self.ax.set_xlim(0, erp.shape[-1] / self.state.sampling_rate)
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        sr_val = (
+            float(self.state.sampling_rate.rescale(pq.Hz).magnitude)
+            if hasattr(self.state.sampling_rate, "rescale")
+            else float(self.state.sampling_rate)
+        )
+        pre_samples = int(round(pre_offset_s * sr_val)) if self.state else 0
+        self.ax.set_xlim(-pre_offset_s, (erp.shape[-1] - pre_samples) / sr_val)
+        if not hasattr(self, "stim_zero_line") or self.stim_zero_line is None:
+            self.stim_zero_line = self.ax.axvline(0.0, color="gray", linestyle="--", alpha=0.6, zorder=0)
         ylim = (float(np.std(np.abs(erp))) or 1.0) * 8
         if getattr(self, "chk_multichannel", None) and self.chk_multichannel.isChecked():
             overlay_chans = self.get_overlay_channels()
@@ -547,7 +557,8 @@ class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
                 if s_idx >= len(erp_ch):
                     continue
                 lat = lats[s_idx]
-                c_idx = int(round(float((lat.rescale(pq.s) * sr).magnitude)))
+                pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+                c_idx = int(round(float(((lat.rescale(pq.s) + (pre_offset_s * pq.s)) * sr).magnitude)))
                 start = c_idx - pre_samples
                 end = c_idx + post_samples
                 sweep_row = erp_ch[s_idx]
@@ -812,7 +823,11 @@ class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
         pts_down, _ = find_peaks(-1 * dpts)
         pts = np.sort(np.hstack([pts, pts_down]).flatten())
 
-        raw_x = np.arange(len(dpts)) / self.state.sampling_rate
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        sr_val = float(self.state.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(self.state.sampling_rate, "rescale") else float(self.state.sampling_rate)
+        pre_samples = int(round(pre_offset_s * sr_val))
+
+        raw_x = (np.arange(len(dpts)) - pre_samples) / sr_val
         dec_x, dec_y = self._decimate_trace_for_display(raw_x, dpts)
 
         if self.trace_line_cache is None:
@@ -842,7 +857,7 @@ class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
                 if hasattr(ch_dpts, "magnitude"):
                     ch_dpts = ch_dpts.magnitude
                 offset = (idx_c + 1) * self.spin_chan_spacing.value()
-                ch_raw_x = np.arange(len(ch_dpts)) / self.state.sampling_rate
+                ch_raw_x = (np.arange(len(ch_dpts)) - pre_samples) / sr_val
                 ch_dec_x, ch_dec_y = self._decimate_trace_for_display(ch_raw_x, ch_dpts + offset)
                 self.aux_trace_lines[idx_c].set_data(ch_dec_x, ch_dec_y)
                 self.aux_trace_lines[idx_c].set_visible(True)
@@ -858,18 +873,17 @@ class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
             self.aux_trace_lines[idx_c].set_visible(False)
             self.aux_trace_labels[idx_c].set_visible(False)
 
-        sr_val = float(self.state.sampling_rate.rescale(pq.Hz).magnitude) if hasattr(self.state.sampling_rate, "rescale") else float(self.state.sampling_rate)
         if sg is not None and getattr(sg, "idx_arr", None) is not None and len(sg.idx_arr) == len(self.state.event_signal):
             idx_list = []
             val_list = []
             for s_i, entry in enumerate(sg.idx_arr):
                 if entry is not None:
                     idx_list.append(s_i)
-                    val_list.append(entry[0] / sr_val)
+                    val_list.append((entry[0] - pre_samples) / sr_val)
             idxs = np.array(idx_list, dtype=int)
             values = val_list
             cur_entry = sg.idx_arr[self.state.stimno] if self.state.stimno < len(sg.idx_arr) else None
-            lat = (cur_entry[0] / sr_val) * pq.s if cur_entry is not None else np.nan * pq.s
+            lat = ((cur_entry[0] - pre_samples) / sr_val) * pq.s if cur_entry is not None else np.nan * pq.s
         else:
             lats_all = sg.get_latencies(self.state.event_signal) if sg is not None else np.array([])
             valid_mask = ~np.isnan(lats_all) if len(lats_all) > 0 else np.array([], dtype=bool)
@@ -880,8 +894,8 @@ class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
                 if sg is not None else np.nan * pq.s
             )
 
-        if not np.isnan(lat) and lat < self.state.window_size:
-            cur_point = int(lat * self.state.sampling_rate)
+        if not np.isnan(lat) and lat < self.state.window_size and lat >= (-pre_offset_s * pq.s):
+            cur_point = int(round((lat.magnitude + pre_offset_s) * sr_val))
             self.identified_spike_line.set_data(
                 (
                     [
@@ -938,7 +952,7 @@ class SingleTraceView(LiveFrameConsumerMixin, QMainWindow):
             hl = highlight[np.argsort(conv[highlight])[::-1]]
             hl_top = hl[0:100]
             if len(hl_top) > 0:
-                x_pos = hl_top / self.state.sampling_rate
+                x_pos = (hl_top - pre_samples) / sr_val
                 x_segs = np.column_stack([x_pos, x_pos, np.full_like(x_pos, np.nan, dtype=np.float64)]).ravel()
                 y_segs = np.tile([0.0, 1.0, np.nan], len(x_pos))
                 self.topax_conv_peaks_line.set_data(x_segs, y_segs)

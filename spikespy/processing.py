@@ -486,6 +486,29 @@ class LiveERPBuffer:
             (self._capacity, max(1, self._decim_width)), dtype=np.float32
         )
 
+    def ensure_window_samples(self, n_samples: int):
+        """Adjust window_samples if buffer is empty and incoming sweep length differs."""
+        n_samples = int(n_samples)
+        if self._count == 0 and n_samples > 0 and self.window_samples != n_samples:
+            self.window_samples = n_samples
+            if self.disk_backed:
+                self._store = DiskRowStore(self.window_samples, self.dtype, self._capacity)
+                self._buffer = self._store.array
+            else:
+                self._buffer = np.zeros(
+                    (self._capacity, self.window_samples), dtype=self.dtype
+                )
+            self._decimated_cols = min(self.window_samples, 2000)
+            self._decim_factor = max(1, self.window_samples // 2000)
+            self._decim_width = (
+                (self.window_samples + self._decim_factor - 1) // self._decim_factor
+                if self.window_samples > 0
+                else 0
+            )
+            self._heatmap_decimated = np.zeros(
+                (self._capacity, max(1, self._decim_width)), dtype=np.float32
+            )
+
     def _compute_decimated_row(self, arr: np.ndarray) -> np.ndarray:
         if len(arr) == 0 or self._decim_width == 0:
             return np.zeros(max(1, self._decim_width), dtype=np.float32)
@@ -508,6 +531,9 @@ class LiveERPBuffer:
             ).flatten()
         else:
             arr = np.asarray(sweep_1d, dtype=self.dtype).flatten()
+
+        if self._count == 0 and len(arr) > 0 and self.window_samples != len(arr):
+            self.ensure_window_samples(len(arr))
 
         if len(arr) < self.window_samples:
             pad = np.zeros(self.window_samples - len(arr), dtype=self.dtype)

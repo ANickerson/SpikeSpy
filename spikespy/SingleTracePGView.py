@@ -261,6 +261,11 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.trace_curve.setClipToView(True)
         self.main_plot.addItem(self.trace_curve)
 
+        self.stim_zero_line = pg.InfiniteLine(
+            pos=0.0, angle=90, pen=pg.mkPen("gray", style=Qt.DashLine), movable=False
+        )
+        self.main_plot.addItem(self.stim_zero_line)
+
         # Shaded tracking search window. Its width is the unit's
         # tracking_window_ms and dragging either edge updates it.
         self.track_window_region = pg.LinearRegionItem(
@@ -773,6 +778,9 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 "templates": templates,
                 "skip_convolution": is_streaming,  # Flag to skip fftconvolve in worker
                 "decimate": False,
+                "pre_offset_s": getattr(self.state, "pre_offset_s", 0.0)
+                if self.state
+                else 0.0,
             },
             priority=TaskPriority.HIGH,
         )
@@ -1059,19 +1067,21 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         """Latency (s) to center the search-window overlay on."""
         if sg is None or sr <= 0:
             return None
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        pre_samples = int(round(pre_offset_s * sr))
         idx_arr = getattr(sg, "idx_arr", None)
         if idx_arr:
             if 0 <= stimno < len(idx_arr) and idx_arr[stimno] is not None:
                 item = idx_arr[stimno]
                 sample = item[0] if isinstance(item, (tuple, list)) else item
-                return float(sample) / sr
+                return (float(sample) - pre_samples) / sr
             for step in (-1, 1):
                 for offset in range(1, 50):
                     i = stimno + step * offset
                     if 0 <= i < len(idx_arr) and idx_arr[i] is not None:
                         item = idx_arr[i]
                         sample = item[0] if isinstance(item, (tuple, list)) else item
-                        return float(sample) / sr
+                        return (float(sample) - pre_samples) / sr
         if self.state is not None and self.state.event_signal is not None:
             if 0 <= stimno < len(self.state.event_signal):
                 try:
@@ -1301,7 +1311,10 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         if sr <= 0:
             return
 
-        times = np.asarray(peaks, dtype=np.float64) / sr
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        pre_samples = int(round(pre_offset_s * sr))
+
+        times = (np.asarray(peaks, dtype=np.float64) - pre_samples) / sr
         xs = np.repeat(times, 2)
         ys = np.tile(np.array([0.0, 1.0]), len(times))
         self.conv_curve.setData(x=xs, y=ys, connect="pairs")
@@ -1325,6 +1338,9 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self._set_marker_lines(None, None, None)
             return
 
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        pre_samples = int(round(pre_offset_s * sr))
+
         cur_ev = self.state.event_signal.times[stimno]
         try:
             lat = sg.get_latencies(np.array([cur_ev]) * cur_ev.units)[0].rescale("s")
@@ -1341,7 +1357,7 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             for offset in range(1, 10):
                 i = stimno + step * offset
                 if 0 <= i < len(idx_arr) and idx_arr[i] is not None:
-                    return idx_arr[i][0] / sr
+                    return (idx_arr[i][0] - pre_samples) / sr
             return None
 
         self._set_marker_lines(cur_latency, _nearest(-1), _nearest(1))
@@ -1370,7 +1386,9 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             self.candidate_marker.setVisible(False)
             return
         sr = float(sr) or 1.0
-        center_s = float(candidate.latency_center_samples) / sr
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        pre_samples = int(round(pre_offset_s * sr))
+        center_s = (float(candidate.latency_center_samples) - pre_samples) / sr
         self.candidate_line.setValue(center_s)
         self.candidate_line.setVisible(True)
         item = None
@@ -1381,7 +1399,7 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             sample = int(item[0] if isinstance(item, (tuple, list)) else item)
             if 0 <= sample < len(dpts_mag):
                 self.candidate_marker.setData(
-                    x=[sample / sr],
+                    x=[(sample - pre_samples) / sr],
                     y=[float(dpts_mag[sample])],
                     size=11,
                     symbol="o",
@@ -1446,8 +1464,10 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self._rebuild_aux_plots()
 
         sr = self._sampling_rate_hz()
-        duration_sec = erp.shape[-1] / sr
-        self.main_plot.setXRange(0, duration_sec, padding=0)
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        pre_samples = int(round(pre_offset_s * sr))
+        duration_sec = (erp.shape[-1] - pre_samples) / sr
+        self.main_plot.setXRange(-pre_offset_s, duration_sec, padding=0)
 
         # Scale to the sweep actually displayed instead of scanning the full
         # sweep history, which can be thousands of sweeps during a live session.
@@ -1681,7 +1701,9 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         dpts = erp[stimno]
         dpts_mag = dpts.magnitude if hasattr(dpts, "magnitude") else dpts
         sr = self._sampling_rate_hz()
-        x_sec = np.arange(len(dpts_mag)) / sr
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        pre_samples = int(round(pre_offset_s * sr))
+        x_sec = (np.arange(len(dpts_mag)) - pre_samples) / sr
 
         # Update waveform curve (lightweight)
         self.trace_curve.setData(x_sec, dpts_mag)
@@ -1726,8 +1748,10 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         if erp is None or len(erp) == 0:
             return
         sr = self._sampling_rate_hz()
-        duration_sec = erp.shape[-1] / sr
-        self.main_plot.setXRange(0, duration_sec, padding=0)
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        pre_samples = int(round(pre_offset_s * sr))
+        duration_sec = (erp.shape[-1] - pre_samples) / sr
+        self.main_plot.setXRange(-pre_offset_s, duration_sec, padding=0)
         erp_mag = erp.magnitude if hasattr(erp, "magnitude") else erp
         if getattr(erp_mag, "ndim", 1) == 2 and erp_mag.shape[0] > 0:
             stimno = max(0, min(int(self.state.stimno), erp_mag.shape[0] - 1)) if self.state else 0
@@ -1842,7 +1866,8 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         if np.isnan(pos.x()):
             return
         sr = float(self.state.sampling_rate) if self.state.sampling_rate is not None else 10000.0
-        sample_x = pos.x() * sr
+        pre_offset_s = getattr(self.state, "pre_offset_s", 0.0) if self.state else 0.0
+        sample_x = (pos.x() + pre_offset_s) * sr
         modifiers = (
             event.modifiers()
             if hasattr(event, "modifiers") and callable(event.modifiers)

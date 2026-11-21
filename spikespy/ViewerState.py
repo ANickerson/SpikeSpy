@@ -113,6 +113,7 @@ class tracked_neuron_unit:
     _consecutive_misses: int = 0
     _tracked_count: int = 0
     _template_matcher: Any = None
+    pre_offset_s: float = 0.0
 
     def __init__(
         self,
@@ -129,12 +130,14 @@ class tracked_neuron_unit:
         tracking_channel: str = "",
         tracking_algorithm: str = "basic",
         tracking_params: dict = None,
+        pre_offset_s: float = 0.0,
     ):
         self._cached_window = None
         self._cached_window_len = -1
         self._consecutive_misses = 0
         self._tracked_count = 0
         self._template_matcher = None
+        self.pre_offset_s = float(pre_offset_s or 0.0)
         self.tracking_params = (
             dict(tracking_params) if tracking_params is not None else {}
         )
@@ -235,13 +238,16 @@ class tracked_neuron_unit:
     def track_limit(self, val):
         self.tracking_track_limit = int(val)
 
-    def get_number_of_events(self, event_signal=None, window_size=None):
+    def get_number_of_events(self, event_signal=None, window_size=None, pre_offset_s=None):
         if self.event is not None and len(self.event) > 0:
             if (
                 event_signal is not None
                 and len(event_signal) > 0
                 and window_size is not None
             ):
+                if pre_offset_s is None:
+                    pre_offset_s = getattr(self, "pre_offset_s", 0.0)
+                pre_offset_s = float(pre_offset_s or 0.0)
                 ev_s = self.event.rescale(pq.s).magnitude
                 stim_s = event_signal.rescale(pq.s).magnitude
                 max_lat_s = float(
@@ -249,10 +255,11 @@ class tracked_neuron_unit:
                     if hasattr(window_size, "rescale")
                     else float(window_size)
                 )
-                idx_sweeps = np.searchsorted(stim_s, ev_s, side="right") - 1
+                stim_starts = stim_s - pre_offset_s
+                idx_sweeps = np.searchsorted(stim_starts, ev_s, side="right") - 1
                 valid_sw = (idx_sweeps >= 0) & (idx_sweeps < len(stim_s))
                 dt = ev_s[valid_sw] - stim_s[idx_sweeps[valid_sw]]
-                in_win = (dt >= 0) & (dt <= max_lat_s)
+                in_win = (dt >= -pre_offset_s - 1e-9) & (dt <= max_lat_s + 1e-9)
                 return int(len(np.unique(idx_sweeps[valid_sw][in_win])))
             return len(self.event)
         if self._idx_arr is not None:
@@ -300,12 +307,17 @@ class tracked_neuron_unit:
         event_signal: neo.Event,
         sampling_rate: float,
         window_size: pq.Quantity = None,
+        pre_offset_s: float = None,
     ) -> np.ndarray:
         """Returns a 1D float64 array of length len(event_signal) containing the spike latency
-        in samples for each sweep (np.nan where no valid spike exists within [0, window_size]).
+        in samples for each sweep (np.nan where no valid spike exists within [-pre_offset_s, window_size]).
         """
         if event_signal is None or len(event_signal) == 0:
             return np.empty(0, dtype=np.float64)
+
+        if pre_offset_s is None:
+            pre_offset_s = getattr(self, "pre_offset_s", 0.0)
+        pre_offset_s = float(pre_offset_s or 0.0)
 
         n_sweeps = len(event_signal)
         lat_samples = np.full(n_sweeps, np.nan, dtype=np.float64)
@@ -335,17 +347,18 @@ class tracked_neuron_unit:
             else float(sampling_rate)
         )
 
-        idx_sweeps = np.searchsorted(stim_s, ev_s, side="right") - 1
+        stim_starts = stim_s - pre_offset_s
+        idx_sweeps = np.searchsorted(stim_starts, ev_s, side="right") - 1
         valid_mask = (idx_sweeps >= 0) & (idx_sweeps < n_sweeps)
         if not np.any(valid_mask):
             return lat_samples
 
         sw = idx_sweeps[valid_mask]
         dt = ev_s[valid_mask] - stim_s[sw]
-        in_win = (dt >= 0) & (dt <= max_lat_s)
+        in_win = (dt >= -pre_offset_s - 1e-9) & (dt <= max_lat_s + 1e-9)
         sw_win = sw[in_win]
         dt_win = dt[in_win]
-        samp = np.round(dt_win * sr)
+        samp = np.round((dt_win + pre_offset_s) * sr)
 
         for s_idx, sample_val in zip(sw_win, samp):
             if np.isnan(lat_samples[s_idx]):
@@ -358,12 +371,13 @@ class tracked_neuron_unit:
         event_signal: neo.Event,
         sampling_rate: float,
         window_size: pq.Quantity = None,
+        pre_offset_s: float = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Returns (sweep_indices, sample_latencies) as 1D int64 arrays for all sweeps
-        that have a valid spike within [0, window_size].
+        that have a valid spike within [-pre_offset_s, window_size].
         """
         lat_samples = self.get_sweep_sample_latencies(
-            event_signal, sampling_rate, window_size
+            event_signal, sampling_rate, window_size, pre_offset_s=pre_offset_s
         )
         if len(lat_samples) == 0:
             return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64)
@@ -379,6 +393,7 @@ class tracked_neuron_unit:
         event_signal: neo.Event,
         sampling_rate: float,
         window_size: pq.Quantity = None,
+        pre_offset_s: float = None,
     ) -> Optional[int]:
         """Fast O(log N) lookup for a single stimno using np.searchsorted."""
         if (
@@ -389,6 +404,10 @@ class tracked_neuron_unit:
             or len(self.event) == 0
         ):
             return None
+
+        if pre_offset_s is None:
+            pre_offset_s = getattr(self, "pre_offset_s", 0.0)
+        pre_offset_s = float(pre_offset_s or 0.0)
 
         ev_s = (
             self.event.rescale(pq.s).magnitude
@@ -411,11 +430,11 @@ class tracked_neuron_unit:
             else float(sampling_rate)
         )
 
-        idx = np.searchsorted(ev_s, stim_ts)
+        idx = np.searchsorted(ev_s, stim_ts - pre_offset_s)
         if idx < len(ev_s):
             dt = ev_s[idx] - stim_ts
-            if 0 <= dt <= max_lat_s:
-                return int(np.round(dt * sr))
+            if -pre_offset_s - 1e-9 <= dt <= max_lat_s + 1e-9:
+                return int(np.round((dt + pre_offset_s) * sr))
 
         return None
 
@@ -424,12 +443,16 @@ class tracked_neuron_unit:
         if self.event is None or len(self.event) == 0:
             return p
         sr = float(signal_chan.sampling_rate.rescale(pq.Hz).magnitude)
-        sweeps, samples = self.get_valid_sweep_indices_and_samples(event_signal, sr)
+        sweeps, samples = self.get_valid_sweep_indices_and_samples(
+            event_signal, sr, pre_offset_s=getattr(self, "pre_offset_s", 0.0)
+        )
         for sw, sa in zip(sweeps, samples):
             p[sw] = (int(sa), 1)
         return p
 
-    def get_latencies(self, event_signal: pq.UnitTime) -> pq.UnitTime:
+    def get_latencies(
+        self, event_signal: pq.UnitTime, pre_offset_s: float = None
+    ) -> pq.UnitTime:
         """Returns the latencies of the events in the spikegroup in ms.
         If the event is not in the spikegroup, returns np.nan.
         """
@@ -438,13 +461,21 @@ class tracked_neuron_unit:
         if len(event_signal) == 0:
             return np.empty(0) * pq.ms
 
-        next_spikes = np.searchsorted(self.event.times, event_signal).magnitude
+        if pre_offset_s is None:
+            pre_offset_s = getattr(self, "pre_offset_s", 0.0)
+        pre_offset_s = float(pre_offset_s or 0.0)
+
+        stim_starts = (
+            np.asarray(event_signal) * event_signal.units
+            - (pre_offset_s * pq.s)
+        )
+        next_spikes = np.searchsorted(self.event.times, stim_starts).magnitude
         next_spikes = np.clip(next_spikes, 0, len(self.event.times) - 1)
         spike_times = self.event.times[next_spikes] - (
             np.asarray(event_signal) * event_signal.units
         )
         spike_times = spike_times.rescale(pq.ms)
-        spike_times[spike_times < (0 * pq.s)] = np.nan * pq.ms
+        spike_times[spike_times < (-pre_offset_s * 1000.0 * pq.ms - (1e-6 * pq.ms))] = np.nan * pq.ms
         return spike_times
 
     def get_sweeps(self, event_signal: pq.UnitTime) -> pq.UnitTime:
@@ -511,12 +542,14 @@ class tracked_neuron_unit:
             )
             ev_s = np.asarray(ev_s, dtype=np.float64).ravel()
             stim_s = np.asarray(stim_s, dtype=np.float64).ravel()
-            idx_sweeps = np.searchsorted(stim_s, ev_s, side="right") - 1
+            pre_offset_s = float(getattr(self, "pre_offset_s", 0.0) or 0.0)
+            stim_starts = stim_s - pre_offset_s
+            idx_sweeps = np.searchsorted(stim_starts, ev_s, side="right") - 1
             valid_mask = (idx_sweeps >= 0) & (idx_sweeps < len(stim_s))
             for sw, t_ev in zip(idx_sweeps[valid_mask], ev_s[valid_mask]):
                 sw_i = int(sw)
                 dt_ms = float((t_ev - stim_s[sw_i]) * 1000.0)
-                if dt_ms >= 0.0 and sw_i not in sweep_latencies_ms:
+                if dt_ms >= -pre_offset_s * 1000.0 - 1e-6 and sw_i not in sweep_latencies_ms:
                     sweep_latencies_ms[sw_i] = dt_ms
                 elif dt_ms >= 0.0 and sweep_latencies_ms.get(sw_i) is None:
                     sweep_latencies_ms[sw_i] = dt_ms
@@ -835,6 +868,29 @@ class ViewerState(QObject):
         if self._live_orchestrator is None:
             self._live_orchestrator = LiveOrchestrator(self)
         return self._live_orchestrator
+
+    @property
+    def pre_offset_s(self) -> float:
+        """Pre-stimulus window duration in seconds."""
+        return getattr(self, "_pre_offset_s", 0.0)
+
+    @pre_offset_s.setter
+    def pre_offset_s(self, val: float):
+        self._pre_offset_s = max(0.0, float(val or 0.0))
+        if hasattr(self, "live_config") and isinstance(self.live_config, dict):
+            self.live_config["pre_ms"] = self._pre_offset_s * 1000.0
+        if hasattr(self, "spike_groups") and self.spike_groups:
+            for sg in self.spike_groups:
+                sg.pre_offset_s = self._pre_offset_s
+
+    @property
+    def pre_stim_ms(self) -> float:
+        """Pre-stimulus window duration in milliseconds."""
+        return self.pre_offset_s * 1000.0
+
+    @pre_stim_ms.setter
+    def pre_stim_ms(self, val: float):
+        self.pre_offset_s = float(val or 0.0) / 1000.0
 
     @Slot(int, int, int)
     def _on_async_spike_tracked(self, unit_idx: int, detected_sample: int, stimno: int):
@@ -1576,13 +1632,21 @@ class ViewerState(QObject):
 
             self.save_undo(undo)
 
+        sr_val = (
+            float(self.sampling_rate.rescale(pq.Hz).magnitude)
+            if hasattr(self.sampling_rate, "rescale")
+            else float(self.sampling_rate or (self.analog_signal.sampling_rate.rescale(pq.Hz).magnitude if self.analog_signal is not None and hasattr(self.analog_signal.sampling_rate, "rescale") else 30000.0))
+        )
+        pre_samples = int(round(self.pre_offset_s * sr_val)) if self.pre_offset_s > 0 else 0
+
         if len(evt) > 0:
-            to_keep = (evt < self.event_signal[stimno]) | (
-                (evt > self.event_signal[stimno + 1])
+            sweep_start = self.event_signal[stimno] - (self.pre_offset_s * pq.s)
+            sweep_end = (
+                (self.event_signal[stimno + 1] - (self.pre_offset_s * pq.s))
                 if stimno < len(self.event_signal) - 1
-                else False
-            )  # Prevent crash on final index
-            # TODO: we should remove by index, and also use purely the timestamps not idx_arr
+                else (self.event_signal[stimno] + self.window_size)
+            )
+            to_keep = (evt < sweep_start) | (evt >= sweep_end)
             sg.event = evt[to_keep]
             evt = evt[to_keep]
 
@@ -1607,8 +1671,8 @@ class ViewerState(QObject):
                     )[0].rescale("s")
                     if prv_lat != np.nan:
                         latency = int(
-                            (prv_lat * self.analog_signal.sampling_rate).magnitude
-                        )
+                            (prv_lat * sr_val).magnitude if hasattr(prv_lat, "magnitude") else (prv_lat * sr_val)
+                        ) + pre_samples
                         break
             elif (
                 latency == -2
@@ -1619,16 +1683,17 @@ class ViewerState(QObject):
                 )[0].rescale("s")
                 if next_lat != np.nan:
                     latency = int(
-                        (next_lat * self.analog_signal.sampling_rate).magnitude
-                    )
+                        (next_lat * sr_val).magnitude if hasattr(next_lat, "magnitude") else (next_lat * sr_val)
+                    ) + pre_samples
 
             sg.idx_arr[stimno] = (
                 latency,
                 1,
-            )  # TODO: fix
+            )
+            rel_samples = latency - pre_samples
             evt2 = evt.merge(
                 Event(
-                    ((latency / self.analog_signal.sampling_rate).rescale(pq.s))
+                    (((rel_samples / sr_val) * pq.s).rescale(pq.s))
                     + self.event_signal[[stimno]],
                 )
             )
@@ -1649,15 +1714,15 @@ class ViewerState(QObject):
         # Emit onUnitAnnotated with unit details
         lat_samples = int(latency) if latency is not None and latency >= 0 else None
         lat_ms = (
-            float((latency / self.analog_signal.sampling_rate).rescale(pq.ms).magnitude)
-            if lat_samples is not None and self.analog_signal is not None
+            float((latency - pre_samples) / sr_val * 1000.0)
+            if lat_samples is not None
             else None
         )
         ts_s = (
             float(
                 (
                     self.event_signal[stimno]
-                    + (latency / self.analog_signal.sampling_rate)
+                    + (((latency - pre_samples) / self.analog_signal.sampling_rate) * pq.s if not hasattr(self.analog_signal.sampling_rate, "units") else ((latency - pre_samples) / self.analog_signal.sampling_rate))
                 )
                 .rescale(pq.s)
                 .magnitude
@@ -1791,8 +1856,12 @@ class ViewerState(QObject):
             dtype=np.float64,
         ).ravel()
 
+        pre_offset_s = float(getattr(self, "pre_offset_s", 0.0) or 0.0)
+        pre_samples = int(round(pre_offset_s * sr)) if pre_offset_s > 0 else 0
+
         if ev_s.size > 0:
-            ev_stim_idx = np.searchsorted(stim_s, ev_s, side="right") - 1
+            stim_starts = stim_s - pre_offset_s
+            ev_stim_idx = np.searchsorted(stim_starts, ev_s, side="right") - 1
             remove = np.zeros(len(stim_s), dtype=bool)
             remove[keys] = True
             keep = np.ones(ev_s.size, dtype=bool)
@@ -1803,7 +1872,7 @@ class ViewerState(QObject):
             keep_times = np.empty(0, dtype=np.float64)
 
         new_times = stim_s[keys] + (
-            np.asarray([samples[k] for k in keys], dtype=np.float64) / sr
+            (np.asarray([samples[k] for k in keys], dtype=np.float64) - pre_samples) / sr
         )
         all_times = np.sort(np.concatenate([keep_times, new_times]))
         new_event = Event(
@@ -2317,7 +2386,11 @@ class ViewerState(QObject):
         """
         convert arrays of stimno and offset to Event
         """
-        t = self.event_signal[stimno] + (offset / self.analog_signal.sampling_rate)
+        sr = self.sampling_rate if self.sampling_rate is not None else self.analog_signal.sampling_rate
+        sr_val = float(sr.rescale(pq.Hz).magnitude) if hasattr(sr, "rescale") else float(sr)
+        pre_offset = getattr(self, "pre_offset_s", 0.0)
+        pre_samples = int(round(pre_offset * sr_val))
+        t = self.event_signal[stimno] + (((offset - pre_samples) / sr_val) * pq.s)
         return Event(t)
 
     def get_latest_event_idx(self) -> Optional[int]:
@@ -3841,10 +3914,11 @@ class ViewerState(QObject):
 
         n_sweeps = len(self.event_signal)
         for sg in self.spike_groups:
+            sg.pre_offset_s = self.pre_offset_s
             p = [None for _ in range(n_sweeps)]
             if sg.event is not None and len(sg.event) > 0:
                 sweeps, samples = sg.get_valid_sweep_indices_and_samples(
-                    self.event_signal, sr, self.window_size
+                    self.event_signal, sr, self.window_size, pre_offset_s=self.pre_offset_s
                 )
                 for sw, sa in zip(sweeps, samples):
                     p[sw] = (int(sa), 1)
@@ -3865,19 +3939,7 @@ class ViewerState(QObject):
             and (signal is None or signal is self.analog_signal)
             and (event_signal is None or event_signal is self.event_signal)
         ):
-            if len(self._live_erp_buffer) > 0:
-                return self._live_erp_buffer.data
-            else:
-                num_samples = int(
-                    self.window_size.rescale(pq.s).magnitude
-                    * (self.sampling_rate or 30000)
-                )
-                units = (
-                    self.analog_signal.units
-                    if self.analog_signal is not None
-                    else pq.mV
-                )
-                return np.zeros((0, num_samples)) * units
+            return self._live_erp_buffer.data
 
         if (
             self.segment is None
@@ -4151,6 +4213,8 @@ class ViewerState(QObject):
         aux_channels: List[str] = None,
         channels: List[Union[int, str]] = None,
         resume: bool = False,
+        pre_ms: Optional[float] = None,
+        pre_stim_ms: Optional[float] = None,
     ):
         """
         Initializes a fresh live streaming session for real-time visualization and annotation.
@@ -4159,6 +4223,15 @@ class ViewerState(QObject):
         if resume and self.has_live_session():
             self.resume_live_session()
             return
+
+        chosen_pre_ms = (
+            pre_ms
+            if pre_ms is not None
+            else (pre_stim_ms if pre_stim_ms is not None else None)
+        )
+        if chosen_pre_ms is None and hasattr(self, "live_config") and isinstance(self.live_config, dict):
+            chosen_pre_ms = self.live_config.get("pre_ms", 0.0)
+        self.pre_offset_s = max(0.0, float(chosen_pre_ms or 0.0) / 1000.0)
 
         if channels:
             ch_names = []
@@ -4186,7 +4259,8 @@ class ViewerState(QObject):
         self.clear_candidates(emit=False)
         self._live_channel_signals = {}
         self._live_aux_erp_buffers = {}
-        window_samples = int(sampling_rate * window_size_ms / 1000.0)
+        total_window_ms = float(window_size_ms) + (self.pre_offset_s * 1000.0)
+        window_samples = int(round(sampling_rate * total_window_ms / 1000.0))
 
         for ch in self.active_channel_names:
             sig = MultiAnalogSignal()
@@ -4214,6 +4288,7 @@ class ViewerState(QObject):
 
         if self.spike_groups and len(self.spike_groups) > 0:
             for sg in self.spike_groups:
+                sg.pre_offset_s = self.pre_offset_s
                 sg.event = neo.Event(
                     np.array([], dtype=float) * pq.s,
                     name=sg.event.name,
@@ -4236,7 +4311,9 @@ class ViewerState(QObject):
             evt.annotations["unit"] = 0
             evt.annotations["notes"] = ""
             evt.annotations["fibre_type"] = ""
-            self.spike_groups = [tracked_neuron_unit(event=evt, idx_arr=[])]
+            self.spike_groups = [
+                tracked_neuron_unit(event=evt, idx_arr=[], pre_offset_s=self.pre_offset_s)
+            ]
             self.segment.events.append(evt)
 
         self.cur_spike_group = 0
@@ -4583,16 +4660,12 @@ class ViewerState(QObject):
                     and ch_name in self._live_aux_erp_buffers
                 ):
                     aux_buf = self._live_aux_erp_buffers[ch_name]
-                    erp_wave = ch_wave[pre_idx : pre_idx + aux_buf.window_samples]
-                    aux_buf.append_sweep(erp_wave)
+                    aux_buf.append_sweep(ch_wave)
                 elif (
                     ch_name == getattr(self.analog_signal, "name", "")
                     and self._live_erp_buffer is not None
                 ):
-                    erp_wave = ch_wave[
-                        pre_idx : pre_idx + self._live_erp_buffer.window_samples
-                    ]
-                    self._live_erp_buffer.append_sweep(erp_wave)
+                    self._live_erp_buffer.append_sweep(ch_wave)
 
             primary_waveform = (
                 sweep_waveform[0]
@@ -4629,20 +4702,16 @@ class ViewerState(QObject):
             elif isinstance(self.analog_signal, MultiAnalogSignal):
                 self.analog_signal.append_signal(sig_slice)
 
-            # Stimulus-locked ERP buffer starts at t=0 (offset by pre_idx)
+            # Stimulus-locked ERP buffer stores the full sweep waveform
             cur_ch_name = getattr(self.analog_signal, "name", "")
             if (
                 hasattr(self, "_live_aux_erp_buffers")
                 and cur_ch_name in self._live_aux_erp_buffers
             ):
                 aux_buf = self._live_aux_erp_buffers[cur_ch_name]
-                erp_wave = sweep_waveform[pre_idx : pre_idx + aux_buf.window_samples]
-                aux_buf.append_sweep(erp_wave)
+                aux_buf.append_sweep(sweep_waveform)
             elif self._live_erp_buffer is not None:
-                erp_wave = sweep_waveform[
-                    pre_idx : pre_idx + self._live_erp_buffer.window_samples
-                ]
-                self._live_erp_buffer.append_sweep(erp_wave)
+                self._live_erp_buffer.append_sweep(sweep_waveform)
 
             # Handle aux sweeps if any
             if aux_sweeps:
@@ -4687,8 +4756,7 @@ class ViewerState(QObject):
                             new_channels_added = True
 
                         aux_buf = self._live_aux_erp_buffers[aux_ch]
-                        erp_aux = aux_wave[pre_idx : pre_idx + aux_buf.window_samples]
-                        aux_buf.append_sweep(erp_aux)
+                        aux_buf.append_sweep(aux_wave)
                     if (
                         hasattr(self, "_live_channel_signals")
                         and aux_ch in self._live_channel_signals
@@ -4702,7 +4770,7 @@ class ViewerState(QObject):
                         )
                         self._live_channel_signals[aux_ch].append_signal(aux_sig)
 
-            primary_waveform = sweep_waveform[pre_idx:]
+            primary_waveform = sweep_waveform
 
         if new_channels_added and hasattr(self, "onChannelGroupsChanged"):
             self.onChannelGroupsChanged.emit()
@@ -4759,6 +4827,7 @@ class ViewerState(QObject):
                             fibre_type="C-fibre",
                             notes="",
                             idx_arr=[None] * (new_stim_idx + 1),
+                            pre_offset_s=self.pre_offset_s,
                         )
                         self.spike_groups.append(sg)
                         if self.segment is not None:
@@ -4776,7 +4845,8 @@ class ViewerState(QObject):
                             ).simplified.magnitude
                         )
                     )
-                    sg.idx_arr[new_stim_idx] = (lat_samples, 1)
+                    sample_idx = pre_idx + lat_samples
+                    sg.idx_arr[new_stim_idx] = (sample_idx, 1)
                     new_ev_times = (
                         np.append(sg.event.as_array(), spike_time.magnitude) * pq.s
                     )
