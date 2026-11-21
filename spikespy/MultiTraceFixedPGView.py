@@ -595,6 +595,20 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
             len(ug.event) if ug and hasattr(ug, "event") and ug.event is not None else 0
         )
         ug_idx = self.get_target_unit_idx()
+        candidate = (
+            self.state.get_active_candidate()
+            if hasattr(self.state, "get_active_candidate")
+            else None
+        )
+        candidate_key = (
+            (
+                int(candidate.candidate_id),
+                int(candidate.hit_count),
+                int(candidate.latency_center_samples),
+            )
+            if candidate is not None
+            else None
+        )
 
         render_key = (
             stimno,
@@ -609,6 +623,7 @@ class MultiTraceFixedPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWind
             y_axis_mode,
             time_window_s,
             post_seconds,
+            candidate_key,
         )
         if not force and getattr(self, "_last_render_key", None) == render_key:
             return

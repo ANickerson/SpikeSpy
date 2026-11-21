@@ -173,6 +173,22 @@ class ActiveUnitInfoView(QWidget):
         card_layout.addWidget(self.lbl_metrics)
         main_layout.addWidget(self.header_card)
 
+        # Quick Candidate Triage Bar (visible only when previewing an active candidate)
+        self.candidate_actions_widget = QWidget(self)
+        cand_act_layout = QHBoxLayout(self.candidate_actions_widget)
+        cand_act_layout.setContentsMargins(0, 0, 0, 0)
+        cand_act_layout.setSpacing(6)
+        self.btn_accept_candidate = QPushButton("✓ Accept Candidate", self.candidate_actions_widget)
+        self.btn_accept_candidate.setToolTip("Promote this candidate to a tracked unit")
+        self.btn_accept_candidate.clicked.connect(self._on_accept_candidate_clicked)
+        self.btn_discard_candidate = QPushButton("✕ Discard Candidate", self.candidate_actions_widget)
+        self.btn_discard_candidate.setToolTip("Discard this candidate proposal")
+        self.btn_discard_candidate.clicked.connect(self._on_discard_candidate_clicked)
+        cand_act_layout.addWidget(self.btn_accept_candidate, 1)
+        cand_act_layout.addWidget(self.btn_discard_candidate, 1)
+        self.candidate_actions_widget.setVisible(False)
+        main_layout.addWidget(self.candidate_actions_widget)
+
         # ------------------------------------------------------------------
         # 2. Identity & Metadata Section
         # ------------------------------------------------------------------
@@ -376,6 +392,8 @@ class ActiveUnitInfoView(QWidget):
                 "onNewSweep",
                 "onLoadNewFile",
                 "onChannelGroupsChanged",
+                "onCandidateSelectionChanged",
+                "onCandidatesChanged",
             ):
                 sig = getattr(self.state, sig_name, None)
                 if sig is not None and hasattr(sig, "connect"):
@@ -401,6 +419,18 @@ class ActiveUnitInfoView(QWidget):
     # ------------------------------------------------------------------
     # Target Unit Resolution & Settings Persistence
     # ------------------------------------------------------------------
+    def _get_active_candidate(self):
+        """Return the active CandidateUnit when following global active selection."""
+        if (
+            self.state is None
+            or self._pinned_unit_idx is not None
+            or self._target_unit_override is not None
+        ):
+            return None
+        if hasattr(self.state, "get_active_candidate"):
+            return self.state.get_active_candidate()
+        return None
+
     def set_target_unit(self, unit_idx: Optional[int]) -> None:
         """Point this panel at a view-bound unit index (or None to follow global)."""
         self._target_unit_override = (
@@ -857,12 +887,90 @@ class ActiveUnitInfoView(QWidget):
         ):
             w.setEnabled(enabled)
 
+    def _sync_from_candidate(self, cand) -> None:
+        self.candidate_actions_widget.setVisible(True)
+        self.lbl_color_swatch.setStyleSheet(
+            "background: #ffaa00; border: 1px solid rgba(0,0,0,0.3); border-radius: 4px;"
+        )
+        self.lbl_unit_title.setText(f"<b>Candidate: {cand.name}</b>")
+        self.lbl_health_badge.setText("CANDIDATE")
+        self.lbl_health_badge.setStyleSheet(
+            "background: #fef3c7; color: #92400e; border: 1px solid #f59e0b; "
+            "border-radius: 10px; padding: 2px 8px; font-weight: bold;"
+        )
+        sr = 30000.0
+        if self.state is not None and hasattr(self.state, "_candidate_sampling_rate"):
+            try:
+                sr = float(self.state._candidate_sampling_rate()) or 30000.0
+            except Exception:
+                sr = 30000.0
+        lat_ms = (float(getattr(cand, "latency_center_samples", 0.0) or 0.0) / sr) * 1000.0
+        ev = getattr(cand, "evidence", None)
+        jitter_ms = float(getattr(ev, "jitter_ms", 0.0) or 0.0)
+        snr = float(getattr(ev, "median_snr", 0.0) or 0.0)
+        self.lbl_metrics.setText(
+            f"N={int(cand.hit_count)}  |  Score: {float(cand.score):.2f}  |  "
+            f"Lat: {lat_ms:.1f} ms  |  Jitter: {jitter_ms:.2f} ms  |  SNR: {snr:.1f}"
+        )
+
+        # Allow editing identity (name/notes) while disabling unit-only tracking actions
+        self.grp_identity.setEnabled(True)
+        self.grp_channels.setEnabled(False)
+        self.grp_tracking.setEnabled(False)
+        self.btn_track_now.setEnabled(False)
+        self.btn_fill_missing.setEnabled(False)
+        self.btn_rebuild_template.setEnabled(False)
+
+        primary_ch = str(getattr(cand, "channel", "") or "")
+        neighbors_list = [
+            str(c) for c in (getattr(cand, "neighbor_channels", None) or []) if str(c).strip()
+        ]
+        self._refresh_primary_channel_combo(primary_ch)
+        self.lbl_neighbors.setText(
+            f"Neighbors: {', '.join(neighbors_list)}" if neighbors_list else "Neighbors: (none)"
+        )
+
+        with (
+            QSignalBlocker(self.edit_name),
+            QSignalBlocker(self.combo_fibre_type),
+            QSignalBlocker(self.edit_notes),
+            QSignalBlocker(self.chk_auto_track),
+            QSignalBlocker(self.combo_algorithm),
+            QSignalBlocker(self.spin_window_ms),
+            QSignalBlocker(self.spin_threshold_mv),
+            QSignalBlocker(self.spin_max_skips),
+            QSignalBlocker(self.spin_track_limit),
+        ):
+            self.edit_name.setText(str(cand.name or ""))
+            self.combo_fibre_type.setCurrentText("")
+            self.edit_notes.setText(str(cand.notes or ""))
+            self.chk_auto_track.setChecked(True)
+            algo = str(getattr(cand, "algorithm", "zscore") or "zscore")
+            algo_idx = self.combo_algorithm.findData(algo)
+            if algo_idx < 0:
+                self.refresh_algorithms()
+                algo_idx = self.combo_algorithm.findData(algo)
+            if algo_idx >= 0 and self.combo_algorithm.currentIndex() != algo_idx:
+                self.combo_algorithm.setCurrentIndex(algo_idx)
+            self._rebuild_extra_param_controls(algo)
+            self._write_extra_params(getattr(cand, "detector_params", {}) or {})
+            self.spin_window_ms.setValue(float(getattr(cand, "tracking_window_ms", 5.0)))
+            self.spin_threshold_mv.setValue(float(getattr(cand, "tracking_threshold_mv", 0.01)))
+            self.spin_max_skips.setValue(int(getattr(cand, "tracking_max_skips", 3)))
+            self.spin_track_limit.setValue(0)
+
     def sync_from_unit(self) -> None:
         if self._updating_ui:
             return
         self._syncing = True
         try:
             self._refresh_unit_combo()
+            cand = self._get_active_candidate()
+            if cand is not None:
+                self._sync_from_candidate(cand)
+                return
+
+            self.candidate_actions_widget.setVisible(False)
             unit_idx = self.get_target_unit_idx()
             sg = self.get_target_unit()
             self._apply_health_header(unit_idx, sg)
@@ -999,9 +1107,47 @@ class ActiveUnitInfoView(QWidget):
         self.sync_from_unit()
 
     @Slot()
+    def _on_accept_candidate_clicked(self) -> None:
+        if self.state is None:
+            return
+        cand = self._get_active_candidate()
+        if cand is not None and hasattr(self.state, "accept_candidate"):
+            self.state.accept_candidate(int(cand.candidate_id))
+
+    @Slot()
+    def _on_discard_candidate_clicked(self) -> None:
+        if self.state is None:
+            return
+        cand = self._get_active_candidate()
+        if cand is not None and hasattr(self.state, "discard_candidate"):
+            self.state.discard_candidate(int(cand.candidate_id))
+
+    @Slot()
     def _on_identity_changed(self, *args) -> None:
         if self._syncing or self.state is None:
             return
+        cand = self._get_active_candidate()
+        if cand is not None:
+            new_name = self.edit_name.text().strip()
+            new_notes = self.edit_notes.text()
+            self._updating_ui = True
+            try:
+                if new_name and new_name != cand.name:
+                    cand.name = new_name
+                    cand.name_edited = True
+                    if getattr(cand.unit, "event", None) is not None:
+                        cand.unit.event.name = new_name
+                if new_notes != cand.notes:
+                    cand.notes = new_notes
+                    cand.notes_edited = True
+                    cand.unit.notes = new_notes
+                self.lbl_unit_title.setText(f"<b>Candidate: {cand.name}</b>")
+                if hasattr(self.state, "onCandidatesChanged"):
+                    self.state.onCandidatesChanged.emit()
+            finally:
+                self._updating_ui = False
+            return
+
         unit_idx = self.get_target_unit_idx()
         sg = self.get_target_unit()
         if sg is None or unit_idx is None:

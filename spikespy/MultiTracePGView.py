@@ -832,6 +832,19 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         act_ld.setChecked(self.rightPlots.get("Latency Diff.", True))
         act_ld.triggered.connect(lambda checked: self.toggle_summary_graph("Latency Diff.", checked))
 
+        extra_channels = self._get_extra_summary_channels()
+        if extra_channels:
+            menu.addSeparator()
+            aux_header = menu.addAction("Auxiliary / Extra Channel Summaries:")
+            aux_header.setEnabled(False)
+            for ch in extra_channels:
+                act_aux = menu.addAction(self._format_extra_channel_label(ch))
+                act_aux.setCheckable(True)
+                act_aux.setChecked(bool(self._is_extra_summary_visible(ch)))
+                act_aux.triggered.connect(
+                    lambda checked=False, c=ch: self.set_plot_visible(c, checked)
+                )
+
         menu.addSeparator()
 
         stat_lbl = "Switch to Mean" if self.toggleMaxMeanButton.isChecked() else "Switch to Max"
@@ -854,8 +867,18 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     def toggle_summary_graph(self, key: str, visible: bool):
         """Toggle visibility of a specific summary line graph."""
         self.rightPlots[key] = visible
+        if visible and self.state is not None:
+            avail = self.state.get_available_channels() if hasattr(self.state, "get_available_channels") else []
+            if key in avail and key not in self.right_ax_data:
+                self._sync_right_axis_data(force=True)
         self.plot_right_axis()
         self.plotsChanged.emit()
+
+    def add_summary_channel(self, ch_name: str):
+        """Enable and display an auxiliary or extra channel as a right-axis summary line graph."""
+        if not ch_name:
+            return
+        self.set_plot_visible(ch_name, True)
 
     def open_settings_dialog(self):
         """Open settings dialog to configure which summary line graphs are displayed."""
@@ -868,10 +891,15 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             if ch and ch not in all_options:
                 all_options[ch] = True
 
+        if self.state is not None:
+            for ch in self._get_extra_summary_channels():
+                if ch not in all_options:
+                    all_options[ch] = self._is_extra_summary_visible(ch)
+
         if self.right_ax_data:
             for k in self.right_ax_data.keys():
                 if k not in all_options:
-                    all_options[k] = True
+                    all_options[k] = self._is_extra_summary_visible(k) if k not in set(self.displayed_channels) else True
 
         if self.settingsDialog is not None:
             try:
@@ -1453,6 +1481,82 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
     def _summary_stat_name(self) -> str:
         return "Max" if self.toggleMaxMeanButton.isChecked() else "Mean"
 
+    def _get_role_aux_channel_purposes(self) -> Dict[str, str]:
+        """Return mapping of mapped auxiliary AS channel names to their purpose string."""
+        purposes: Dict[str, str] = {}
+        if self.state is not None and hasattr(self.state, "get_channel_roles"):
+            try:
+                for role in self.state.get_channel_roles():
+                    if not isinstance(role, dict) or not role.get("enabled", True):
+                        continue
+                    probe_type = str(role.get("probe_type", "AS")).upper()
+                    purpose = str(role.get("purpose", "") or "")
+                    r_name = str(role.get("name") or role.get("target_name") or "")
+                    if r_name and probe_type == "AS" and purpose != "probe":
+                        purposes[r_name] = purpose
+            except Exception:
+                pass
+        return purposes
+
+    def _is_auxiliary_channel(self, ch_name: str) -> bool:
+        if not ch_name:
+            return False
+        if ch_name.startswith("env.") or ch_name.startswith("rec."):
+            return True
+        return ch_name in self._get_role_aux_channel_purposes()
+
+    def _get_extra_summary_channels(self) -> List[str]:
+        """Available channels (plus any calculated right_ax_data channels) not shown in displayed_channels."""
+        displayed = {c for c in self.displayed_channels if c}
+        reserved = {"Stim. Freq. (Hz)", "Latency Diff.", "__channel_summaries__"}
+        extras: List[str] = []
+        avail = (
+            list(self.state.get_available_channels())
+            if self.state is not None and hasattr(self.state, "get_available_channels")
+            else []
+        )
+        for ch in avail:
+            if ch and ch not in displayed and ch not in reserved and ch not in extras:
+                extras.append(ch)
+        for k in self.right_ax_data.keys():
+            if k and k not in displayed and k not in reserved and k not in extras:
+                extras.append(k)
+        return extras
+
+    def _format_extra_channel_label(self, ch_name: str) -> str:
+        purpose_labels = {
+            "thermode": "Thermode Temperature",
+            "potentiometer": "Potentiometer",
+            "stim_analog": "Stimulus Analog Trace",
+            "aux": "Auxiliary Analog",
+        }
+        purposes = self._get_role_aux_channel_purposes()
+        p = purposes.get(ch_name)
+        if not p:
+            if ch_name == "env.thermode":
+                p = "thermode"
+            elif ch_name == "env.potentiometer":
+                p = "potentiometer"
+            elif ch_name == "env.stim":
+                p = "stim_analog"
+        if p and p in purpose_labels:
+            return f"{ch_name} — {purpose_labels[p]}"
+        return ch_name
+
+    def _default_extra_summary_visible(self, ch_name: str) -> bool:
+        if not ch_name:
+            return False
+        if ch_name == "env.thermode":
+            return True
+        if self._get_role_aux_channel_purposes().get(ch_name) == "thermode":
+            return True
+        return False
+
+    def _is_extra_summary_visible(self, ch_name: str) -> bool:
+        if ch_name in self.rightPlots:
+            return bool(self.rightPlots[ch_name])
+        return self._default_extra_summary_visible(ch_name)
+
     def get_summary_plot_availability(self) -> Dict[str, bool]:
         """Return globally available summary plots mapped to their enabled state."""
         availability: Dict[str, bool] = {
@@ -1476,6 +1580,8 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             availability["Latency Diff."] = bool(
                 self.rightPlots.get("Latency Diff.", True)
             )
+        for ch in self._get_extra_summary_channels():
+            availability[ch] = bool(self._is_extra_summary_visible(ch))
         return availability
 
     def get_plot_specs(self) -> List[Dict[str, Any]]:
@@ -1547,8 +1653,29 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             "Stim. Freq. (Hz)": "Stimulus Frequency",
             "Latency Diff.": "Latency Difference",
         }
+        extra_set = set(self._get_extra_summary_channels())
+        stat_name = self._summary_stat_name()
         for key, is_enabled in self.get_summary_plot_availability().items():
             if key == "__channel_summaries__":
+                continue
+            if key in extra_set:
+                if not is_enabled:
+                    continue
+                specs.append(
+                    {
+                        "kind": "summary",
+                        "key": key,
+                        "slot_idx": None,
+                        "channel_name": key,
+                        "label": f"{self._format_extra_channel_label(key)} ({stat_name})",
+                        "has_data": bool(
+                            key in self.right_ax_data
+                            and len(self.right_ax_data[key][0]) > 0
+                        ),
+                        "visible": True,
+                        "is_channel_stat": True,
+                    }
+                )
                 continue
             specs.append(
                 {
@@ -1646,12 +1773,20 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         """Show or hide a summary plot."""
         if key == "__channel_summaries__":
             self.toggle_channel_summaries(visible)
-        elif (
-            key in ("Stim. Freq. (Hz)", "Latency Diff.")
-            or key in self.rightPlots
-            or key.startswith("__empty_slot_")
-        ):
-            self.toggle_summary_graph(key, visible)
+        else:
+            avail = (
+                self.state.get_available_channels()
+                if self.state is not None and hasattr(self.state, "get_available_channels")
+                else []
+            )
+            if (
+                key in ("Stim. Freq. (Hz)", "Latency Diff.")
+                or key in self.rightPlots
+                or key in avail
+                or key in self.right_ax_data
+                or key.startswith("__empty_slot_")
+            ):
+                self.toggle_summary_graph(key, visible)
         self.plotsChanged.emit()
 
     def _prompt_custom_channel(self):
@@ -1748,6 +1883,14 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             with QSignalBlocker(self.groupSizeSpinBox):
                 self.groupSizeSpinBox.setValue(self.group_size_n)
 
+        self.setup_figure()
+        self.reset_right_axes_data()
+        self.plotsChanged.emit()
+
+    @Slot()
+    def _on_channel_roles_or_groups_changed(self, *args):
+        if hasattr(self, "channel_bar") and self.channel_bar is not None:
+            self.channel_bar.refresh_channels()
         self.setup_figure()
         self.reset_right_axes_data()
         self.plotsChanged.emit()
@@ -2126,6 +2269,10 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
 
         if hasattr(self.state, "onChannelChange"):
             self._connect_state(self.state.onChannelChange, self._on_channel_change)
+        if hasattr(self.state, "onChannelRolesChanged"):
+            self._connect_state(self.state.onChannelRolesChanged, self._on_channel_roles_or_groups_changed)
+        if hasattr(self.state, "onChannelGroupsChanged"):
+            self._connect_state(self.state.onChannelGroupsChanged, self._on_channel_roles_or_groups_changed)
 
         # Live sweeps arrive through the state's LiveOrchestrator (LIFO);
         # the GUI-side throttle keeps render scheduling rate-limited.
@@ -2372,6 +2519,23 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
             sig_name = getattr(self.state.analog_signal, "name", None)
             if sig_name and sig_name not in names:
                 names.append(sig_name)
+
+        if self.state is not None:
+            avail = (
+                list(self.state.get_available_channels())
+                if hasattr(self.state, "get_available_channels")
+                else []
+            )
+            role_aux_names = set(self._get_role_aux_channel_purposes().keys())
+            for ch in avail:
+                if not ch or ch in names:
+                    continue
+                if ch.startswith("env.") or ch.startswith("rec.") or ch in role_aux_names:
+                    names.append(ch)
+            avail_set = set(avail)
+            for k, enabled in self.rightPlots.items():
+                if enabled and k in avail_set and k not in names:
+                    names.append(k)
         return names
     
     def _schedule_right_axis_update(self, force: bool = False):
@@ -2489,9 +2653,14 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         rdata = result.get("right_ax_data")
         if rdata:
             self.right_ax_data.update(rdata)
+            displayed_set = {c for c in self.displayed_channels if c}
+            reserved = {"Stim. Freq. (Hz)", "Latency Diff.", "__channel_summaries__"}
             for k in rdata.keys():
                 if k not in self.rightPlots:
-                    self.rightPlots[k] = True
+                    if k in displayed_set or k in reserved:
+                        self.rightPlots[k] = True
+                    else:
+                        self.rightPlots[k] = self._default_extra_summary_visible(k)
             self.plot_right_axis()
         
         # Spike groups handled by separate result
@@ -2504,9 +2673,14 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         self.right_ax_data = result
         
         # Update rightPlots dict
+        displayed_set = {c for c in self.displayed_channels if c}
+        reserved = {"Stim. Freq. (Hz)", "Latency Diff.", "__channel_summaries__"}
         for k in self.right_ax_data.keys():
             if k not in self.rightPlots:
-                self.rightPlots[k] = True
+                if k in displayed_set or k in reserved:
+                    self.rightPlots[k] = True
+                else:
+                    self.rightPlots[k] = self._default_extra_summary_visible(k)
         
         self.plot_right_axis()
     
@@ -3234,9 +3408,14 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                 data[ch_name] = (stat_arr, np.arange(len(stat_arr)))
 
         self.right_ax_data = data
+        displayed_set = {c for c in self.displayed_channels if c}
+        reserved = {"Stim. Freq. (Hz)", "Latency Diff.", "__channel_summaries__"}
         for k in data.keys():
             if k not in self.rightPlots:
-                self.rightPlots[k] = True
+                if k in displayed_set or k in reserved:
+                    self.rightPlots[k] = True
+                else:
+                    self.rightPlots[k] = self._default_extra_summary_visible(k)
 
     def reset_right_axes_data(self):
         """Recompute right axis summary data and schedule background updates."""
@@ -3311,6 +3490,32 @@ class MultiTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
                         "has_data": True,
                         "xy_data": xy_data,
                     })
+
+        # C) Auxiliary / Extra channel summary graphs (channels not in displayed_channels)
+        for ch_name in self._get_extra_summary_channels():
+            if not self._is_extra_summary_visible(ch_name):
+                continue
+            xy_data = self.right_ax_data.get(ch_name)
+            if xy_data is None or len(xy_data[0]) == 0:
+                # Try computing on-demand if newly enabled
+                ch_stats = self._extract_channel_row_stats([ch_name], self.toggleMaxMeanButton.isChecked())
+                stat_arr = ch_stats.get(ch_name)
+                if stat_arr is not None and len(stat_arr) > 0:
+                    xy_data = (stat_arr, np.arange(len(stat_arr)))
+                    self.right_ax_data[ch_name] = xy_data
+            has_data = xy_data is not None and len(xy_data[0]) > 0
+            label = f"{self._format_extra_channel_label(ch_name)} ({stat_name})"
+            axis_label = f"{ch_name} ({stat_name})" if has_data else f"{ch_name} (No data)"
+            active_summary_specs.append({
+                "key": ch_name,
+                "label": label,
+                "axis_label": axis_label,
+                "is_channel": True,
+                "slot_idx": None,
+                "channel_name": ch_name,
+                "has_data": has_data,
+                "xy_data": xy_data,
+            })
 
         start_col = len(self.channel_panels)
         if not active_summary_specs:

@@ -4,6 +4,7 @@ from dataclasses import asdict
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import QSignalBlocker, Qt, Slot
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -208,6 +209,62 @@ class SpikeProposalConfigView(QWidget):
         root_layout.addWidget(self.lbl_scan_status)
 
         # ------------------------------------------------------------------
+        # Proposed Candidates Summary & Quick Triage (always visible)
+        # ------------------------------------------------------------------
+        self.grp_candidates_preview = QGroupBox(
+            "Proposed Candidates (Click to Inspect as Current Unit)", self
+        )
+        cand_layout = QVBoxLayout(self.grp_candidates_preview)
+        cand_layout.setContentsMargins(8, 8, 8, 8)
+        cand_layout.setSpacing(6)
+
+        self.list_candidates = QListWidget(self.grp_candidates_preview)
+        self.list_candidates.setMinimumHeight(96)
+        self.list_candidates.setMaximumHeight(180)
+        self.list_candidates.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Preferred
+        )
+        self.list_candidates.setToolTip(
+            "Click a candidate to display it as the current unit across all views. Press Delete to discard."
+        )
+        self.list_candidates.currentItemChanged.connect(
+            self._on_candidate_item_selected
+        )
+        self.list_candidates.itemClicked.connect(self._on_candidate_item_clicked)
+        cand_layout.addWidget(self.list_candidates)
+
+        self._shortcut_delete_candidate = QShortcut(
+            QKeySequence(Qt.Key_Delete), self.list_candidates
+        )
+        self._shortcut_delete_candidate.setContext(Qt.WidgetWithChildrenShortcut)
+        self._shortcut_delete_candidate.activated.connect(
+            self._on_discard_selected_clicked
+        )
+        self._shortcut_backspace_candidate = QShortcut(
+            QKeySequence(Qt.Key_Backspace), self.list_candidates
+        )
+        self._shortcut_backspace_candidate.setContext(Qt.WidgetWithChildrenShortcut)
+        self._shortcut_backspace_candidate.activated.connect(
+            self._on_discard_selected_clicked
+        )
+
+        triage_row = QHBoxLayout()
+        triage_row.setSpacing(6)
+        self.btn_accept_candidate = QPushButton(
+            "✓ Accept Selected", self.grp_candidates_preview
+        )
+        self.btn_accept_candidate.clicked.connect(self._on_accept_selected_clicked)
+        self.btn_discard_candidate = QPushButton(
+            "✕ Discard Selected", self.grp_candidates_preview
+        )
+        self.btn_discard_candidate.clicked.connect(self._on_discard_selected_clicked)
+        triage_row.addWidget(self.btn_accept_candidate)
+        triage_row.addWidget(self.btn_discard_candidate)
+        triage_row.addStretch(1)
+        cand_layout.addLayout(triage_row)
+        root_layout.addWidget(self.grp_candidates_preview)
+
+        # ------------------------------------------------------------------
         # Scrollable Configuration Body
         # ------------------------------------------------------------------
         scroll = QScrollArea(self)
@@ -217,6 +274,53 @@ class SpikeProposalConfigView(QWidget):
         body_layout = QVBoxLayout(scroll_content)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(6)
+
+        # 0. Channels to Scan
+        self.grp_scan_channels = QGroupBox("Channels to Scan", scroll_content)
+        ch_layout = QVBoxLayout(self.grp_scan_channels)
+        ch_layout.setContentsMargins(8, 8, 8, 8)
+        ch_layout.setSpacing(4)
+
+        ch_ctrl_row = QHBoxLayout()
+        ch_ctrl_row.setSpacing(6)
+        self.chk_scan_use_active_channels = QCheckBox(
+            "Use Active Channels (Auto)", self.grp_scan_channels
+        )
+        self.chk_scan_use_active_channels.setToolTip(
+            "When checked, automatically scan the currently active channels. "
+            "Uncheck or toggle individual channels below to scan specific channels."
+        )
+        self.chk_scan_use_active_channels.toggled.connect(
+            self._on_scan_use_active_toggled
+        )
+        ch_ctrl_row.addWidget(self.chk_scan_use_active_channels)
+
+        self.btn_scan_channels_all = QPushButton("All", self.grp_scan_channels)
+        self.btn_scan_channels_all.setToolTip("Select all available channels to scan")
+        self.btn_scan_channels_all.clicked.connect(self._on_scan_channels_all_clicked)
+        ch_ctrl_row.addWidget(self.btn_scan_channels_all)
+
+        self.btn_scan_channels_none = QPushButton("None", self.grp_scan_channels)
+        self.btn_scan_channels_none.setToolTip("Uncheck all channels")
+        self.btn_scan_channels_none.clicked.connect(self._on_scan_channels_none_clicked)
+        ch_ctrl_row.addWidget(self.btn_scan_channels_none)
+        ch_ctrl_row.addStretch(1)
+        ch_layout.addLayout(ch_ctrl_row)
+
+        self.lbl_scan_channels_summary = QLabel("Scanning: Auto", self.grp_scan_channels)
+        self.lbl_scan_channels_summary.setStyleSheet("color: #475569; font-size: 11px;")
+        ch_layout.addWidget(self.lbl_scan_channels_summary)
+
+        self.list_scan_channels = QListWidget(self.grp_scan_channels)
+        self.list_scan_channels.setMinimumHeight(72)
+        self.list_scan_channels.setMaximumHeight(130)
+        self.list_scan_channels.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Preferred
+        )
+        self.list_scan_channels.itemChanged.connect(self._on_scan_channel_item_changed)
+        ch_layout.addWidget(self.list_scan_channels)
+
+        body_layout.addWidget(self.grp_scan_channels)
 
         # 1. Spike Proposal Algorithm & Detector Parameters
         self.grp_algorithm = QGroupBox(
@@ -416,41 +520,6 @@ class SpikeProposalConfigView(QWidget):
             spin.valueChanged.connect(self._on_config_control_changed)
 
         body_layout.addWidget(self.grp_live_cadence)
-
-        # 5. Proposed Candidates Summary & Quick Triage
-        self.grp_candidates_preview = QGroupBox(
-            "5. Proposed Candidates Summary & Quick Triage", scroll_content
-        )
-        cand_layout = QVBoxLayout(self.grp_candidates_preview)
-        cand_layout.setContentsMargins(8, 8, 8, 8)
-        cand_layout.setSpacing(6)
-
-        self.list_candidates = QListWidget(self.grp_candidates_preview)
-        self.list_candidates.setMinimumHeight(110)
-        self.list_candidates.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Preferred
-        )
-        self.list_candidates.currentItemChanged.connect(
-            self._on_candidate_item_selected
-        )
-        cand_layout.addWidget(self.list_candidates)
-
-        triage_row = QHBoxLayout()
-        triage_row.setSpacing(6)
-        self.btn_accept_candidate = QPushButton(
-            "✓ Accept Selected", self.grp_candidates_preview
-        )
-        self.btn_accept_candidate.clicked.connect(self._on_accept_selected_clicked)
-        self.btn_discard_candidate = QPushButton(
-            "✕ Discard Selected", self.grp_candidates_preview
-        )
-        self.btn_discard_candidate.clicked.connect(self._on_discard_selected_clicked)
-        triage_row.addWidget(self.btn_accept_candidate)
-        triage_row.addWidget(self.btn_discard_candidate)
-        triage_row.addStretch(1)
-        cand_layout.addLayout(triage_row)
-
-        body_layout.addWidget(self.grp_candidates_preview)
         body_layout.addStretch(1)
 
         scroll.setWidget(scroll_content)
@@ -538,6 +607,8 @@ class SpikeProposalConfigView(QWidget):
                 ("onCandidateSelectionChanged", self._on_candidate_selection_changed),
                 ("onCandidateScanStateChanged", self._on_scan_state_changed),
                 ("onStreamStateChanged", self._on_stream_state_changed),
+                ("onLoadNewFile", self._on_channels_changed),
+                ("onChannelChange", self._on_channels_changed),
             ]
             for sig_name, slot in mappings:
                 sig = getattr(self.state, sig_name, None)
@@ -743,10 +814,94 @@ class SpikeProposalConfigView(QWidget):
             with QSignalBlocker(self.spin_max_scan_sweeps):
                 self.spin_max_scan_sweeps.setValue(int(cfg.max_scan_sweeps))
 
+            self._refresh_scan_channels_list()
             self._refresh_candidates_list()
             self._update_status_label()
         finally:
             self._syncing = False
+
+    def _selected_scan_channels(self) -> List[str]:
+        if self.chk_scan_use_active_channels.isChecked():
+            return []
+        selected: List[str] = []
+        for row in range(self.list_scan_channels.count()):
+            item = self.list_scan_channels.item(row)
+            if item is not None and item.checkState() == Qt.Checked:
+                ch = str(item.data(Qt.UserRole) or item.text() or "").strip()
+                if ch:
+                    selected.append(ch)
+        return selected
+
+    def _update_scan_channels_summary(self) -> None:
+        if self.chk_scan_use_active_channels.isChecked():
+            active = (
+                list(self.state._candidate_scan_channels())
+                if self.state is not None and hasattr(self.state, "_candidate_scan_channels")
+                else []
+            )
+            if active:
+                preview = ", ".join(active[:4])
+                if len(active) > 4:
+                    preview += f", +{len(active) - 4} more"
+                self.lbl_scan_channels_summary.setText(f"Scanning: Auto ({preview})")
+            else:
+                self.lbl_scan_channels_summary.setText("Scanning: Auto (Active Channels)")
+        else:
+            sel = self._selected_scan_channels()
+            total = self.list_scan_channels.count()
+            if sel:
+                preview = ", ".join(sel[:4])
+                if len(sel) > 4:
+                    preview += f", +{len(sel) - 4} more"
+                self.lbl_scan_channels_summary.setText(
+                    f"Scanning: {len(sel)} of {total} channels ({preview})"
+                )
+            else:
+                self.lbl_scan_channels_summary.setText(
+                    "Scanning: None selected (check channels below or enable Auto)"
+                )
+
+    def _refresh_scan_channels_list(self) -> None:
+        avail: List[str] = []
+        configured: List[str] = []
+        active_default: List[str] = []
+        if self.state is not None:
+            if hasattr(self.state, "get_available_channels"):
+                try:
+                    avail = [str(c) for c in (self.state.get_available_channels() or []) if str(c).strip()]
+                except Exception:
+                    avail = []
+            configured = [
+                str(c).strip()
+                for c in (getattr(self.state.candidate_config, "scan_channels", None) or [])
+                if str(c).strip()
+            ]
+            if hasattr(self.state, "_candidate_scan_channels"):
+                try:
+                    active_default = list(self.state._candidate_scan_channels())
+                except Exception:
+                    active_default = []
+
+        use_auto = len(configured) == 0
+        checked_set = set(active_default if use_auto else configured)
+        all_channels = list(avail)
+        for ch in configured:
+            if ch not in all_channels:
+                all_channels.append(ch)
+
+        with QSignalBlocker(self.chk_scan_use_active_channels):
+            self.chk_scan_use_active_channels.setChecked(use_auto)
+
+        with QSignalBlocker(self.list_scan_channels):
+            self.list_scan_channels.clear()
+            for ch in all_channels:
+                item = QListWidgetItem(ch)
+                item.setData(Qt.UserRole, ch)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if ch in checked_set else Qt.Unchecked)
+                self.list_scan_channels.addItem(item)
+
+        self._update_scan_channels_summary()
 
     def _refresh_candidates_list(self) -> None:
         if self.state is None:
@@ -822,6 +977,7 @@ class SpikeProposalConfigView(QWidget):
         return {
             "algorithm": self._selected_algorithm(),
             "enabled_algorithms": enabled,
+            "scan_channels": self._selected_scan_channels(),
             "detector_params": existing_params,
             "template_refine": bool(self.chk_template_refine.isChecked()),
             "template_corr_threshold": float(self.spin_template_corr.value()),
@@ -972,6 +1128,68 @@ class SpikeProposalConfigView(QWidget):
             return
         self._push_config_to_state()
 
+    @Slot(bool)
+    def _on_scan_use_active_toggled(self, checked: bool) -> None:
+        if self._syncing:
+            return
+        if checked:
+            self._push_config_to_state()
+            self._refresh_scan_channels_list()
+        else:
+            self._push_config_to_state()
+            self._update_scan_channels_summary()
+
+    @Slot()
+    def _on_scan_channels_all_clicked(self) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            with QSignalBlocker(self.chk_scan_use_active_channels):
+                self.chk_scan_use_active_channels.setChecked(False)
+            with QSignalBlocker(self.list_scan_channels):
+                for row in range(self.list_scan_channels.count()):
+                    item = self.list_scan_channels.item(row)
+                    if item is not None:
+                        item.setCheckState(Qt.Checked)
+        finally:
+            self._syncing = False
+        self._push_config_to_state()
+        self._update_scan_channels_summary()
+
+    @Slot()
+    def _on_scan_channels_none_clicked(self) -> None:
+        if self._syncing:
+            return
+        self._syncing = True
+        try:
+            with QSignalBlocker(self.chk_scan_use_active_channels):
+                self.chk_scan_use_active_channels.setChecked(False)
+            with QSignalBlocker(self.list_scan_channels):
+                for row in range(self.list_scan_channels.count()):
+                    item = self.list_scan_channels.item(row)
+                    if item is not None:
+                        item.setCheckState(Qt.Unchecked)
+        finally:
+            self._syncing = False
+        self._push_config_to_state()
+        self._update_scan_channels_summary()
+
+    @Slot(QListWidgetItem)
+    def _on_scan_channel_item_changed(self, _item: Optional[QListWidgetItem] = None) -> None:
+        if self._syncing:
+            return
+        with QSignalBlocker(self.chk_scan_use_active_channels):
+            self.chk_scan_use_active_channels.setChecked(False)
+        self._push_config_to_state()
+        self._update_scan_channels_summary()
+
+    @Slot()
+    @Slot(str)
+    def _on_channels_changed(self, *args) -> None:
+        if not self._syncing:
+            self._refresh_scan_channels_list()
+
     def _selected_candidate_id(self) -> Optional[int]:
         item = self.list_candidates.currentItem()
         if item is not None:
@@ -982,15 +1200,22 @@ class SpikeProposalConfigView(QWidget):
             return int(self.state.active_candidate_id)
         return None
 
-    @Slot()
-    def _on_candidate_item_selected(self, current: Optional[QListWidgetItem], _prev=None) -> None:
+    def _activate_candidate_item(self, item: Optional[QListWidgetItem]) -> None:
         if self._syncing or self.state is None:
             return
-        cid = current.data(Qt.UserRole) if current is not None else None
+        cid = item.data(Qt.UserRole) if item is not None else None
         self.state.set_active_candidate(int(cid) if cid is not None else None)
         has_sel = cid is not None
         self.btn_accept_candidate.setEnabled(has_sel)
         self.btn_discard_candidate.setEnabled(has_sel)
+
+    @Slot()
+    def _on_candidate_item_selected(self, current: Optional[QListWidgetItem], _prev=None) -> None:
+        self._activate_candidate_item(current)
+
+    @Slot(QListWidgetItem)
+    def _on_candidate_item_clicked(self, item: Optional[QListWidgetItem]) -> None:
+        self._activate_candidate_item(item)
 
     @Slot()
     def _on_accept_selected_clicked(self) -> None:
@@ -1005,8 +1230,15 @@ class SpikeProposalConfigView(QWidget):
         if self.state is None:
             return
         cid = self._selected_candidate_id()
-        if cid is not None:
-            self.state.discard_candidate(cid)
+        if cid is None:
+            return
+        prev_row = self.list_candidates.currentRow()
+        self.state.discard_candidate(cid)
+        # Auto-advance to the next candidate for rapid assessment & removal
+        remaining = self.list_candidates.count()
+        if remaining > 0 and prev_row >= 0:
+            next_row = min(prev_row, remaining - 1)
+            self.list_candidates.setCurrentRow(next_row)
 
     @Slot()
     def _on_state_config_changed(self) -> None:
@@ -1050,6 +1282,7 @@ class SpikeProposalConfigView(QWidget):
                 if self.state is not None
                 else False
             )
+        self._refresh_scan_channels_list()
 
     # ------------------------------------------------------------------
     # Perspective Settings Persistence

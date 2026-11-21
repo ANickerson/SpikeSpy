@@ -315,6 +315,14 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow
                 self._connect_state(self.state.onChannelGroupsChanged, self._on_state_reset)
             if hasattr(self.state, "onChannelChange"):
                 self._connect_state(self.state.onChannelChange, self._on_channel_change)
+            if hasattr(self.state, "onCandidateSelectionChanged"):
+                self._connect_state(
+                    self.state.onCandidateSelectionChanged, self._on_candidate_change
+                )
+            if hasattr(self.state, "onCandidatesChanged"):
+                self._connect_state(
+                    self.state.onCandidatesChanged, self._on_candidate_change
+                )
             if hasattr(self.state, "onNewSweep"):
                 self._register_live_frames(
                     self.state,
@@ -323,6 +331,14 @@ class UnitFootprintPGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow
             if hasattr(self.state, "onUIRefreshRateChange") and hasattr(self, "render_timer"):
                 self.render_timer.setInterval(self.state.get_ui_refresh_rate_ms())
                 self._connect_state(self.state.onUIRefreshRateChange, self.render_timer.setInterval)
+        self.update_window_title()
+        self.update_plot()
+
+    @Slot()
+    @Slot(int)
+    def _on_candidate_change(self, *args):
+        if hasattr(self, "channel_bar") and self.channel_bar is not None and self.channel_bar.is_unit_locked():
+            return
         self.update_window_title()
         self.update_plot()
 

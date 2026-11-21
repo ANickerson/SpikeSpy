@@ -66,6 +66,7 @@ class CandidateScanConfig:
     algorithm: str = "zscore"
     detector_params: Dict[str, Any] = field(default_factory=dict)
     enabled_algorithms: List[str] = field(default_factory=list)
+    scan_channels: List[str] = field(default_factory=list)
     template_refine: bool = True
     template_corr_threshold: float = 0.35
     max_template_refine_sweeps: int = 2000

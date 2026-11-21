@@ -198,6 +198,15 @@ class MultiTracePlotManager(QWidget):
                 self._connections.append((unit_list_changed, self.refresh))
             except (TypeError, RuntimeError):
                 pass
+        roles_changed = (
+            getattr(state, "onChannelRolesChanged", None) if state is not None else None
+        )
+        if roles_changed is not None:
+            try:
+                roles_changed.connect(self.refresh)
+                self._connections.append((roles_changed, self.refresh))
+            except (TypeError, RuntimeError):
+                pass
 
     def _disconnect_view(self):
         for sig, slot in self._connections:
@@ -338,11 +347,11 @@ class MultiTracePlotManager(QWidget):
             is_channel = spec.get("kind") == "channel"
             is_channel_stat = bool(spec.get("is_channel_stat"))
 
-            self._populate_channel_combo(spec, allow_edit=is_channel or is_channel_stat)
+            self._populate_channel_combo(spec, allow_edit=is_channel or (is_channel_stat and spec.get("slot_idx") is not None))
             self._set_row_visible(
                 self.lbl_channel,
                 self.combo_channel,
-                is_channel or is_channel_stat,
+                is_channel or (is_channel_stat and spec.get("slot_idx") is not None),
             )
             self._set_row_visible(self.lbl_visible, self.chk_visible, not is_channel)
             self.chk_visible.setChecked(bool(spec.get("visible", True)))
@@ -524,7 +533,13 @@ class MultiTracePlotManager(QWidget):
             for key, enabled in availability.items():
                 if key == "__channel_summaries__":
                     continue
-                act = menu.addAction(labels.get(key, key))
+                if key in labels:
+                    text = labels[key]
+                elif hasattr(view, "_format_extra_channel_label"):
+                    text = view._format_extra_channel_label(key)
+                else:
+                    text = key
+                act = menu.addAction(text)
                 act.setCheckable(True)
                 act.setChecked(bool(enabled))
                 act.triggered.connect(

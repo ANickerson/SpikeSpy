@@ -474,11 +474,20 @@ def test_layout_presets_and_named_perspectives(qtbot, mock_multichannel_state):
     assert "MyNamedPerspective" in spy.dock_manager.perspectiveNames()
 
     spy.clear_dock_area()
-    assert len(spy.dock_manager.dockWidgets()) == 0
+    workspace_docks = [
+        dw for dw in spy.dock_manager.dockWidgets()
+        if not spy._is_permanent_sidebar_dock(dw)
+    ]
+    assert len(workspace_docks) == 0
+    assert len(spy._permanent_sidebar_docks) == 4
 
     ok = spy.load_perspective("MyNamedPerspective")
     assert ok is True
-    assert len(spy.dock_manager.dockWidgets()) >= 2
+    loaded_workspace_docks = [
+        dw for dw in spy.dock_manager.dockWidgets()
+        if not spy._is_permanent_sidebar_dock(dw)
+    ]
+    assert len(loaded_workspace_docks) >= 2
 
 
 def test_simplified_channel_selector_and_unit_detected_vs_assigned(qtbot, mock_multichannel_state):

@@ -37,7 +37,11 @@ from neo.core.objectlist import ObjectList
 from .APTrack_experiment_import import (
     process_folder as open_aptrack,
     APTrackRecording,
+    ChannelRoleSpec,
     TypeID,
+    get_default_channel_roles,
+    normalize_channel_roles,
+    preprocess_segment_with_roles,
 )
 from .NeoOpenEphyisIO import open_ephys_to_neo
 from .io_manager import (
@@ -723,6 +727,7 @@ class ViewerState(QObject):
     onSharedVisualSettingsChanged = Signal(str, dict)
     onProtocolMarkersChanged = Signal()
     onLiveConfigChanged = Signal()
+    onChannelRolesChanged = Signal()
 
     @staticmethod
     def _default_visual_settings() -> Dict[str, Any]:
@@ -742,6 +747,9 @@ class ViewerState(QObject):
         self._file_load_worker = None
         self._file_load_progress = None
         self._file_load_cancelled = False
+        self._loaded_file_path: Optional[str] = None
+        self._loaded_file_type: Optional[str] = None
+        self._last_aptrack_config: Optional[Dict[str, Any]] = None
 
         self.segment: neo.Segment = segment
         self.spike_groups: List[tracked_neuron_unit] = spike_groups or []
@@ -761,6 +769,12 @@ class ViewerState(QObject):
         self.MAX_UNDO = 10
         self.title = ""
         self.ui_refresh_rate_ms: int = 33  # ~30 FPS
+
+        # Channel roles & preprocessing configuration
+        self.channel_roles: List[Dict[str, Any]] = [
+            r.to_dict() for r in get_default_channel_roles()
+        ]
+        self._channel_roles_customized: bool = False
 
         # Channel groups storage: name -> list of channel names
         self.channel_groups: dict = {}
@@ -814,6 +828,7 @@ class ViewerState(QObject):
             "sync_annotations": True,
             "live_disk_cache": bool(getattr(self, "live_disk_cache", True)),
             "ui_refresh_rate_ms": int(getattr(self, "ui_refresh_rate_ms", 33)),
+            "channel_roles": [dict(r) for r in self.channel_roles],
         }
         self._live_frame_timer = None
         self._live_frame_pending_idx = None
@@ -953,8 +968,11 @@ class ViewerState(QObject):
 
         changed = False
         refresh_rate_updated = False
+        roles_updated = False
         for k, v in kwargs.items():
-            if k in int_keys:
+            if k == "channel_roles":
+                coerced = [r.to_dict() for r in normalize_channel_roles(v)]
+            elif k in int_keys:
                 coerced = int(v)
             elif k in float_keys:
                 coerced = float(v)
@@ -980,13 +998,300 @@ class ViewerState(QObject):
                     self.live_disk_cache = bool(coerced)
                 elif k == "ui_refresh_rate_ms":
                     refresh_rate_updated = True
+                elif k == "channel_roles":
+                    self.channel_roles = [dict(r) for r in coerced]
+                    self._channel_roles_customized = True
+                    self.live_config["channel_roles_customized"] = True
+                    roles_updated = True
 
         if refresh_rate_updated:
             self.set_ui_refresh_rate_ms(int(self.live_config["ui_refresh_rate_ms"]))
 
+        if roles_updated:
+            self.onChannelRolesChanged.emit()
+
         if changed:
             self.onLiveConfigChanged.emit()
         return changed
+
+    def get_channel_roles(self) -> List[Dict[str, Any]]:
+        return [dict(r) for r in getattr(self, "channel_roles", [])]
+
+    def _sync_roles_to_live_config(self, norm_roles: List[ChannelRoleSpec]):
+        for role in norm_roles:
+            if not role.enabled:
+                continue
+            if role.purpose == "probe":
+                self.live_config["online_filter"] = bool(role.bandpass)
+                self.live_config["filter_low_hz"] = float(role.bandpass_low)
+                self.live_config["filter_high_hz"] = float(role.bandpass_high)
+            elif role.purpose == "stim_trigger":
+                if role.ttl_threshold is not None and role.ttl_threshold > 0:
+                    self.live_config["ttl_threshold_v"] = float(role.ttl_threshold)
+                self.live_config["ttl_refractory_ms"] = float(role.ttl_refractory_ms)
+
+    def set_channel_roles(
+        self,
+        roles,
+        apply_preprocess: bool = False,
+        reload_if_aptrack: bool = False,
+    ) -> bool:
+        norm_roles = normalize_channel_roles(roles)
+        role_dicts = [r.to_dict() for r in norm_roles]
+        self.channel_roles = role_dicts
+        self._channel_roles_customized = True
+        self.live_config["channel_roles"] = [dict(r) for r in role_dicts]
+        self.live_config["channel_roles_customized"] = True
+        self._sync_roles_to_live_config(norm_roles)
+
+        self.onChannelRolesChanged.emit()
+        self.onLiveConfigChanged.emit()
+
+        if (
+            reload_if_aptrack
+            and getattr(self, "_loaded_file_type", None) == "APTrack"
+            and getattr(self, "_loaded_file_path", None)
+            and Path(self._loaded_file_path).exists()
+            and not self.is_streaming
+        ):
+            cfg = dict(self._last_aptrack_config or {"record": 1})
+            cfg["roles"] = [dict(r) for r in role_dicts]
+            self.loadFile(
+                self._loaded_file_path,
+                type="APTrack",
+                blocking=True,
+                aptrack_config=cfg,
+            )
+            return True
+
+        if apply_preprocess and self.segment is not None and not self.is_streaming:
+            self.apply_channel_roles_preprocessing()
+
+        return True
+
+    def _select_role_signals(
+        self,
+        seg: neo.Segment,
+        norm_roles: List[ChannelRoleSpec],
+    ):
+        sigs = list(getattr(seg, "analogsignals", []) or [])
+        new_analog = None
+        if sigs:
+            # Prefer rd.0.bp, then rd.0, then probe role (.bp if bandpass else raw), then current if still present, else first
+            for preferred in ("rd.0.bp", "rd.0"):
+                new_analog = next((s for s in sigs if getattr(s, "name", "") == preferred), None)
+                if new_analog is not None:
+                    break
+            if new_analog is None:
+                for r in norm_roles:
+                    if r.enabled and r.purpose == "probe":
+                        cand_names = [f"{r.name}.bp", r.name] if r.bandpass else [r.name]
+                        for cname in cand_names:
+                            new_analog = next(
+                                (s for s in sigs if getattr(s, "name", "") == cname), None
+                            )
+                            if new_analog is not None:
+                                break
+                    if new_analog is not None:
+                        break
+            if new_analog is None and self.analog_signal in sigs:
+                new_analog = self.analog_signal
+            if new_analog is None:
+                new_analog = sigs[0]
+
+        evts = list(getattr(seg, "events", []) or [])
+        non_unit_evts = [
+            e
+            for e in evts
+            if not (getattr(e, "name", "") or "").startswith("unit")
+            and e.annotations.get("type") != "unit"
+        ]
+        new_event = None
+        if non_unit_evts:
+            for r in norm_roles:
+                if r.enabled and r.purpose == "stim_trigger":
+                    new_event = next(
+                        (e for e in non_unit_evts if getattr(e, "name", "") == r.name),
+                        None,
+                    )
+                    if new_event is not None:
+                        break
+            if new_event is None:
+                new_event = next(
+                    (e for e in non_unit_evts if getattr(e, "name", "") == "env.stim"),
+                    None,
+                )
+            if (
+                new_event is None
+                and self.event_signal in non_unit_evts
+                and len(self.event_signal) > 0
+            ):
+                new_event = self.event_signal
+            if new_event is None:
+                new_event = next(
+                    (
+                        e
+                        for e in non_unit_evts
+                        if e.annotations.get("type_id") == TypeID.TTL.value
+                    ),
+                    None,
+                )
+            if new_event is None:
+                new_event = non_unit_evts[0]
+        elif evts:
+            new_event = evts[0]
+
+        return new_analog, new_event
+
+    def apply_channel_roles_preprocessing(self, roles=None) -> bool:
+        if roles is not None:
+            norm_roles = normalize_channel_roles(roles)
+            role_dicts = [r.to_dict() for r in norm_roles]
+            self.channel_roles = role_dicts
+            self.live_config["channel_roles"] = [dict(r) for r in role_dicts]
+            self._sync_roles_to_live_config(norm_roles)
+            self.onChannelRolesChanged.emit()
+            self.onLiveConfigChanged.emit()
+        else:
+            norm_roles = normalize_channel_roles(self.channel_roles)
+
+        if self.segment is None:
+            return False
+
+        if self.is_streaming or self.has_live_session():
+            # Handle live session buffers and non-MultiAnalogSignal channels gracefully
+            has_regular_signals = any(
+                not isinstance(s, MultiAnalogSignal)
+                for s in (self.segment.analogsignals or [])
+            )
+            if not self.is_streaming and has_regular_signals:
+                # Apply standard preprocessing only to non-MultiAnalogSignal signals if present
+                regular_seg = neo.Segment()
+                regular_seg.analogsignals = [
+                    s
+                    for s in self.segment.analogsignals
+                    if not isinstance(s, MultiAnalogSignal)
+                ]
+                regular_seg.events = list(self.segment.events)
+                preprocess_segment_with_roles(regular_seg, norm_roles, in_place=True)
+                multi_sigs = [
+                    s
+                    for s in self.segment.analogsignals
+                    if isinstance(s, MultiAnalogSignal)
+                ]
+                self.segment.analogsignals = multi_sigs + list(regular_seg.analogsignals)
+                self.segment.events = list(regular_seg.events)
+
+            # Map/alias live channel buffers (e.g. CH0 / CH1 -> rd.0)
+            for role in norm_roles:
+                if not role.enabled or role.probe_type != TypeID.ANALOG:
+                    continue
+                src_candidates = [role.source]
+                m = None
+                import re
+
+                m = re.fullmatch(r"ch(\d+)", role.source.strip(), re.IGNORECASE)
+                if m and int(m.group(1)) >= 1:
+                    src_candidates.append(f"CH{int(m.group(1)) - 1}")
+                matched_key = next(
+                    (c for c in src_candidates if c in self._live_channel_signals),
+                    None,
+                )
+                if matched_key is None:
+                    matched_key = next(
+                        (c for c in src_candidates if c in self._live_aux_erp_buffers),
+                        None,
+                    )
+                if matched_key is not None and role.name and role.name != matched_key:
+                    if matched_key in self._live_channel_signals:
+                        sig = self._live_channel_signals[matched_key]
+                        self._live_channel_signals[role.name] = sig
+                        sig.annotations.setdefault("raw_channel_name", matched_key)
+                        sig.annotations["channel_purpose"] = role.purpose
+                    if matched_key in self._live_aux_erp_buffers:
+                        self._live_aux_erp_buffers[role.name] = (
+                            self._live_aux_erp_buffers[matched_key]
+                        )
+                    if (
+                        role.name == "rd.0"
+                        and matched_key in self._live_channel_signals
+                    ):
+                        self.analog_signal = self._live_channel_signals[role.name]
+                        if role.name in self._live_aux_erp_buffers:
+                            self._live_erp_buffer = self._live_aux_erp_buffers[role.name]
+
+            self.segment.annotations["channel_roles"] = [dict(r) for r in self.channel_roles]
+            self.onChannelGroupsChanged.emit()
+            self.onLoadNewFile.emit()
+            self.onEventsUpdated.emit()
+            return True
+
+        preprocess_segment_with_roles(self.segment, norm_roles, in_place=True)
+        self.segment.annotations["channel_roles"] = [dict(r) for r in self.channel_roles]
+
+        new_analog, new_event = self._select_role_signals(self.segment, norm_roles)
+        self.set_data(
+            analog_signal=new_analog,
+            event_signal=new_event,
+            spike_groups=self.spike_groups,
+        )
+        self.onChannelGroupsChanged.emit()
+        self.onEventsUpdated.emit()
+        return True
+
+    def reload_with_channel_roles(
+        self, roles=None, record_no: Optional[int] = None
+    ) -> bool:
+        if roles is not None:
+            norm_roles = normalize_channel_roles(roles)
+            role_dicts = [r.to_dict() for r in norm_roles]
+            self.channel_roles = role_dicts
+            self.live_config["channel_roles"] = [dict(r) for r in role_dicts]
+            self._sync_roles_to_live_config(norm_roles)
+            self.onChannelRolesChanged.emit()
+            self.onLiveConfigChanged.emit()
+
+        if record_no is not None:
+            if self._last_aptrack_config is None:
+                self._last_aptrack_config = {}
+            self._last_aptrack_config["record"] = int(record_no)
+
+        if (
+            getattr(self, "_loaded_file_type", None) == "APTrack"
+            and getattr(self, "_loaded_file_path", None)
+            and Path(self._loaded_file_path).exists()
+            and not self.is_streaming
+        ):
+            preserved_groups = list(self.spike_groups or [])
+            cfg = dict(self._last_aptrack_config or {"record": 1})
+            cfg["roles"] = [dict(r) for r in self.channel_roles]
+            self.loadFile(
+                self._loaded_file_path,
+                type="APTrack",
+                blocking=True,
+                aptrack_config=cfg,
+            )
+            if preserved_groups:
+                existing_names = {
+                    getattr(sg.event, "name", None) for sg in (self.spike_groups or [])
+                }
+                merged = list(self.spike_groups or [])
+                has_non_empty_loaded = any(
+                    len(getattr(sg, "event", [])) > 0 for sg in merged
+                )
+                if not has_non_empty_loaded:
+                    merged = preserved_groups
+                else:
+                    for sg in preserved_groups:
+                        sg_name = getattr(getattr(sg, "event", None), "name", None)
+                        if sg_name and sg_name not in existing_names and len(sg.event) > 0:
+                            merged.append(sg)
+                            existing_names.add(sg_name)
+                if merged is not self.spike_groups:
+                    self.set_data(spike_groups=merged)
+            return True
+
+        return self.apply_channel_roles_preprocessing()
 
     def get_effective_refresh_rate_ms(
         self, view_name: str = None, weight: str = "normal"
@@ -1573,6 +1878,9 @@ class ViewerState(QObject):
     def setUnitGroup(self, unitid: int):
         if unitid > len(self.spike_groups):
             return
+        if self.active_candidate_id is not None:
+            self.active_candidate_id = None
+            self.onCandidateSelectionChanged.emit(-1)
         self.cur_spike_group = unitid
         if 0 <= unitid < len(self.spike_groups):
             sg = self.spike_groups[unitid]
@@ -2484,11 +2792,23 @@ class ViewerState(QObject):
     def _apply_loaded_file(
         self, fname, type, data, analog_signal, event_signal, spike_groups
     ):
+        self._loaded_file_path = fname
+        self._loaded_file_type = type
         self.title = fname
         self.segment = data
         self.cur_spike_group = 0
         self.event_signal = event_signal
         self.analog_signal = analog_signal
+        if data is not None and hasattr(data, "annotations"):
+            if "aptrack_config" in data.annotations:
+                self._last_aptrack_config = dict(data.annotations["aptrack_config"])
+            if "channel_roles" in data.annotations:
+                self.channel_roles = [
+                    r.to_dict()
+                    for r in normalize_channel_roles(data.annotations["channel_roles"])
+                ]
+                self.live_config["channel_roles"] = [dict(r) for r in self.channel_roles]
+                self.onChannelRolesChanged.emit()
         self.restore_candidate_store(
             data.annotations.get("spikespy_candidates"), event_signal=event_signal
         )
@@ -2875,6 +3195,17 @@ class ViewerState(QObject):
         return names[0] if names else ""
 
     def _candidate_scan_channels(self) -> List[str]:
+        configured = [
+            str(c).strip()
+            for c in (getattr(self.candidate_config, "scan_channels", None) or [])
+            if str(c).strip()
+        ]
+        if configured:
+            avail = self.get_available_channels()
+            if avail:
+                avail_set = set(avail)
+                return [c for c in configured if c in avail_set]
+            return configured
         names = [str(c) for c in (getattr(self, "active_channel_names", None) or []) if c]
         primary = getattr(self.analog_signal, "name", "") or ""
         if primary and primary not in names:
@@ -2916,13 +3247,44 @@ class ViewerState(QObject):
     def set_active_candidate(self, candidate_id: Optional[int]) -> None:
         if candidate_id is not None and candidate_id not in self.candidate_units:
             candidate_id = None
-        if self.active_candidate_id == candidate_id:
-            return
+        changed = self.active_candidate_id != candidate_id
         self.active_candidate_id = candidate_id
         self._touch_candidate_review()
-        self.onCandidateSelectionChanged.emit(
-            -1 if candidate_id is None else int(candidate_id)
+
+        candidate = (
+            self.candidate_units.get(candidate_id)
+            if candidate_id is not None
+            else None
         )
+        if candidate is not None:
+            target_ch = str(getattr(candidate, "channel", "") or "")
+            cur_ch = getattr(self.analog_signal, "name", "") or ""
+            if target_ch and target_ch != cur_ch:
+                avail = self.get_available_channels()
+                if not avail or target_ch in avail:
+                    self.set_active_channel(target_ch)
+
+            idx_arr = getattr(getattr(candidate, "unit", None), "idx_arr", None) or []
+            n_events = len(self.event_signal) if self.event_signal is not None else 0
+            if n_events > 0 and idx_arr:
+                cur_stim = int(getattr(self, "stimno", 0) or 0)
+                has_at_cur = (
+                    0 <= cur_stim < len(idx_arr) and idx_arr[cur_stim] is not None
+                )
+                if not has_at_cur:
+                    detected_stims = [
+                        i
+                        for i, item in enumerate(idx_arr)
+                        if item is not None and 0 <= i < n_events
+                    ]
+                    if detected_stims:
+                        nearest = min(detected_stims, key=lambda s: abs(s - cur_stim))
+                        self.setStimNo(nearest)
+
+        if changed:
+            self.onCandidateSelectionChanged.emit(
+                -1 if candidate_id is None else int(candidate_id)
+            )
 
     def clear_candidates(self, emit: bool = True) -> None:
         self.candidate_units = {}
@@ -3473,6 +3835,16 @@ class ViewerState(QObject):
                 continue
             if key == "enabled_algorithms":
                 cfg.enabled_algorithms = [str(a) for a in (value or []) if str(a).strip()]
+                continue
+            if key == "scan_channels":
+                seen = set()
+                cleaned: List[str] = []
+                for ch in value or []:
+                    s = str(ch).strip()
+                    if s and s not in seen:
+                        seen.add(s)
+                        cleaned.append(s)
+                cfg.scan_channels = cleaned
                 continue
             setattr(cfg, key, value)
             if key == "scan_interval_ms":

@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 
 from .ActiveUnitInfoView import ActiveUnitInfoView
 from .ChannelGroupBar import ChannelGroupBar, ChannelGroupEditorPane
+from .ChannelPurposeView import ChannelPurposeWidget
 from .MultiTracePlotManager import MultiTracePlotManager
 
 
@@ -357,6 +358,11 @@ class ViewSettingsPanel(QWidget):
         self.grp_streaming = self._create_streaming_group()
         self.container_layout.addWidget(self.grp_streaming)
         self.grp_streaming.setVisible(False)
+
+        # Channel Purposes & Preprocessing group
+        self.grp_channel_purpose = self._create_channel_purpose_group()
+        self.container_layout.addWidget(self.grp_channel_purpose)
+        self.grp_channel_purpose.setVisible(False)
 
         self.container_layout.addStretch()
         self.scroll.setWidget(self.container_widget)
@@ -900,6 +906,17 @@ class ViewSettingsPanel(QWidget):
 
         return grp
 
+    def _create_channel_purpose_group(self) -> QGroupBox:
+        grp = QGroupBox("Channel Purposes & Preprocessing", self)
+        layout = QVBoxLayout(grp)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+        self.channel_purpose_widget = ChannelPurposeWidget(
+            parent=grp, state=self.state, compact=True
+        )
+        layout.addWidget(self.channel_purpose_widget)
+        return grp
+
     # ---------------------------------------------------------
     # Active View Tracking & Population
     # ---------------------------------------------------------
@@ -988,6 +1005,8 @@ class ViewSettingsPanel(QWidget):
             self.unit_info_widget.set_state(state)
         if hasattr(self, "channel_groups_editor") and self.channel_groups_editor is not None:
             self.channel_groups_editor.setState(state)
+        if hasattr(self, "channel_purpose_widget") and self.channel_purpose_widget is not None:
+            self.channel_purpose_widget.setState(state)
         if self.state is not None:
             self._connect_state_signals()
             self._refresh_unit_combo()
@@ -1225,6 +1244,8 @@ class ViewSettingsPanel(QWidget):
             self.grp_unit_selector.setVisible(in_channels)
             self.grp_active_unit_info.setVisible(in_unit)
             self.grp_streaming.setVisible(in_stream)
+            if hasattr(self, "grp_channel_purpose"):
+                self.grp_channel_purpose.setVisible(in_channels or in_stream)
             return
 
         c_name = self.active_view.__class__.__name__
@@ -1250,6 +1271,8 @@ class ViewSettingsPanel(QWidget):
         self.grp_active_unit_info.setVisible(in_unit)
         self.grp_navigation.setVisible(in_nav and has_nav)
         self.grp_streaming.setVisible(in_stream)
+        if hasattr(self, "grp_channel_purpose"):
+            self.grp_channel_purpose.setVisible(in_channels or in_stream)
 
     def _find_live_view(self):
         mdi = self._find_mdi_view()
