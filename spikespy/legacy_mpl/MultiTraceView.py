@@ -835,9 +835,43 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
         names = []
         if hasattr(self, "channel_bar"):
             chans = self.channel_bar.get_selected_channels()
-            names.extend(chans)
-        elif self.state.analog_signal is not None:
-            names.append(self.state.analog_signal.name)
+            for ch in chans:
+                if ch and ch not in names:
+                    names.append(ch)
+        elif self.state and self.state.analog_signal is not None:
+            sig_name = getattr(self.state.analog_signal, "name", None)
+            if sig_name and sig_name not in names:
+                names.append(sig_name)
+
+        if self.state is not None:
+            avail = self.state.get_available_channels() if hasattr(self.state, "get_available_channels") else []
+            role_aux_names = set()
+            if hasattr(self.state, "get_channel_roles"):
+                try:
+                    for role in self.state.get_channel_roles():
+                        if not isinstance(role, dict):
+                            continue
+                        if not role.get("enabled", True):
+                            continue
+                        probe_type = str(role.get("probe_type", "AS")).upper()
+                        purpose = str(role.get("purpose", "") or "")
+                        r_name = str(role.get("name") or role.get("target_name") or "")
+                        if r_name and probe_type == "AS" and purpose != "probe":
+                            role_aux_names.add(r_name)
+                except Exception:
+                    pass
+
+            for ch in avail:
+                if not ch or ch in names:
+                    continue
+                if ch.startswith("env.") or ch.startswith("rec.") or ch in role_aux_names:
+                    names.append(ch)
+
+            if hasattr(self, "rightPlots") and isinstance(self.rightPlots, dict):
+                avail_set = set(avail)
+                for k, enabled in self.rightPlots.items():
+                    if enabled and k in avail_set and k not in names:
+                        names.append(k)
         return names
     
     def _schedule_right_axis_update(self):
@@ -1135,9 +1169,7 @@ class MultiTraceView(LiveFrameConsumerMixin, QMainWindow):
         except Exception:
             pass
 
-        chans = []
-        if hasattr(self, "channel_bar") and self.channel_bar is not None:
-            chans = list(self.channel_bar.get_selected_channels())
+        chans = self._get_channel_names()
         if not chans and self.state.analog_signal is not None:
             chans = [self.state.analog_signal.name]
 

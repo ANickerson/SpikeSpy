@@ -87,6 +87,7 @@ from .ChannelGroupContainer import ChannelGroupContainerView
 from .ViewSettingsPanel import ViewSettingsPanel
 from .ActiveUnitInfoView import ActiveUnitInfoView
 from .SpikeProposalConfigView import SpikeProposalConfigView
+from .ChannelPurposeView import ChannelPurposeWidget, ChannelPurposeDialog
 from .helpers import apply_top_bars_visibility, notify_view_selected
 from .dsp.detectors import (
     DetectorParamSpec,
@@ -125,6 +126,7 @@ window_options = {
     "OpenEphysLive": OpenEphysLiveView,
     "SharedChannelPanel": SharedChannelPanel,
     "ChannelGroupContainer": ChannelGroupContainerView,
+    "ChannelPurpose": ChannelPurposeWidget,
     "ViewSettings": ViewSettingsPanel,
     "ActiveUnitInfo": ActiveUnitInfoView,
     "SpikeProposalConfig": SpikeProposalConfigView,
@@ -297,6 +299,48 @@ class MdiView(QMainWindow):
                 dw.raise_()
                 return dw.widget()
         return self.newWindow("SharedChannelPanel", pos=QtAds.BottomDockWidgetArea)
+
+    def open_or_show_channel_purpose_panel(self):
+        """Opens or activates the ChannelPurposeWidget dock panel."""
+        for dw in self.dock_manager.dockWidgets():
+            if isinstance(dw.widget(), ChannelPurposeWidget):
+                if dw.isClosed():
+                    dw.toggleView(True)
+                    if dw.dockAreaWidget() is None:
+                        self.dock_manager.addDockWidget(QtAds.RightDockWidgetArea, dw)
+                dw.show()
+                dw.raise_()
+                if dw.dockAreaWidget() is not None:
+                    try:
+                        dw.dockAreaWidget().setCurrentDockWidget(dw)
+                    except Exception:
+                        pass
+                if hasattr(dw, "setAsCurrentTab") and callable(getattr(dw, "setAsCurrentTab")):
+                    try:
+                        dw.setAsCurrentTab()
+                    except Exception:
+                        pass
+                return dw.widget()
+        return self.newWindow("ChannelPurpose", pos=QtAds.RightDockWidgetArea)
+
+    def open_channel_purpose_dialog(self):
+        """Opens ChannelPurposeDialog to configure APTrack/channel roles and reload/preprocess."""
+        initial_roles = (
+            self.state.get_channel_roles()
+            if self.state is not None and hasattr(self.state, "get_channel_roles")
+            else None
+        )
+        dlg = ChannelPurposeDialog(
+            parent=self, state=self.state, initial_roles=initial_roles
+        )
+        accepted = dlg.exec_() if hasattr(dlg, "exec_") else dlg.exec()
+        if accepted and self.state is not None:
+            rec_no = dlg.get_config().get("record")
+            if hasattr(self.state, "reload_with_channel_roles"):
+                self.state.reload_with_channel_roles(dlg.get_roles(), record_no=rec_no)
+            elif hasattr(self.state, "set_channel_roles"):
+                self.state.set_channel_roles(dlg.get_roles(), apply_preprocess=True)
+        return dlg
 
     def open_or_show_active_unit_info(self):
         """Opens or activates the ActiveUnitInfoView dock panel."""
@@ -701,10 +745,12 @@ class MdiView(QMainWindow):
         menu_channels = add_panel_menu.addMenu("Channel Groups")
         menu_channels.addAction("Channel Group Sub-Window", lambda: self.newWindow("ChannelGroupContainer"))
         menu_channels.addAction("Shared Channel Controller", lambda: self.open_or_show_shared_channel_panel())
+        menu_channels.addAction("Channel Purposes & Preprocessing", lambda: self.open_or_show_channel_purpose_panel())
 
         menu_tables = add_panel_menu.addMenu("Tables & Controllers")
         menu_tables.addAction("Active Unit Info & Tracking", lambda: self.newWindow("ActiveUnitInfo"))
         menu_tables.addAction("Spike Proposal Config", lambda: self.open_or_show_spike_proposal_config())
+        menu_tables.addAction("Channel Purposes & Preprocessing", lambda: self.open_or_show_channel_purpose_panel())
         menu_tables.addAction("View Settings Panel", lambda: self.open_or_show_view_settings_panel())
         menu_tables.addAction("Pinned Settings for Active View", lambda: self.new_settings_panel(pinned=True))
         menu_tables.addAction("Channel & Unit Settings Panel", lambda: self.new_settings_panel(page="channels", title="Channel & Unit Settings"))
@@ -839,6 +885,13 @@ class MdiView(QMainWindow):
                 triggered=self.open_folder,
             )
         )
+        file_menu.addAction(
+            QAction(
+                "Configure APTrack / Channel Purposes...",
+                self,
+                triggered=self.open_channel_purpose_dialog,
+            )
+        )
         self.recent_menu = file_menu.addMenu("Open Recent")
         file_menu.addAction(
             QAction(
@@ -909,6 +962,25 @@ class MdiView(QMainWindow):
                 "Open Dual Unit View (Unit 0 & Unit 1)...",
                 self,
                 triggered=self.open_dual_unit_view,
+            )
+        )
+        channels_menu.addSeparator()
+        channels_menu.addAction(
+            QAction(
+                "Channel Purposes & Preprocessing...",
+                self,
+                triggered=self.open_or_show_channel_purpose_panel,
+            )
+        )
+        channels_menu.addAction(
+            QAction(
+                "Re-run Preprocessing / Reload with Roles",
+                self,
+                triggered=lambda: (
+                    self.state.reload_with_channel_roles()
+                    if self.state is not None and hasattr(self.state, "reload_with_channel_roles")
+                    else None
+                ),
             )
         )
 

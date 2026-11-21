@@ -23,23 +23,33 @@ import quantities as pq
 from neo import Event
 from neo.core.objectlist import ObjectList
 from neo.io import NixIO
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
     QPushButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
 )
 
 from .APTrack_experiment_import import (
     APTrackRecording,
+    ChannelRoleSpec,
     TypeID,
+    get_default_channel_roles,
+    normalize_channel_roles,
     process_folder as open_aptrack,
 )
 from .processing import MultiAnalogSignal, create_erp_signals
@@ -107,16 +117,84 @@ def open_matlab_to_neo(folder: str | Path) -> neo.Segment:
     return seg
 
 
+_PURPOSE_LABELS = [
+    ("Analog", (TypeID.ANALOG, False)),
+    ("Analog + Bandpass", (TypeID.ANALOG, True)),
+    ("TTL Trigger / Event", (TypeID.TTL, False)),
+]
+
+_KNOWN_PURPOSES = [
+    "probe",
+    "stim_trigger",
+    "stim_voltage",
+    "stim_analog",
+    "potentiometer",
+    "thermode",
+    "button",
+    "aux",
+]
+
+
+def _detect_channels_from_folder(folder: Optional[Union[str, Path]]) -> List[str]:
+    if not folder:
+        return []
+    p = Path(folder)
+    if not p.exists() or not p.is_dir():
+        return []
+    detected: List[str] = []
+    seen = set()
+    for f in sorted(p.glob("*.continuous")):
+        stem = f.stem
+        if "_" in stem:
+            ch = stem.split("_", 1)[1]
+            # Strip optional trailing recording suffix _2, _3
+            parts = ch.rsplit("_", 1)
+            if len(parts) == 2 and parts[1].isdigit() and not parts[0].isdigit():
+                ch = parts[0]
+        else:
+            ch = stem
+        if ch and ch not in seen:
+            seen.add(ch)
+            detected.append(ch)
+    return detected
+
+
 class APTrackDialog(QDialog):
-    def __init__(self, parent=None):
+    """Channel purpose & preprocessing configuration dialog (backward compatible with legacy API)."""
+
+    _SETTINGS_KEY = "APTrackDialog/last_config"
+
+    def __init__(
+        self,
+        parent=None,
+        available_channels: Optional[List[str]] = None,
+        folder: Optional[Union[str, Path]] = None,
+        segment: Optional[neo.Segment] = None,
+        initial_roles: Optional[List[Union[ChannelRoleSpec, Dict[str, Any]]]] = None,
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Load APTrack Data")
+        self.setWindowTitle("Load APTrack / Channel Configuration")
+        self.resize(860, 480)
+
+        self._available_channels: List[str] = list(available_channels or [])
+        if folder:
+            for ch in _detect_channels_from_folder(folder):
+                if ch not in self._available_channels:
+                    self._available_channels.append(ch)
+        if segment is not None and hasattr(segment, "analogsignals"):
+            for sig in segment.analogsignals:
+                sig_name = getattr(sig, "name", "") or ""
+                if sig.annotations.get("derived_from_role") or sig_name.endswith(".bp"):
+                    continue
+                raw_name = sig.annotations.get("raw_channel_name", sig_name)
+                if raw_name and raw_name not in self._available_channels:
+                    self._available_channels.append(raw_name)
 
         self.bottomLayout = QFormLayout()
         self.topLayout = QFormLayout()
         self.mainLayout = QVBoxLayout()
 
-        self.topLayout.addRow(QLabel("custom parameters"))
+        self.topLayout.addRow(QLabel("Channel & Preprocessing Parameters"))
         self.sbRecordNumber = QSpinBox()
         self.sbRecordNumber.setMinimum(0)
 
@@ -126,6 +204,7 @@ class APTrackDialog(QDialog):
 
         self.topLayout.addRow(QLabel("Rec#"), self.sbRecordNumber)
 
+        # Legacy quick-edit rows preserved for backward compatibility
         labelBox = QLabel("Rec. channel")
         inputBox = QLineEdit("CH1")
         self.topLayout.addRow(labelBox, inputBox)
@@ -133,7 +212,7 @@ class APTrackDialog(QDialog):
         self.inputBoxes.append(inputBox)
 
         labelBox = QLabel("Stimulus ch.")
-        inputBox = QLineEdit("ADC2")
+        inputBox = QLineEdit("ADC4")
         self.topLayout.addRow(labelBox, inputBox)
         self.labelBoxes.append(labelBox)
         self.inputBoxes.append(inputBox)
@@ -148,6 +227,44 @@ class APTrackDialog(QDialog):
             self.inputBoxes.append(inputBox)
             self.topLayout.addRow(labelBox, inputBox)
 
+        # Structured role configuration table
+        self.roleTable = QTableWidget(0, 9)
+        self.roleTable.setHorizontalHeaderLabels(
+            [
+                "Enabled",
+                "Source",
+                "Target Name",
+                "Type / Processing",
+                "Purpose",
+                "BP Low (Hz)",
+                "BP High (Hz)",
+                "TTL Thresh",
+                "TTL Refrac (ms)",
+            ]
+        )
+        self.roleTable.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.roleTable.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+
+        # Role row controls & Presets bar
+        presetBar = QHBoxLayout()
+        self.addRoleButton = QPushButton("Add Role")
+        self.addRoleButton.clicked.connect(self._on_add_role_clicked)
+        self.removeRoleButton = QPushButton("Remove Role")
+        self.removeRoleButton.clicked.connect(self._on_remove_role_clicked)
+        self.resetDefaultsButton = QPushButton("Reset Defaults")
+        self.resetDefaultsButton.clicked.connect(self._on_reset_defaults_clicked)
+        self.loadPresetButton = QPushButton("Load Preset...")
+        self.loadPresetButton.clicked.connect(self._on_load_preset_clicked)
+        self.savePresetButton = QPushButton("Save Preset...")
+        self.savePresetButton.clicked.connect(self._on_save_preset_clicked)
+
+        presetBar.addWidget(self.addRoleButton)
+        presetBar.addWidget(self.removeRoleButton)
+        presetBar.addWidget(self.resetDefaultsButton)
+        presetBar.addStretch()
+        presetBar.addWidget(self.loadPresetButton)
+        presetBar.addWidget(self.savePresetButton)
+
         self.addButton = QPushButton("+")
         self.addButton.clicked.connect(self.addWidget)
         self.removeButton = QPushButton("-")
@@ -157,15 +274,273 @@ class APTrackDialog(QDialog):
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.bottomLayout.addRow(self.buttons)
-        self.buttons.accepted.connect(self.accept)
+        self.buttons.accepted.connect(self._on_accept)
         self.buttons.rejected.connect(self.reject)
 
         self.mainLayout.addLayout(self.topLayout)
+        self.mainLayout.addWidget(self.roleTable)
+        self.mainLayout.addLayout(presetBar)
         self.mainLayout.addLayout(self.bottomLayout)
         self.setLayout(self.mainLayout)
 
+        self._syncing_legacy = False
+        self.inputBoxes[0].textChanged.connect(self._sync_legacy_to_table)
+        self.inputBoxes[1].textChanged.connect(self._sync_legacy_to_table)
+        if len(self.inputBoxes) > 2:
+            self.inputBoxes[2].textChanged.connect(self._sync_legacy_to_table)
+
+        # Initialize roles from explicit argument, QSettings, or defaults
+        if initial_roles is not None:
+            self.set_roles(normalize_channel_roles(initial_roles))
+        else:
+            loaded_from_settings = self._load_from_qsettings()
+            if not loaded_from_settings:
+                self.set_roles(get_default_channel_roles())
+
+    def _load_from_qsettings(self) -> bool:
+        try:
+            settings = QSettings("SpikeSpy", "SpikeSpy")
+            raw = settings.value(self._SETTINGS_KEY, None)
+            if not raw:
+                return False
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(data, dict):
+                if "record" in data:
+                    self.sbRecordNumber.setValue(int(data["record"]))
+                if "roles" in data and isinstance(data["roles"], list) and data["roles"]:
+                    self.set_roles(normalize_channel_roles(data["roles"]))
+                    return True
+        except Exception:
+            logger.debug("Failed to load APTrackDialog settings", exc_info=True)
+        return False
+
+    def _save_to_qsettings(self):
+        try:
+            settings = QSettings("SpikeSpy", "SpikeSpy")
+            cfg = self.get_config()
+            settings.setValue(self._SETTINGS_KEY, json.dumps(cfg))
+        except Exception:
+            logger.debug("Failed to save APTrackDialog settings", exc_info=True)
+
+    def _on_accept(self):
+        self._save_to_qsettings()
+        self.accept()
+
+    def _sync_legacy_to_table(self):
+        if self._syncing_legacy:
+            return
+        self._syncing_legacy = True
+        try:
+            rd0_src = self.inputBoxes[0].text().strip()
+            stim_src = self.inputBoxes[1].text().strip()
+            for row in range(self.roleTable.rowCount()):
+                target_item = self.roleTable.item(row, 2)
+                target_name = target_item.text().strip() if target_item else ""
+                src_widget = self.roleTable.cellWidget(row, 1)
+                if target_name == "rd.0" and rd0_src and isinstance(src_widget, QComboBox):
+                    src_widget.setCurrentText(rd0_src)
+                elif target_name in ("env.stimVolt", "env.stim") and stim_src:
+                    type_widget = self.roleTable.cellWidget(row, 3)
+                    if isinstance(type_widget, QComboBox) and "TTL" in type_widget.currentText():
+                        if isinstance(src_widget, QComboBox):
+                            src_widget.setCurrentText(stim_src)
+                for idx in range(2, len(self.inputBoxes)):
+                    lbl_w = self.labelBoxes[idx]
+                    lbl = lbl_w.text().strip() if hasattr(lbl_w, "text") else ""
+                    val = self.inputBoxes[idx].text().strip()
+                    if lbl == "button" and target_name == "rec.button" and val:
+                        if isinstance(src_widget, QComboBox):
+                            src_widget.setCurrentText(val)
+        finally:
+            self._syncing_legacy = False
+
+    def _sync_table_to_legacy(self):
+        if self._syncing_legacy:
+            return
+        self._syncing_legacy = True
+        try:
+            roles = self.get_roles()
+            for r in roles:
+                if r.name == "rd.0" and r.source:
+                    self.inputBoxes[0].setText(r.source)
+                elif r.name in ("env.stimVolt", "env.stim") and r.probe_type == TypeID.TTL and r.source:
+                    self.inputBoxes[1].setText(r.source)
+                elif r.name == "rec.button" and len(self.inputBoxes) > 2 and r.source:
+                    lbl_w = self.labelBoxes[2]
+                    if hasattr(lbl_w, "text") and lbl_w.text().strip() == "button":
+                        self.inputBoxes[2].setText(r.source)
+        finally:
+            self._syncing_legacy = False
+
+    def _append_role_row(self, role: ChannelRoleSpec):
+        row = self.roleTable.rowCount()
+        self.roleTable.insertRow(row)
+
+        chk = QCheckBox()
+        chk.setChecked(role.enabled)
+        self.roleTable.setCellWidget(row, 0, chk)
+
+        src_combo = QComboBox()
+        src_combo.setEditable(True)
+        choices = list(self._available_channels)
+        for default_ch in ("CH1", "CH0", "ADC2", "ADC4", "ADC5", "ADC7", "ADC8"):
+            if default_ch not in choices:
+                choices.append(default_ch)
+        if role.source and role.source not in choices:
+            choices.insert(0, role.source)
+        src_combo.addItems(choices)
+        src_combo.setCurrentText(role.source)
+        self.roleTable.setCellWidget(row, 1, src_combo)
+
+        name_item = QTableWidgetItem(role.name)
+        self.roleTable.setItem(row, 2, name_item)
+
+        type_combo = QComboBox()
+        for label, _ in _PURPOSE_LABELS:
+            type_combo.addItem(label)
+        if role.probe_type == TypeID.TTL:
+            type_combo.setCurrentIndex(2)
+        elif role.bandpass:
+            type_combo.setCurrentIndex(1)
+        else:
+            type_combo.setCurrentIndex(0)
+        self.roleTable.setCellWidget(row, 3, type_combo)
+
+        purpose_combo = QComboBox()
+        purpose_combo.setEditable(True)
+        purpose_choices = list(_KNOWN_PURPOSES)
+        if role.purpose and role.purpose not in purpose_choices:
+            purpose_choices.insert(0, role.purpose)
+        purpose_combo.addItems(purpose_choices)
+        purpose_combo.setCurrentText(role.purpose)
+        self.roleTable.setCellWidget(row, 4, purpose_combo)
+
+        bp_low = QDoubleSpinBox()
+        bp_low.setRange(0.1, 25000.0)
+        bp_low.setDecimals(1)
+        bp_low.setValue(role.bandpass_low)
+        self.roleTable.setCellWidget(row, 5, bp_low)
+
+        bp_high = QDoubleSpinBox()
+        bp_high.setRange(1.0, 50000.0)
+        bp_high.setDecimals(1)
+        bp_high.setValue(role.bandpass_high)
+        self.roleTable.setCellWidget(row, 6, bp_high)
+
+        ttl_thresh = QDoubleSpinBox()
+        ttl_thresh.setRange(0.0, 1e6)
+        ttl_thresh.setDecimals(4)
+        ttl_thresh.setSpecialValueText("Auto")
+        ttl_thresh.setValue(float(role.ttl_threshold) if role.ttl_threshold and role.ttl_threshold > 0 else 0.0)
+        self.roleTable.setCellWidget(row, 7, ttl_thresh)
+
+        ttl_refrac = QDoubleSpinBox()
+        ttl_refrac.setRange(0.0, 60000.0)
+        ttl_refrac.setDecimals(1)
+        ttl_refrac.setValue(role.ttl_refractory_ms)
+        self.roleTable.setCellWidget(row, 8, ttl_refrac)
+
+    def set_roles(self, roles: List[Union[ChannelRoleSpec, Dict[str, Any]]]):
+        norm = normalize_channel_roles(roles)
+        self.roleTable.setRowCount(0)
+        for r in norm:
+            self._append_role_row(r)
+        self._sync_table_to_legacy()
+
+    def get_roles(self) -> List[ChannelRoleSpec]:
+        roles: List[ChannelRoleSpec] = []
+        for row in range(self.roleTable.rowCount()):
+            chk = self.roleTable.cellWidget(row, 0)
+            src_widget = self.roleTable.cellWidget(row, 1)
+            name_item = self.roleTable.item(row, 2)
+            type_widget = self.roleTable.cellWidget(row, 3)
+            purpose_widget = self.roleTable.cellWidget(row, 4)
+            bp_low_w = self.roleTable.cellWidget(row, 5)
+            bp_high_w = self.roleTable.cellWidget(row, 6)
+            ttl_thresh_w = self.roleTable.cellWidget(row, 7)
+            ttl_refrac_w = self.roleTable.cellWidget(row, 8)
+
+            source = src_widget.currentText().strip() if isinstance(src_widget, QComboBox) else ""
+            name = name_item.text().strip() if name_item else source
+            type_idx = type_widget.currentIndex() if isinstance(type_widget, QComboBox) else 0
+            probe_type, bandpass = _PURPOSE_LABELS[max(0, min(type_idx, len(_PURPOSE_LABELS) - 1))][1]
+            purpose = purpose_widget.currentText().strip() if isinstance(purpose_widget, QComboBox) else ""
+            bp_low = float(bp_low_w.value()) if isinstance(bp_low_w, QDoubleSpinBox) else 500.0
+            bp_high = float(bp_high_w.value()) if isinstance(bp_high_w, QDoubleSpinBox) else 7000.0
+            thresh_val = float(ttl_thresh_w.value()) if isinstance(ttl_thresh_w, QDoubleSpinBox) else 0.0
+            ttl_threshold = thresh_val if thresh_val > 0 else None
+            ttl_refrac = float(ttl_refrac_w.value()) if isinstance(ttl_refrac_w, QDoubleSpinBox) else 100.0
+            enabled = bool(chk.isChecked()) if isinstance(chk, QCheckBox) else True
+
+            if not source and not name:
+                continue
+
+            roles.append(
+                ChannelRoleSpec(
+                    source=source,
+                    name=name or source,
+                    probe_type=probe_type,
+                    purpose=purpose,
+                    bandpass=bandpass,
+                    bandpass_low=bp_low,
+                    bandpass_high=bp_high,
+                    ttl_threshold=ttl_threshold,
+                    ttl_refractory_ms=ttl_refrac,
+                    is_adc=source.upper().startswith("ADC"),
+                    enabled=enabled,
+                )
+            )
+        return roles
+
+    def _on_add_role_clicked(self):
+        self._append_role_row(
+            ChannelRoleSpec(
+                source="ADC1",
+                name="aux.ch",
+                probe_type=TypeID.ANALOG,
+                purpose="aux",
+                is_adc=True,
+            )
+        )
+
+    def _on_remove_role_clicked(self):
+        row = self.roleTable.currentRow()
+        if row < 0:
+            row = self.roleTable.rowCount() - 1
+        if row >= 0:
+            self.roleTable.removeRow(row)
+
+    def _on_reset_defaults_clicked(self):
+        self.set_roles(get_default_channel_roles())
+
+    def _on_save_preset_clicked(self):
+        fname, _ = QFileDialog.getSaveFileName(
+            self, "Save Channel Preset", "", "JSON (*.json);;All files (*)"
+        )
+        if not fname:
+            return
+        payload = {
+            "record": self.sbRecordNumber.value(),
+            "roles": [r.to_dict() for r in self.get_roles()],
+        }
+        Path(fname).write_text(json.dumps(payload, indent=2))
+
+    def _on_load_preset_clicked(self):
+        fname, _ = QFileDialog.getOpenFileName(
+            self, "Load Channel Preset", "", "JSON (*.json);;All files (*)"
+        )
+        if not fname:
+            return
+        data = json.loads(Path(fname).read_text())
+        if isinstance(data, list):
+            self.set_roles(normalize_channel_roles(data))
+        elif isinstance(data, dict):
+            if "record" in data:
+                self.sbRecordNumber.setValue(int(data["record"]))
+            self.set_roles(normalize_channel_roles(data))
+
     def get_config(self):
-        config = {}
+        config: Dict[str, Any] = {}
         config["record"] = self.sbRecordNumber.value()
         config["rd.0"] = self.inputBoxes[0].text()
         config["stimVolt"] = self.inputBoxes[1].text()
@@ -173,6 +548,42 @@ class APTrackDialog(QDialog):
         for i in range(len(self.inputBoxes) - 2):
             config[self.labelBoxes[i + 2].text()] = self.inputBoxes[i + 2].text()
 
+        roles = self.get_roles()
+        # Reflect table edits for core roles while preserving any custom extra legacy rows
+        for r in roles:
+            if not r.enabled:
+                continue
+            if r.name == "rd.0":
+                config["rd.0"] = r.source
+            elif r.name == "env.stimVolt":
+                config["stimVolt"] = r.source
+            elif r.name == "env.potentiometer":
+                config["stimVolt_pot"] = r.source
+            elif r.name == "env.stim" and r.probe_type == TypeID.ANALOG:
+                config["stim"] = r.source
+            elif r.name == "env.thermode":
+                config["thermode"] = r.source
+            elif r.name == "rec.button" and "button" in config:
+                config["button"] = r.source
+
+        # If caller added custom legacy rows via addWidget(), ensure they appear in roles too
+        known_names = {r.name for r in roles}
+        known_legacy = {"record", "rd.0", "stimVolt", "stimVolt_pot", "stim", "thermode", "button", "roles"}
+        for k, v in config.items():
+            if k in known_legacy or k in known_names or not isinstance(v, str) or not v.strip():
+                continue
+            roles.append(
+                ChannelRoleSpec(
+                    source=v.strip(),
+                    name=k,
+                    probe_type=TypeID.ANALOG,
+                    purpose="aux",
+                    bandpass=k.lower().startswith("rd"),
+                    is_adc=v.strip().upper().startswith("ADC"),
+                )
+            )
+
+        config["roles"] = [r.to_dict() for r in roles]
         return config
 
     def addWidget(self):
@@ -283,12 +694,83 @@ def prompt_for_neo_folder(parent=None):
     return folder, type
 
 
+def _select_primary_event_signal(
+    seg: neo.Segment, roles: Optional[List[ChannelRoleSpec]] = None
+) -> Event:
+    if seg is None or not seg.events:
+        return Event()
+
+    non_unit_events = [
+        evt
+        for evt in seg.events
+        if not (getattr(evt, "name", "") or "").startswith("unit")
+        and evt.annotations.get("type") != "unit"
+    ]
+
+    # 1. Prefer event named "env.stim" if non-empty
+    for evt in non_unit_events:
+        if getattr(evt, "name", "") == "env.stim" and len(evt) > 0:
+            return evt
+
+    # 2. Prefer event matching a role with purpose == "stim_trigger"
+    if roles:
+        stim_names = [
+            r.name
+            for r in roles
+            if r.enabled and r.purpose == "stim_trigger" and r.probe_type == TypeID.TTL
+        ]
+        for sname in stim_names:
+            for evt in non_unit_events:
+                if getattr(evt, "name", "") == sname and len(evt) > 0:
+                    return evt
+
+    # 3. Prefer non-empty non-unit TTL event
+    for evt in non_unit_events:
+        if evt.annotations.get("type_id") == TypeID.TTL.value and len(evt) > 0:
+            return evt
+
+    # 4. Fallback to first non-empty non-unit event, then first event
+    for evt in non_unit_events:
+        if len(evt) > 0:
+            return evt
+
+    return seg.events[0]
+
+
+def _select_primary_analog_signal(
+    seg: neo.Segment, roles: Optional[List[ChannelRoleSpec]] = None
+):
+    if seg is None or not seg.analogsignals:
+        return None
+
+    sigs = seg.analogsignals
+    # 1. Prefer "rd.0.bp" then "rd.0"
+    for preferred in ("rd.0.bp", "rd.0"):
+        for sig in sigs:
+            if getattr(sig, "name", "") == preferred:
+                return sig
+
+    # 2. Prefer role with purpose == "probe" (its .bp variant first if bandpass is enabled)
+    if roles:
+        for r in roles:
+            if r.enabled and r.purpose == "probe":
+                candidates = [f"{r.name}.bp", r.name] if r.bandpass else [r.name]
+                for cname in candidates:
+                    for sig in sigs:
+                        if getattr(sig, "name", "") == cname:
+                            return sig
+
+    return sigs[0]
+
+
 def load_file(data_path, type="h5", aptrack_config=None, progress_cb=None):
     from .ViewerState import tracked_neuron_unit
 
     def _stage(msg):
         if progress_cb is not None:
             progress_cb(msg)
+
+    normalized_roles: Optional[List[ChannelRoleSpec]] = None
 
     if type == "h5":
         _stage("Reading NIX file...")
@@ -304,23 +786,32 @@ def load_file(data_path, type="h5", aptrack_config=None, progress_cb=None):
         data = open_matlab_to_neo(data_path)
     elif type == "APTrack":
         if aptrack_config is None:
-            d = APTrackDialog()
+            d = APTrackDialog(folder=data_path)
             val = d.exec_() if hasattr(d, "exec_") else d.exec()
             config = d.get_config()
         else:
             config = dict(aptrack_config)
-        t = config.pop("record")
+        t = config.pop("record", 1)
 
-        skip_list = ["rd.0", "rd.0.bp", "stimVolt", "stim"]
+        has_explicit_roles = "roles" in config and config["roles"] is not None
+        skip_list = ["rd.0", "rd.0.bp", "stimVolt", "stimVolt_pot", "stim", "thermode", "button", "roles"]
         additional_channels = []
-        for k, v in config.items():
-            if any(k in x for x in skip_list):
-                continue
-            extra_channel = APTrackRecording(v, TypeID.ANALOG, k, "")
-            additional_channels.append(extra_channel)
+        if not has_explicit_roles:
+            for k, v in config.items():
+                if any(k in x for x in skip_list) or not isinstance(v, str) or not v.strip():
+                    continue
+                extra_channel = APTrackRecording(v, TypeID.ANALOG, k, "")
+                additional_channels.append(extra_channel)
+
+        normalized_roles = normalize_channel_roles(config, extra_channels=additional_channels)
 
         _stage("Reading APTrack folder...")
         data = open_aptrack(data_path, t, config, additional_channels)
+        if data is not None:
+            saved_cfg = dict(config)
+            saved_cfg["record"] = t
+            data.annotations["aptrack_config"] = saved_cfg
+            data.annotations["channel_roles"] = [r.to_dict() for r in normalized_roles]
     elif type == "spike2":
         _stage("Reading Spike2 file...")
         data = neo.Spike2IO(data_path)
@@ -360,11 +851,14 @@ def load_file(data_path, type="h5", aptrack_config=None, progress_cb=None):
     if data is not None:
         data = expand_multichannel_segment(data)
 
-    if len(data.events) == 0:
-        event_signal = Event()
-    else:
-        event_signal = data.events[0]
-    signal_chan = data.analogsignals[0] if len(data.analogsignals) > 0 else None
+    if normalized_roles is None and data is not None and "channel_roles" in data.annotations:
+        try:
+            normalized_roles = normalize_channel_roles(data.annotations["channel_roles"])
+        except Exception:
+            normalized_roles = None
+
+    event_signal = _select_primary_event_signal(data, normalized_roles)
+    signal_chan = _select_primary_analog_signal(data, normalized_roles)
 
     spike_event_groups = []
     for x in data.events:

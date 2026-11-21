@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from spikespy.ChannelPurposeView import ChannelPurposeWidget
 from spikespy.ViewerState import ViewerState, tracked_neuron_unit
 
 from .oe_controller import OpenEphysController
@@ -291,6 +292,18 @@ class OpenEphysLiveView(QWidget):
         self.chk_follow_live.setChecked(True)
         self.chk_follow_live.toggled.connect(self._on_follow_live_toggled)
 
+        self.btn_configure_channel_purposes = QPushButton(
+            "🎛 Configure Channel Purposes & Preprocessing ▾"
+        )
+        self.btn_configure_channel_purposes.setCheckable(True)
+        self.btn_configure_channel_purposes.setChecked(False)
+        self.btn_configure_channel_purposes.setToolTip(
+            "Expand or collapse inline Channel Purposes & Preprocessing controls"
+        )
+        self.btn_configure_channel_purposes.toggled.connect(
+            self._on_channel_purposes_toggled
+        )
+
         chan_layout.addRow("Recording Channel:", self.spin_rec_chan)
         chan_layout.addRow("Multi-Channel Active Set:", self.edit_active_channels)
         chan_layout.addRow("Trigger Source:", self.combo_trigger_source)
@@ -299,10 +312,28 @@ class OpenEphysLiveView(QWidget):
         chan_layout.addRow("Pre-Stimulus Time:", self.spin_pre_ms)
         chan_layout.addRow("", self.chk_online_filter)
         chan_layout.addRow("", self.chk_follow_live)
+        chan_layout.addRow("", self.btn_configure_channel_purposes)
 
-        self.tabs_live.addTab(
-            _wrap_tab_group(self.chan_group), "📡 Acquisition & Channels"
+        self.channel_purpose_group = QGroupBox("Channel Purposes & Preprocessing")
+        purpose_vbox = QVBoxLayout(self.channel_purpose_group)
+        purpose_vbox.setContentsMargins(4, 6, 4, 4)
+        purpose_vbox.setSpacing(4)
+        self.channel_purpose_widget = ChannelPurposeWidget(
+            parent=self.channel_purpose_group,
+            state=self.state,
+            compact=True,
         )
+        purpose_vbox.addWidget(self.channel_purpose_widget)
+        self.channel_purpose_group.setVisible(False)
+
+        acq_tab_page = QWidget(self.tabs_live)
+        acq_tab_layout = QVBoxLayout(acq_tab_page)
+        acq_tab_layout.setContentsMargins(4, 6, 4, 4)
+        acq_tab_layout.setSpacing(6)
+        acq_tab_layout.addWidget(self.chan_group)
+        acq_tab_layout.addWidget(self.channel_purpose_group)
+        acq_tab_layout.addStretch(1)
+        self.tabs_live.addTab(acq_tab_page, "📡 Acquisition & Channels")
 
         # -------------------------------------------------------------
         # Tab 2: Closed-Loop & OE
@@ -641,6 +672,14 @@ class OpenEphysLiveView(QWidget):
                 )
 
             if self.worker is not None:
+                if hasattr(self.worker, "set_channel_roles") and self._should_apply_channel_roles(cfg):
+                    roles_val = (
+                        self.state.get_channel_roles()
+                        if hasattr(self.state, "get_channel_roles")
+                        else cfg.get("channel_roles")
+                    )
+                    if roles_val is not None:
+                        self.worker.set_channel_roles(roles_val)
                 self.worker.set_rec_channel(int(cfg["rec_chan"]))
                 self.worker.set_active_channels(
                     self._parse_active_channels(str(cfg["active_channels"]))
@@ -668,6 +707,23 @@ class OpenEphysLiveView(QWidget):
                 self.worker.adc_trigger_chan = int(cfg.get("adc_trigger_chan", 1))
         finally:
             self._syncing_live_config = False
+
+    @Slot(bool)
+    def _on_channel_purposes_toggled(self, checked: bool):
+        if hasattr(self, "channel_purpose_group"):
+            self.channel_purpose_group.setVisible(bool(checked))
+            self.btn_configure_channel_purposes.setText(
+                "🎛 Configure Channel Purposes & Preprocessing ▴"
+                if checked
+                else "🎛 Configure Channel Purposes & Preprocessing ▾"
+            )
+
+    @Slot()
+    def _open_channel_purposes_tab(self):
+        if hasattr(self, "tabs_live"):
+            self.tabs_live.setCurrentIndex(0)
+        if hasattr(self, "btn_configure_channel_purposes"):
+            self.btn_configure_channel_purposes.setChecked(True)
 
     @Slot(bool)
     def _on_follow_live_toggled(self, checked: bool):
@@ -865,6 +921,19 @@ class OpenEphysLiveView(QWidget):
             )
         self._push_live_config_to_state()
 
+    def _should_apply_channel_roles(self, cfg: Dict[str, Any]) -> bool:
+        """Only apply channel_roles to OpenEphysStreamWorker when explicitly configured.
+
+        ViewerState initializes default APTrack roles (only CH1/rd.0 bandpass-filtered),
+        so uncustomized multi-channel Open Ephys sessions should keep filtering all active
+        channels unless the user or config explicitly applied channel roles.
+        """
+        if self.state is not None and getattr(self.state, "_channel_roles_customized", False):
+            return True
+        if cfg.get("channel_roles_customized"):
+            return True
+        return False
+
     def start_stream(self):
         if self._is_replaying:
             self._cancel_replay()
@@ -897,6 +966,9 @@ class OpenEphysLiveView(QWidget):
         auto_align_clock = bool(cfg.get("auto_align_clock", True))
 
         hb_port = event_port if is_sliced else None
+        channel_roles = (
+            cfg.get("channel_roles") if self._should_apply_channel_roles(cfg) else None
+        )
         self.worker = OpenEphysStreamWorker(
             host=host,
             data_port=data_port,
@@ -914,6 +986,7 @@ class OpenEphysLiveView(QWidget):
             filter_high=filter_high_hz,
             ttl_threshold_v=ttl_threshold_v,
             ttl_refractory_ms=ttl_refractory_ms,
+            channel_roles=channel_roles,
             parent=self,
         )
         self.worker.auto_align_clock = auto_align_clock
@@ -1886,6 +1959,51 @@ class OpenEphysLiveView(QWidget):
     @Slot(str, float, dict)
     def _on_protocol_event_ready(self, event_type: str, ts: float, details: dict):
         logger.info("Protocol Event [%s] at %.3fs: %s", event_type, ts, details)
+        if event_type == "ttl_role" and self.state is not None:
+            details = details or {}
+            purpose = str(details.get("purpose", "") or "").lower()
+            evt_name = str(details.get("name", "rec.button") or "rec.button")
+            seg = getattr(self.state, "segment", None)
+            if seg is not None:
+                existing_idx = None
+                for i, ev in enumerate(getattr(seg, "events", []) or []):
+                    if getattr(ev, "name", None) == evt_name:
+                        existing_idx = i
+                        break
+                if existing_idx is not None:
+                    old_ev = seg.events[existing_idx]
+                    old_times = (
+                        np.asarray(old_ev.rescale(pq.s).magnitude, dtype=np.float64).ravel()
+                        if hasattr(old_ev, "rescale")
+                        else np.asarray(old_ev, dtype=np.float64).ravel()
+                    )
+                    new_times = np.sort(np.append(old_times, float(ts))) * pq.s
+                    updated_ev = Event(
+                        new_times,
+                        name=evt_name,
+                        units=pq.s,
+                        **dict(getattr(old_ev, "annotations", {}) or {}),
+                    )
+                    seg.events[existing_idx] = updated_ev
+                else:
+                    new_ev = Event(
+                        np.array([float(ts)], dtype=np.float64) * pq.s,
+                        name=evt_name,
+                        units=pq.s,
+                    )
+                    if purpose:
+                        new_ev.annotations["channel_purpose"] = purpose
+                    seg.events.append(new_ev)
+            if (purpose == "button" or evt_name == "rec.button") and hasattr(
+                self.state, "add_protocol_marker"
+            ):
+                self.state.add_protocol_marker(
+                    label=f"Button ({evt_name})",
+                    timestamp_s=ts,
+                    category="button",
+                )
+            elif hasattr(self.state, "onEventsUpdated"):
+                self.state.onEventsUpdated.emit()
 
     @Slot(dict)
     def _on_stats_updated(self, stats: Dict[str, Any]):
