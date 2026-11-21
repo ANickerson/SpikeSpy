@@ -166,6 +166,9 @@ class MdiView(QMainWindow):
         self.cur_windows.clear()
         self.dock_settings = None
         self.settings_panel = None
+        self._open_ephys_live_dock = None
+        if hasattr(self, "extra_settings_panels"):
+            self.extra_settings_panels.clear()
 
     def save_perspective_as(self, name: str):
         if not name:
@@ -393,6 +396,67 @@ class MdiView(QMainWindow):
                 pass
         return self.dock_settings.widget()
 
+    def _refresh_all_settings_panel_targets(self):
+        panels: List[ViewSettingsPanel] = []
+        if getattr(self, "settings_panel", None) is not None:
+            panels.append(self.settings_panel)
+        for sp in list(getattr(self, "extra_settings_panels", [])):
+            if sp is not None and sp not in panels:
+                panels.append(sp)
+        for sp in panels:
+            try:
+                if hasattr(sp, "refresh_target_views"):
+                    sp.refresh_target_views()
+            except RuntimeError:
+                pass
+
+    def new_settings_panel(
+        self,
+        target_view: Optional[QWidget] = None,
+        pinned: bool = False,
+        page: str = "view",
+        title: Optional[str] = None,
+        dock_area=QtAds.RightDockWidgetArea,
+    ) -> ViewSettingsPanel:
+        panel = ViewSettingsPanel(parent=self, state=self.state, initial_page=page)
+        target = (
+            target_view
+            if target_view is not None
+            else (
+                self.settings_panel.active_view
+                if getattr(self, "settings_panel", None) is not None
+                else None
+            )
+        )
+        if target is not None:
+            if pinned:
+                panel.pin_to_view(target)
+            else:
+                panel.setActiveView(target)
+
+        if title is None:
+            if pinned and panel.active_view is not None:
+                view_title = panel._get_view_display_name(panel.active_view)
+                dock_title = f"Settings ({page.capitalize()}): {view_title}"
+            else:
+                dock_title = f"{page.capitalize()} Settings"
+        else:
+            dock_title = title
+
+        dock = QtAds.CDockWidget(dock_title)
+        dock.setWidget(panel)
+        dock.setFeature(QtAds.CDockWidget.DockWidgetDeleteOnClose, True)
+        dock.setFeature(QtAds.CDockWidget.DockWidgetForceCloseWithArea, True)
+        self.dock_manager.addDockWidget(dock_area, dock)
+        dock.show()
+        dock.raise_()
+
+        if not hasattr(self, "extra_settings_panels"):
+            self.extra_settings_panels = []
+        self.extra_settings_panels.append(panel)
+        self._refresh_all_settings_panel_targets()
+        return panel
+
     def open_channel_groups_editor_pane(self):
         """Opens the View Settings panel and expands the Channel Groups editor pane."""
         panel = self.open_or_show_view_settings_panel()
@@ -542,6 +606,7 @@ class MdiView(QMainWindow):
 
         self.window_options = window_options
         self.cur_windows = []
+        self.extra_settings_panels: List[ViewSettingsPanel] = []
 
         self.version_check_thread = VersionCheckThread()
         self.version_check_thread.worker.result.connect(
@@ -641,6 +706,9 @@ class MdiView(QMainWindow):
         menu_tables.addAction("Active Unit Info & Tracking", lambda: self.newWindow("ActiveUnitInfo"))
         menu_tables.addAction("Spike Proposal Config", lambda: self.open_or_show_spike_proposal_config())
         menu_tables.addAction("View Settings Panel", lambda: self.open_or_show_view_settings_panel())
+        menu_tables.addAction("Pinned Settings for Active View", lambda: self.new_settings_panel(pinned=True))
+        menu_tables.addAction("Channel & Unit Settings Panel", lambda: self.new_settings_panel(page="channels", title="Channel & Unit Settings"))
+        menu_tables.addAction("Live Streaming Settings Panel", lambda: self.new_settings_panel(page="stream", title="Streaming Settings"))
         menu_tables.addAction("SharedChannelPanel", lambda: self.open_or_show_shared_channel_panel())
         menu_tables.addAction("SpikeGroupTable", lambda: self.newWindow("SpikeGroupTable"))
         menu_tables.addAction("Events", lambda: self.newWindow("Events"))
@@ -854,6 +922,31 @@ class MdiView(QMainWindow):
         view_menu.addAction(self.act_hide_top_bars)
         view_menu.addAction(
             QAction("View Settings Panel...", self, triggered=self.open_or_show_view_settings_panel)
+        )
+        view_menu.addAction(
+            QAction(
+                "Pinned Settings for Active View",
+                self,
+                triggered=lambda: self.new_settings_panel(pinned=True),
+            )
+        )
+        view_menu.addAction(
+            QAction(
+                "Channel & Unit Settings Panel",
+                self,
+                triggered=lambda: self.new_settings_panel(
+                    page="channels", title="Channel & Unit Settings"
+                ),
+            )
+        )
+        view_menu.addAction(
+            QAction(
+                "Live Streaming Settings Panel",
+                self,
+                triggered=lambda: self.new_settings_panel(
+                    page="stream", title="Streaming Settings"
+                ),
+            )
         )
 
         help_menu = self.menubar.addMenu("Help")
@@ -1362,6 +1455,7 @@ class MdiView(QMainWindow):
             apply_top_bars_visibility(w, True)
         if hasattr(self, "settings_panel") and self.settings_panel is not None:
             notify_view_selected(w)
+        self._refresh_all_settings_panel_targets()
         return w
 
     def open_dual_unit_view(self):

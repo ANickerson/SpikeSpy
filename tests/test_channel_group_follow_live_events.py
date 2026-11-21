@@ -143,6 +143,7 @@ def test_view_settings_panel_channel_selection_options(test_state):
     app.processEvents()
 
     panel.setActiveView(container)
+    panel.set_settings_page("channels")
     app.processEvents()
 
     # 1. Verify channel selection options exist in ViewSettingsPanel

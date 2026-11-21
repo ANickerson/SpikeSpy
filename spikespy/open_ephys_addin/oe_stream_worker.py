@@ -316,6 +316,8 @@ class OpenEphysStreamWorker(QThread):
         filter_low: float = 500.0,
         filter_high: float = 7000.0,
         sample_rate: float = 30000.0,
+        ttl_threshold_v: float = 2.5,
+        ttl_refractory_ms: float = 100.0,
         parent: Optional[QObject] = None,
     ):
         super().__init__(parent)
@@ -336,14 +338,17 @@ class OpenEphysStreamWorker(QThread):
         self.window_ms = window_ms
         self.pre_stim_ms = pre_stim_ms
         self.apply_filter = apply_filter
-        self.filter_low = filter_low
-        self.filter_high = filter_high
+        self.filter_low = float(filter_low)
+        self.filter_high = float(filter_high)
         self.sample_rate = sample_rate
+        self.ttl_threshold_v = float(ttl_threshold_v)
+        self.ttl_refractory_ms = float(ttl_refractory_ms)
         self.auto_align_clock = True
 
         self._running = False
         self._pending_sweeps: List[PendingSweep] = []
         self._pending_lock = threading.Lock()
+        self._lock = threading.Lock()
 
         # Batched sweep delivery to the GUI (flush at most every ~20 ms or at cap)
         self._pending_payloads: List[Dict[str, Any]] = []
@@ -355,9 +360,15 @@ class OpenEphysStreamWorker(QThread):
         cap = int(sample_rate * 15.0)
         self.ring_buffer = RingBuffer(n_channels=16, capacity_samples=cap)
         self.bandpass_filter = OnlineBandpassFilter(
-            lowcut=filter_low, highcut=filter_high, sampling_rate=sample_rate
+            lowcut=self.filter_low,
+            highcut=self.filter_high,
+            sampling_rate=sample_rate,
         )
-        self.analog_ttl_detector = OnlineTTLDetector()
+        self.analog_ttl_detector = OnlineTTLDetector(
+            threshold=self.ttl_threshold_v,
+            refractory_s=self.ttl_refractory_ms / 1000.0,
+        )
+        self.ttl_detector = self.analog_ttl_detector
 
         # Metrics
         self._sweeps_count = 0
@@ -371,6 +382,30 @@ class OpenEphysStreamWorker(QThread):
         self._last_heartbeat_reply = 0.0
         self._last_data_received = 0.0
         self._plugin_info: Dict[str, Any] = {}
+
+    @property
+    def pre_ms(self) -> float:
+        return self.pre_stim_ms
+
+    @pre_ms.setter
+    def pre_ms(self, value: float):
+        self.pre_stim_ms = float(value)
+
+    @property
+    def use_analog_trigger(self) -> bool:
+        return self.trigger_source == "analog"
+
+    @use_analog_trigger.setter
+    def use_analog_trigger(self, enabled: bool):
+        self.trigger_source = "analog" if enabled else "ttl"
+
+    @property
+    def adc_trigger_chan(self) -> int:
+        return self.analog_trigger_channel
+
+    @adc_trigger_chan.setter
+    def adc_trigger_chan(self, chan: int):
+        self.analog_trigger_channel = int(chan)
 
     def stop(self):
         """Signal thread to stop and wait."""
@@ -393,7 +428,8 @@ class OpenEphysStreamWorker(QThread):
             new_active.sort()
         self.active_channels = new_active
         if len(self.active_channels) != prev_count:
-            self.bandpass_filter.reset()
+            with self._lock:
+                self.bandpass_filter.reset()
 
     def set_filtering(self, enabled: bool):
         if enabled != self.apply_filter:
@@ -403,7 +439,54 @@ class OpenEphysStreamWorker(QThread):
                 self._pending_sweeps.clear()
         self.apply_filter = enabled
         if not enabled:
-            self.bandpass_filter.reset()
+            with self._lock:
+                self.bandpass_filter.reset()
+
+    def set_filter_band(self, low_hz: float, high_hz: float):
+        low_hz = float(low_hz)
+        high_hz = float(high_hz)
+        if low_hz <= 0 or high_hz <= low_hz:
+            raise ValueError(
+                f"Invalid filter band: low_hz={low_hz}, high_hz={high_hz}"
+            )
+        if (
+            self.filter_low == low_hz
+            and self.filter_high == high_hz
+            and self.bandpass_filter is not None
+            and self.bandpass_filter.sample_rate == self.sample_rate
+        ):
+            return
+        self.filter_low = low_hz
+        self.filter_high = high_hz
+        with self._lock:
+            self.bandpass_filter = OnlineBandpassFilter(
+                lowcut=self.filter_low,
+                highcut=self.filter_high,
+                sampling_rate=self.sample_rate,
+            )
+
+    def set_ttl_params(
+        self,
+        threshold: Optional[float] = None,
+        refractory_ms: Optional[float] = None,
+    ):
+        with self._lock:
+            if threshold is not None:
+                self.ttl_threshold_v = float(threshold)
+                self.ttl_detector.threshold = float(threshold)
+            if refractory_ms is not None:
+                self.ttl_refractory_ms = float(refractory_ms)
+                self.ttl_detector.refractory_s = float(refractory_ms) / 1000.0
+
+    def set_window_params(
+        self,
+        window_ms: Optional[float] = None,
+        pre_ms: Optional[float] = None,
+    ):
+        if window_ms is not None:
+            self.window_ms = float(window_ms)
+        if pre_ms is not None:
+            self.pre_stim_ms = float(pre_ms)
 
     def _queue_sweep_payload(self, payload: Dict[str, Any]):
         """Accumulate a sweep payload and flush in batches to reduce GUI wakeups."""
@@ -725,7 +808,8 @@ class OpenEphysStreamWorker(QThread):
 
             if waveform is not None:
                 if self.apply_filter:
-                    waveform = self.bandpass_filter.process(waveform)
+                    with self._lock:
+                        waveform = self.bandpass_filter.process(waveform)
 
                 # Record stim interval
                 if self._last_stim_timestamp is not None:
@@ -876,13 +960,15 @@ class OpenEphysStreamWorker(QThread):
             # Check analog TTL trigger if configured, using unfiltered samples
             if self.trigger_source == "analog" and self.analog_trigger_channel < data.shape[0]:
                 adc_data = data[self.analog_trigger_channel, :]
-                triggers = self.analog_ttl_detector.process_chunk(adc_data, start_sample)
+                with self._lock:
+                    triggers = self.analog_ttl_detector.process_chunk(adc_data, start_sample)
                 for t_sample in triggers:
                     self.queue_sweep_trigger(t_sample, t_sample / self.sample_rate)
 
             # Filter the continuous stream exactly once per chunk (stateful, causal)
             if self.apply_filter:
-                data = self.bandpass_filter.process(data)
+                with self._lock:
+                    data = self.bandpass_filter.process(data)
 
             # Append to circular ring buffer (RingBuffer handles channel expansion thread-safely)
             self.ring_buffer.append(data, start_sample)

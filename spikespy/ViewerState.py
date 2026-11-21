@@ -689,6 +689,7 @@ class ViewerState(QObject):
     onCandidateConfigChanged = Signal()
     onSharedVisualSettingsChanged = Signal(str, dict)
     onProtocolMarkersChanged = Signal()
+    onLiveConfigChanged = Signal()
 
     @staticmethod
     def _default_visual_settings() -> Dict[str, Any]:
@@ -759,6 +760,28 @@ class ViewerState(QObject):
         self._live_erp_buffer: Optional[LiveERPBuffer] = None
         # Store live sweeps in memory-mapped temp files instead of RAM
         self.live_disk_cache: bool = True
+        self.live_config: Dict[str, Any] = {
+            "host": "127.0.0.1",
+            "http_port": 37497,
+            "data_port": 5556,
+            "event_port": 5557,
+            "stream_mode": "zmq_raw",
+            "rec_chan": 0,
+            "active_channels": "0-3",
+            "trigger_source": "ttl",
+            "adc_trigger_chan": 1,
+            "ttl_threshold_v": 2.5,
+            "ttl_refractory_ms": 100.0,
+            "window_ms": 500.0,
+            "pre_ms": 0.0,
+            "online_filter": True,
+            "filter_low_hz": 500.0,
+            "filter_high_hz": 7000.0,
+            "auto_align_clock": True,
+            "sync_annotations": True,
+            "live_disk_cache": bool(getattr(self, "live_disk_cache", True)),
+            "ui_refresh_rate_ms": int(getattr(self, "ui_refresh_rate_ms", 33)),
+        }
         self._live_frame_timer = None
         self._live_frame_pending_idx = None
         self._last_live_emitted_stimno = None
@@ -824,12 +847,90 @@ class ViewerState(QObject):
 
     def set_ui_refresh_rate_ms(self, interval_ms: int):
         self.ui_refresh_rate_ms = max(5, int(interval_ms))
+        if hasattr(self, "live_config") and isinstance(self.live_config, dict):
+            self.live_config["ui_refresh_rate_ms"] = self.ui_refresh_rate_ms
         if hasattr(self, "frame_scheduler") and self.frame_scheduler is not None:
             self.frame_scheduler.set_base_interval_ms(self.ui_refresh_rate_ms)
         self.onUIRefreshRateChange.emit(self.ui_refresh_rate_ms)
 
     def get_ui_refresh_rate_ms(self) -> int:
         return getattr(self, "ui_refresh_rate_ms", 33)
+
+    def get_live_config(self) -> Dict[str, Any]:
+        self.live_config["live_disk_cache"] = bool(
+            getattr(self, "live_disk_cache", True)
+        )
+        self.live_config["ui_refresh_rate_ms"] = int(
+            getattr(self, "ui_refresh_rate_ms", 33)
+        )
+        return dict(self.live_config)
+
+    def update_live_config(self, **kwargs) -> bool:
+        int_keys = {
+            "http_port",
+            "data_port",
+            "event_port",
+            "rec_chan",
+            "adc_trigger_chan",
+            "ui_refresh_rate_ms",
+        }
+        float_keys = {
+            "ttl_threshold_v",
+            "ttl_refractory_ms",
+            "window_ms",
+            "pre_ms",
+            "filter_low_hz",
+            "filter_high_hz",
+        }
+        bool_keys = {
+            "online_filter",
+            "auto_align_clock",
+            "sync_annotations",
+            "live_disk_cache",
+        }
+        str_keys = {
+            "host",
+            "stream_mode",
+            "active_channels",
+            "trigger_source",
+        }
+
+        changed = False
+        refresh_rate_updated = False
+        for k, v in kwargs.items():
+            if k in int_keys:
+                coerced = int(v)
+            elif k in float_keys:
+                coerced = float(v)
+            elif k in bool_keys:
+                coerced = bool(v)
+            elif k in str_keys:
+                coerced = str(v)
+            else:
+                coerced = v
+
+            if k == "ui_refresh_rate_ms":
+                coerced = max(5, int(coerced))
+                cur = int(getattr(self, "ui_refresh_rate_ms", 33))
+            elif k == "live_disk_cache":
+                cur = bool(getattr(self, "live_disk_cache", True))
+            else:
+                cur = self.live_config.get(k)
+
+            if cur != coerced or k not in self.live_config:
+                self.live_config[k] = coerced
+                changed = True
+                if k == "live_disk_cache":
+                    self.live_disk_cache = bool(coerced)
+                elif k == "ui_refresh_rate_ms":
+                    refresh_rate_updated = True
+
+        if refresh_rate_updated:
+            self.set_ui_refresh_rate_ms(int(self.live_config["ui_refresh_rate_ms"]))
+
+        if changed:
+            self.onLiveConfigChanged.emit()
+        return changed
 
     def get_effective_refresh_rate_ms(
         self, view_name: str = None, weight: str = "normal"

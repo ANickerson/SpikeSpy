@@ -195,6 +195,7 @@ def test_unit_group_selector_standalone_and_channel_group(mock_state):
     app.processEvents()
 
     panel.setActiveView(st_view)
+    panel.set_settings_page("channels")
     app.processEvents()
 
     assert panel.grp_unit_selector.isVisible()

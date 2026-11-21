@@ -1,10 +1,11 @@
 import logging
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import PySide6
 from PySide6.QtCore import QSignalBlocker, Qt, Signal, Slot
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QApplication,
     QButtonGroup,
     QCheckBox,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
     QRadioButton,
@@ -39,14 +41,30 @@ class ViewSettingsPanel(QWidget):
     """
 
     settingsChanged = Signal()
+    pageChanged = Signal(str)
+    pinStateChanged = Signal(bool, object)
 
-    def __init__(self, parent: Optional[QWidget] = None, state=None):
+    _VALID_PAGES = ("view", "channels", "unit", "nav", "stream", "all")
+
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        state=None,
+        initial_page: str = "view",
+        pinned_view: Optional[QWidget] = None,
+    ):
         super().__init__(parent)
         self.state = state
         self.active_view: Optional[QWidget] = None
         self._active_state_connections = []
         self._current_view_connections = []
         self._block_updates = False
+        self._syncing_streaming = False
+        self._current_page: str = (
+            initial_page if initial_page in self._VALID_PAGES else "view"
+        )
+        self.is_pinned: bool = False
+        self.pinned_view: Optional[QWidget] = None
 
         self.setWindowTitle("View Settings")
         self.setMinimumWidth(240)
@@ -55,7 +73,7 @@ class ViewSettingsPanel(QWidget):
         main_layout.setContentsMargins(6, 6, 6, 6)
         main_layout.setSpacing(6)
 
-        # 1. Header with Selected Window Name
+        # 1. Header with Selected Window Name & Target Pinning Controls
         header_frame = QFrame(self)
         header_frame.setFrameShape(QFrame.StyledPanel)
         header_frame.setStyleSheet(
@@ -74,18 +92,124 @@ class ViewSettingsPanel(QWidget):
         self.lbl_view_sub.setStyleSheet("color: #666; font-size: 11px;")
         h_layout.addWidget(self.lbl_view_sub)
 
+        target_row = QHBoxLayout()
+        target_row.setContentsMargins(0, 2, 0, 2)
+        target_row.setSpacing(4)
+
+        self.combo_target_view = QComboBox(header_frame)
+        self.combo_target_view.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.combo_target_view.setMinimumContentsLength(10)
+        self.combo_target_view.setToolTip(
+            "Choose 'Follow Focused View' or select a specific view window to pin this settings panel to it."
+        )
+        self.combo_target_view.currentIndexChanged.connect(
+            self._on_target_combo_changed
+        )
+        target_row.addWidget(self.combo_target_view, 1)
+
+        self.btn_pin_view = QToolButton(header_frame)
+        self.btn_pin_view.setText("📌")
+        self.btn_pin_view.setCheckable(True)
+        self.btn_pin_view.setToolTip(
+            "Pin / lock this settings panel to a specific view window instead of following focus"
+        )
+        self.btn_pin_view.toggled.connect(self._on_pin_toggled)
+        target_row.addWidget(self.btn_pin_view)
+
+        self.btn_spawn_pinned = QToolButton(header_frame)
+        self.btn_spawn_pinned.setText("🗗")
+        self.btn_spawn_pinned.setToolTip(
+            "Open a new dockable settings panel pinned to the current view or split out the current page"
+        )
+        self.btn_spawn_pinned.clicked.connect(self._on_spawn_pinned_clicked)
+        target_row.addWidget(self.btn_spawn_pinned)
+
+        h_layout.addLayout(target_row)
+
         self.chk_hide_top_bars = QCheckBox("Remove Top Bars from Views", header_frame)
         self.chk_hide_top_bars.setToolTip(
             "Globally remove top bars from views so settings are controlled exclusively from this properties pane."
         )
         if self.state is not None:
-            self.chk_hide_top_bars.setChecked(getattr(self.state, "hide_view_top_bars", False))
+            self.chk_hide_top_bars.setChecked(
+                getattr(self.state, "hide_view_top_bars", False)
+            )
         self.chk_hide_top_bars.toggled.connect(self._on_hide_top_bars_toggled)
         h_layout.addWidget(self.chk_hide_top_bars)
 
         main_layout.addWidget(header_frame)
 
-        # 1b. Channel & Unit Selector for Selected Window
+        # 1a. Paginated Settings Group Buttons
+        self.page_bar = QFrame(self)
+        self.page_bar.setFrameShape(QFrame.NoFrame)
+        page_bar_layout = QHBoxLayout(self.page_bar)
+        page_bar_layout.setContentsMargins(0, 0, 0, 0)
+        page_bar_layout.setSpacing(2)
+
+        self.page_button_group = QButtonGroup(self)
+        self.page_button_group.setExclusive(True)
+        self.page_buttons: Dict[str, QAbstractButton] = {}
+
+        page_specs = [
+            ("view", "btn_page_view", "📊 View", "View & Plot Settings (Ctrl+1)", "Ctrl+1"),
+            ("channels", "btn_page_channels", "🔀 Channels", "Channel & Unit Selection (Ctrl+2)", "Ctrl+2"),
+            ("unit", "btn_page_unit", "🎯 Unit", "Active Unit Info & Auto-Tracking (Ctrl+3)", "Ctrl+3"),
+            ("nav", "btn_page_nav", "🧭 Nav", "Plot Navigation & Axis Limits (Ctrl+4)", "Ctrl+4"),
+            ("stream", "btn_page_stream", "📡 Stream", "Live Acquisition & Streaming Settings (Ctrl+5)", "Ctrl+5"),
+            ("all", "btn_page_all", "☰ All", "Show All Settings Groups Together", None),
+        ]
+
+        btn_style = (
+            "QToolButton { padding: 2px 3px; font-size: 11px; border: 1px solid #cbd5e1; border-radius: 3px; background: #f8fafc; }"
+            "QToolButton:checked { background: #2563eb; color: white; border-color: #1d4ed8; font-weight: bold; }"
+        )
+        self._page_shortcuts: List[QShortcut] = []
+        for page_key, attr_name, label, tip, shortcut_seq in page_specs:
+            btn = QToolButton(self.page_bar)
+            btn.setText(label)
+            btn.setCheckable(True)
+            btn.setToolTip(tip)
+            btn.setStyleSheet(btn_style)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn.clicked.connect(
+                lambda _checked=False, k=page_key: self.set_settings_page(k)
+            )
+            btn.customContextMenuRequested.connect(
+                lambda pos, k=page_key, b=btn: self._show_page_button_context_menu(
+                    k, b, pos
+                )
+            )
+            self.page_button_group.addButton(btn)
+            self.page_buttons[page_key] = btn
+            setattr(self, attr_name, btn)
+            page_bar_layout.addWidget(btn)
+            if shortcut_seq is not None:
+                sc = QShortcut(
+                    QKeySequence(shortcut_seq),
+                    self,
+                    context=Qt.WidgetWithChildrenShortcut,
+                )
+                sc.activated.connect(
+                    lambda k=page_key: self.set_settings_page(k)
+                )
+                self._page_shortcuts.append(sc)
+
+        main_layout.addWidget(self.page_bar)
+
+        # 2. Scroll area containing paginated settings editors
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+
+        self.container_widget = QWidget()
+        self.container_layout = QVBoxLayout(self.container_widget)
+        self.container_layout.setContentsMargins(0, 0, 0, 0)
+        self.container_layout.setSpacing(8)
+
+        # 2a. Channel & Unit Selector for Selected Window
         self.grp_unit_selector = QGroupBox("Channel & Unit Selection", self)
         self.grp_channel_selector = self.grp_unit_selector
         grp_layout = QVBoxLayout(self.grp_unit_selector)
@@ -180,29 +304,13 @@ class ViewSettingsPanel(QWidget):
         self.channel_groups_editor.groupsChanged.connect(self._on_editor_groups_changed)
         grp_layout.addWidget(self.channel_groups_editor)
 
-        main_layout.addWidget(self.grp_unit_selector)
+        self.container_layout.addWidget(self.grp_unit_selector)
 
         # Keyboard shortcut for toggling following live events
         self.shortcut_toggle_live_events = QShortcut(
             QKeySequence("Ctrl+L"), self, context=Qt.WidgetWithChildrenShortcut
         )
         self.shortcut_toggle_live_events.activated.connect(self.toggle_follow_live_events)
-
-        if self.state is not None:
-            self._connect_state_signals()
-            self._refresh_unit_combo()
-            self._refresh_channel_combo()
-            self._sync_follow_events_checkbox()
-
-        # 2. Scroll area containing dynamic settings editors
-        self.scroll = QScrollArea(self)
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setFrameShape(QFrame.NoFrame)
-
-        self.container_widget = QWidget()
-        self.container_layout = QVBoxLayout(self.container_widget)
-        self.container_layout.setContentsMargins(0, 0, 0, 0)
-        self.container_layout.setSpacing(8)
 
         # Compact Active Unit Info & Tracking section
         self.grp_active_unit_info = QGroupBox("Active Unit Info & Tracking", self)
@@ -245,9 +353,31 @@ class ViewSettingsPanel(QWidget):
         self.container_layout.addWidget(self.grp_navigation)
         self.grp_navigation.setVisible(False)
 
+        # Live & Streaming Settings group
+        self.grp_streaming = self._create_streaming_group()
+        self.container_layout.addWidget(self.grp_streaming)
+        self.grp_streaming.setVisible(False)
+
         self.container_layout.addStretch()
         self.scroll.setWidget(self.container_widget)
         main_layout.addWidget(self.scroll, 1)
+
+        if self.state is not None:
+            self._connect_state_signals()
+            self._refresh_unit_combo()
+            self._refresh_channel_combo()
+            self._sync_follow_events_checkbox()
+            self._sync_streaming_controls_from_state()
+
+        self.refresh_target_views()
+        initial_btn = self.page_buttons.get(self._current_page)
+        if initial_btn is not None:
+            with QSignalBlocker(initial_btn):
+                initial_btn.setChecked(True)
+        self._update_page_visibility()
+
+        if pinned_view is not None:
+            self.pin_to_view(pinned_view)
 
     # ---------------------------------------------------------
     # Editor Creation
@@ -584,6 +714,192 @@ class ViewSettingsPanel(QWidget):
 
         return grp
 
+    def _create_streaming_group(self) -> QGroupBox:
+        grp = QGroupBox("Live & Streaming Settings", self)
+        layout = QVBoxLayout(grp)
+        layout.setSpacing(6)
+
+        # Status & Quick Actions
+        status_grp = QGroupBox("Status & Quick Actions", grp)
+        status_layout = QVBoxLayout(status_grp)
+        status_layout.setContentsMargins(6, 6, 6, 6)
+        status_layout.setSpacing(4)
+
+        self.lbl_stream_status = QLabel("Offline", status_grp)
+        self.lbl_stream_status.setStyleSheet("color: #475569; font-weight: bold;")
+        status_layout.addWidget(self.lbl_stream_status)
+
+        btn_row = QHBoxLayout()
+        self.btn_stream_toggle = QPushButton("Start Live Stream", status_grp)
+        self.btn_stream_toggle.clicked.connect(self._on_stream_toggle_clicked)
+        btn_row.addWidget(self.btn_stream_toggle)
+
+        self.btn_open_live_cockpit = QPushButton("Live Cockpit...", status_grp)
+        self.btn_open_live_cockpit.clicked.connect(self._on_open_live_cockpit_clicked)
+        btn_row.addWidget(self.btn_open_live_cockpit)
+        status_layout.addLayout(btn_row)
+
+        self.chk_stream_follow_live = QCheckBox("📡 Follow Live Sweeps", status_grp)
+        self.chk_stream_follow_live.setChecked(True)
+        self.chk_stream_follow_live.toggled.connect(self._on_stream_follow_live_toggled)
+        status_layout.addWidget(self.chk_stream_follow_live)
+        layout.addWidget(status_grp)
+
+        # Acquisition & Channels
+        acq_grp = QGroupBox("Acquisition & Channels", grp)
+        acq_form = QFormLayout(acq_grp)
+        acq_form.setContentsMargins(6, 6, 6, 6)
+        acq_form.setSpacing(4)
+
+        self.spin_stream_rec_chan = QSpinBox(acq_grp)
+        self.spin_stream_rec_chan.setRange(0, 512)
+        self.spin_stream_rec_chan.setValue(0)
+        self.spin_stream_rec_chan.valueChanged.connect(self._on_streaming_ui_changed)
+        acq_form.addRow("Recording Channel:", self.spin_stream_rec_chan)
+
+        self.edit_stream_active_chans = QLineEdit("0-3", acq_grp)
+        self.edit_stream_active_chans.editingFinished.connect(
+            self._on_streaming_ui_changed
+        )
+        acq_form.addRow("Active Channels:", self.edit_stream_active_chans)
+
+        self.spin_stream_window_ms = QDoubleSpinBox(acq_grp)
+        self.spin_stream_window_ms.setRange(10.0, 5000.0)
+        self.spin_stream_window_ms.setValue(500.0)
+        self.spin_stream_window_ms.setSuffix(" ms")
+        self.spin_stream_window_ms.valueChanged.connect(self._on_streaming_ui_changed)
+        acq_form.addRow("Sweep Window:", self.spin_stream_window_ms)
+
+        self.spin_stream_pre_ms = QDoubleSpinBox(acq_grp)
+        self.spin_stream_pre_ms.setRange(0.0, 500.0)
+        self.spin_stream_pre_ms.setValue(0.0)
+        self.spin_stream_pre_ms.setSuffix(" ms")
+        self.spin_stream_pre_ms.valueChanged.connect(self._on_streaming_ui_changed)
+        acq_form.addRow("Pre-Stimulus:", self.spin_stream_pre_ms)
+        layout.addWidget(acq_grp)
+
+        # Trigger & Pulse Alignment
+        trig_grp = QGroupBox("Trigger & Pulse Alignment", grp)
+        trig_form = QFormLayout(trig_grp)
+        trig_form.setContentsMargins(6, 6, 6, 6)
+        trig_form.setSpacing(4)
+
+        self.combo_stream_trig_source = QComboBox(trig_grp)
+        self.combo_stream_trig_source.addItem("Digital TTL Event", "ttl")
+        self.combo_stream_trig_source.addItem("Analog ADC Channel", "analog")
+        self.combo_stream_trig_source.currentIndexChanged.connect(
+            self._on_streaming_ui_changed
+        )
+        trig_form.addRow("Trigger Source:", self.combo_stream_trig_source)
+
+        self.spin_stream_adc_chan = QSpinBox(trig_grp)
+        self.spin_stream_adc_chan.setRange(0, 64)
+        self.spin_stream_adc_chan.setValue(1)
+        self.spin_stream_adc_chan.valueChanged.connect(self._on_streaming_ui_changed)
+        trig_form.addRow("Analog ADC Chan:", self.spin_stream_adc_chan)
+
+        self.spin_stream_ttl_thresh = QDoubleSpinBox(trig_grp)
+        self.spin_stream_ttl_thresh.setRange(0.05, 20.0)
+        self.spin_stream_ttl_thresh.setDecimals(2)
+        self.spin_stream_ttl_thresh.setSingleStep(0.1)
+        self.spin_stream_ttl_thresh.setValue(2.5)
+        self.spin_stream_ttl_thresh.setSuffix(" V")
+        self.spin_stream_ttl_thresh.valueChanged.connect(self._on_streaming_ui_changed)
+        trig_form.addRow("TTL Threshold:", self.spin_stream_ttl_thresh)
+
+        self.spin_stream_ttl_refrac = QDoubleSpinBox(trig_grp)
+        self.spin_stream_ttl_refrac.setRange(1.0, 5000.0)
+        self.spin_stream_ttl_refrac.setDecimals(1)
+        self.spin_stream_ttl_refrac.setValue(100.0)
+        self.spin_stream_ttl_refrac.setSuffix(" ms")
+        self.spin_stream_ttl_refrac.valueChanged.connect(self._on_streaming_ui_changed)
+        trig_form.addRow("TTL Refractory:", self.spin_stream_ttl_refrac)
+
+        self.chk_stream_auto_align = QCheckBox(
+            "Auto-Align Trigger Sample Clock", trig_grp
+        )
+        self.chk_stream_auto_align.setChecked(True)
+        self.chk_stream_auto_align.toggled.connect(self._on_streaming_ui_changed)
+        trig_form.addRow("", self.chk_stream_auto_align)
+        layout.addWidget(trig_grp)
+
+        # Online Filtering & Performance
+        perf_grp = QGroupBox("Online Filtering & Performance", grp)
+        perf_form = QFormLayout(perf_grp)
+        perf_form.setContentsMargins(6, 6, 6, 6)
+        perf_form.setSpacing(4)
+
+        self.chk_stream_filter = QCheckBox("Online Bandpass Filter", perf_grp)
+        self.chk_stream_filter.setChecked(True)
+        self.chk_stream_filter.toggled.connect(self._on_streaming_ui_changed)
+        perf_form.addRow("", self.chk_stream_filter)
+
+        self.spin_stream_filter_low = QDoubleSpinBox(perf_grp)
+        self.spin_stream_filter_low.setRange(1.0, 5000.0)
+        self.spin_stream_filter_low.setValue(500.0)
+        self.spin_stream_filter_low.setSuffix(" Hz")
+        self.spin_stream_filter_low.valueChanged.connect(self._on_streaming_ui_changed)
+        perf_form.addRow("Filter Low:", self.spin_stream_filter_low)
+
+        self.spin_stream_filter_high = QDoubleSpinBox(perf_grp)
+        self.spin_stream_filter_high.setRange(100.0, 20000.0)
+        self.spin_stream_filter_high.setValue(7000.0)
+        self.spin_stream_filter_high.setSuffix(" Hz")
+        self.spin_stream_filter_high.valueChanged.connect(self._on_streaming_ui_changed)
+        perf_form.addRow("Filter High:", self.spin_stream_filter_high)
+
+        self.chk_stream_disk_cache = QCheckBox("Disk-Backed Live Buffer", perf_grp)
+        self.chk_stream_disk_cache.setChecked(True)
+        self.chk_stream_disk_cache.toggled.connect(self._on_streaming_ui_changed)
+        perf_form.addRow("", self.chk_stream_disk_cache)
+
+        self.spin_stream_refresh_ms = QSpinBox(perf_grp)
+        self.spin_stream_refresh_ms.setRange(10, 500)
+        self.spin_stream_refresh_ms.setValue(33)
+        self.spin_stream_refresh_ms.setSuffix(" ms")
+        self.spin_stream_refresh_ms.valueChanged.connect(self._on_streaming_ui_changed)
+        perf_form.addRow("UI Refresh Rate:", self.spin_stream_refresh_ms)
+        layout.addWidget(perf_grp)
+
+        # Connection (ZMQ / HTTP)
+        conn_grp = QGroupBox("Connection (ZMQ / HTTP)", grp)
+        conn_form = QFormLayout(conn_grp)
+        conn_form.setContentsMargins(6, 6, 6, 6)
+        conn_form.setSpacing(4)
+
+        self.edit_stream_host = QLineEdit("127.0.0.1", conn_grp)
+        self.edit_stream_host.editingFinished.connect(self._on_streaming_ui_changed)
+        conn_form.addRow("Host:", self.edit_stream_host)
+
+        self.spin_stream_data_port = QSpinBox(conn_grp)
+        self.spin_stream_data_port.setRange(1024, 65535)
+        self.spin_stream_data_port.setValue(5556)
+        self.spin_stream_data_port.valueChanged.connect(self._on_streaming_ui_changed)
+        conn_form.addRow("Data Port:", self.spin_stream_data_port)
+
+        self.spin_stream_event_port = QSpinBox(conn_grp)
+        self.spin_stream_event_port.setRange(1024, 65535)
+        self.spin_stream_event_port.setValue(5557)
+        self.spin_stream_event_port.valueChanged.connect(self._on_streaming_ui_changed)
+        conn_form.addRow("Event Port:", self.spin_stream_event_port)
+
+        self.spin_stream_http_port = QSpinBox(conn_grp)
+        self.spin_stream_http_port.setRange(1024, 65535)
+        self.spin_stream_http_port.setValue(37497)
+        self.spin_stream_http_port.valueChanged.connect(self._on_streaming_ui_changed)
+        conn_form.addRow("HTTP Port:", self.spin_stream_http_port)
+
+        self.combo_stream_mode = QComboBox(conn_grp)
+        self.combo_stream_mode.addItem("Standard OE ZMQ + Events", "zmq_raw")
+        self.combo_stream_mode.addItem("SpikeSpy C++ Plugin (Pre-Sliced)", "sliced_erp")
+        self.combo_stream_mode.currentIndexChanged.connect(
+            self._on_streaming_ui_changed
+        )
+        conn_form.addRow("Stream Mode:", self.combo_stream_mode)
+        layout.addWidget(conn_grp)
+
+        return grp
+
     # ---------------------------------------------------------
     # Active View Tracking & Population
     # ---------------------------------------------------------
@@ -677,15 +993,432 @@ class ViewSettingsPanel(QWidget):
             self._refresh_unit_combo()
             self._refresh_channel_combo()
             self._sync_follow_events_checkbox()
+            self._sync_streaming_controls_from_state()
             if hasattr(self, "chk_hide_top_bars"):
                 self.chk_hide_top_bars.setChecked(getattr(self.state, "hide_view_top_bars", False))
 
     def setState(self, state):
         self.set_state(state)
 
+    # ---------------------------------------------------------
+    # Pagination & Pinning
+    # ---------------------------------------------------------
+    @property
+    def current_page(self) -> str:
+        return self._current_page
+
+    def get_settings_page(self) -> str:
+        return self._current_page
+
+    def set_settings_page(self, page_key: str):
+        if page_key not in self._VALID_PAGES:
+            return
+        changed = self._current_page != page_key
+        self._current_page = page_key
+        btn = self.page_buttons.get(page_key)
+        if btn is not None:
+            with QSignalBlocker(btn):
+                btn.setChecked(True)
+        self._update_page_visibility()
+        if changed:
+            self.pageChanged.emit(page_key)
+
+    set_page = set_settings_page
+
+    def _show_page_button_context_menu(self, page_key: str, btn: QWidget, pos):
+        menu = QMenu(btn)
+        page_names = {
+            "view": "View",
+            "channels": "Channels",
+            "unit": "Unit",
+            "nav": "Nav",
+            "stream": "Stream",
+            "all": "All",
+        }
+        label = page_names.get(page_key, page_key.capitalize())
+        act = menu.addAction(f"Open '{label}' in Split Settings Panel")
+        act.triggered.connect(
+            lambda _checked=False, k=page_key: self._spawn_split_panel(
+                target_view=self.active_view if self.is_pinned else None,
+                pinned=self.is_pinned,
+                page=k,
+            )
+        )
+        menu.exec(btn.mapToGlobal(pos))
+
+    def _find_mdi_view(self):
+        curr = self.parentWidget() if hasattr(self, "parentWidget") else None
+        while curr is not None:
+            if curr.__class__.__name__ == "MdiView" or hasattr(curr, "new_settings_panel"):
+                return curr
+            curr = curr.parentWidget() if hasattr(curr, "parentWidget") else None
+        win = self.window()
+        if win is not None and (
+            win.__class__.__name__ == "MdiView" or hasattr(win, "new_settings_panel")
+        ):
+            return win
+        app = QApplication.instance()
+        if app is not None:
+            for top_w in app.topLevelWidgets():
+                if top_w.__class__.__name__ == "MdiView" or hasattr(top_w, "new_settings_panel"):
+                    return top_w
+        return None
+
+    def _spawn_split_panel(
+        self,
+        target_view: Optional[QWidget] = None,
+        pinned: bool = False,
+        page: str = "view",
+    ):
+        mdi = self._find_mdi_view()
+        if mdi is not None and hasattr(mdi, "new_settings_panel"):
+            mdi.new_settings_panel(
+                target_view=target_view, pinned=pinned, page=page
+            )
+
+    def _get_view_display_name(self, view: QWidget) -> str:
+        mdi = self._find_mdi_view()
+        if mdi is not None and hasattr(mdi, "dock_manager") and mdi.dock_manager is not None:
+            for dw in mdi.dock_manager.dockWidgets():
+                w = dw.widget() if hasattr(dw, "widget") else None
+                if w is view:
+                    return dw.windowTitle() or view.__class__.__name__
+                if w is not None and hasattr(w, "sub_views") and view in w.sub_views:
+                    parent_title = dw.windowTitle() or w.__class__.__name__
+                    return f"{parent_title} → {view.__class__.__name__}"
+        title = view.windowTitle() if hasattr(view, "windowTitle") else ""
+        return title or view.__class__.__name__
+
+    def refresh_target_views(self):
+        if not hasattr(self, "combo_target_view"):
+            return
+        with QSignalBlocker(self.combo_target_view):
+            self.combo_target_view.clear()
+            self.combo_target_view.addItem("🎯 Follow Focused View", userData=None)
+
+            views: List[tuple] = []
+            seen = set()
+            mdi = self._find_mdi_view()
+            if mdi is not None and hasattr(mdi, "dock_manager") and mdi.dock_manager is not None:
+                for dw in mdi.dock_manager.dockWidgets():
+                    w = dw.widget() if hasattr(dw, "widget") else None
+                    if w is None or isinstance(w, ViewSettingsPanel):
+                        continue
+                    if not self._is_view_alive(w):
+                        continue
+                    dw_title = dw.windowTitle() or w.__class__.__name__
+                    if hasattr(w, "sub_views"):
+                        if self._is_configurable_view(w) and id(w) not in seen:
+                            seen.add(id(w))
+                            views.append((dw_title, w))
+                        for sv in getattr(w, "sub_views", []):
+                            if self._is_configurable_view(sv) and id(sv) not in seen:
+                                seen.add(id(sv))
+                                views.append((f"  {dw_title} → {sv.__class__.__name__}", sv))
+                    elif self._is_configurable_view(w) and id(w) not in seen:
+                        seen.add(id(w))
+                        views.append((dw_title, w))
+
+            if (
+                self.is_pinned
+                and self._is_view_alive(self.pinned_view)
+                and id(self.pinned_view) not in seen
+            ):
+                seen.add(id(self.pinned_view))
+                views.append((self._get_view_display_name(self.pinned_view), self.pinned_view))
+
+            for label, vw in views:
+                self.combo_target_view.addItem(f"📌 {label}", userData=vw)
+
+            if self.is_pinned and self._is_view_alive(self.pinned_view):
+                selected_idx = 0
+                for idx in range(1, self.combo_target_view.count()):
+                    if self.combo_target_view.itemData(idx) is self.pinned_view:
+                        selected_idx = idx
+                        break
+                self.combo_target_view.setCurrentIndex(selected_idx)
+            else:
+                self.combo_target_view.setCurrentIndex(0)
+
+    def pin_to_view(self, view: Optional[QWidget]):
+        resolved = self._resolve_view(view) if view is not None else None
+        if resolved is None or not self._is_configurable_view(resolved):
+            resolved = self.active_view
+        if resolved is None or not self._is_view_alive(resolved):
+            return
+        self.is_pinned = False
+        self.setActiveView(resolved, force=True)
+        self.is_pinned = True
+        self.pinned_view = self.active_view
+        with QSignalBlocker(self.btn_pin_view):
+            self.btn_pin_view.setChecked(True)
+        self.refresh_target_views()
+        self.lbl_view_sub.setText("📌 Pinned to window (fixed)")
+        self.pinStateChanged.emit(True, self.pinned_view)
+
+    def unpin_view(self):
+        self.is_pinned = False
+        self.pinned_view = None
+        with QSignalBlocker(self.btn_pin_view):
+            self.btn_pin_view.setChecked(False)
+        with QSignalBlocker(self.combo_target_view):
+            if self.combo_target_view.count() > 0:
+                self.combo_target_view.setCurrentIndex(0)
+        if self.active_view is not None and self._is_view_alive(self.active_view):
+            self.lbl_view_sub.setText("Settings follow this active view.")
+        else:
+            self.lbl_view_sub.setText("Click any view window to edit its settings.")
+        self.pinStateChanged.emit(False, None)
+
+    def set_pinned(self, pinned: bool, target_view: Optional[QWidget] = None):
+        if pinned:
+            self.pin_to_view(target_view or self.active_view)
+        else:
+            self.unpin_view()
+
+    def _on_pin_toggled(self, checked: bool):
+        if checked:
+            target = self.combo_target_view.currentData()
+            if target is None:
+                target = self.active_view
+            if target is None or not self._is_view_alive(target):
+                with QSignalBlocker(self.btn_pin_view):
+                    self.btn_pin_view.setChecked(False)
+                return
+            self.pin_to_view(target)
+        else:
+            self.unpin_view()
+
+    def _on_target_combo_changed(self, idx: int):
+        target = self.combo_target_view.itemData(idx)
+        if target is None:
+            if self.is_pinned:
+                self.unpin_view()
+        else:
+            self.pin_to_view(target)
+
+    def _on_spawn_pinned_clicked(self):
+        self._spawn_split_panel(
+            target_view=self.active_view,
+            pinned=(self.active_view is not None),
+            page=self._current_page,
+        )
+
+    def _update_page_visibility(self):
+        page = self._current_page
+        in_view = page in ("view", "all")
+        in_channels = page in ("channels", "all")
+        in_unit = page in ("unit", "all")
+        in_nav = page in ("nav", "all")
+        in_stream = page in ("stream", "all")
+
+        alive = self._is_view_alive(self.active_view)
+        if not alive:
+            self.placeholder.setVisible(in_view)
+            self.grp_multitrace.setVisible(False)
+            self.grp_singletrace.setVisible(False)
+            self.grp_fixed.setVisible(False)
+            self.grp_unit.setVisible(False)
+            if getattr(self, "_custom_plugin_grp", None) is not None:
+                self._custom_plugin_grp.setVisible(False)
+            self.grp_navigation.setVisible(False)
+            self.grp_unit_selector.setVisible(in_channels)
+            self.grp_active_unit_info.setVisible(in_unit)
+            self.grp_streaming.setVisible(in_stream)
+            return
+
+        c_name = self.active_view.__class__.__name__
+        is_mt = "MultiTraceView" in c_name or "MultiTracePGView" in c_name
+        is_st = "SingleTraceView" in c_name or "SingleTracePGView" in c_name
+        is_fix = "MultiTraceFixed" in c_name
+        is_unit = "UnitView" in c_name or "UnitFootprint" in c_name or "UnitPG" in c_name
+        has_custom = getattr(self, "_custom_plugin_grp", None) is not None
+        has_any_view_grp = is_mt or is_st or is_fix or is_unit or has_custom
+        has_nav = (
+            hasattr(self.active_view, "get_view_range")
+            and callable(getattr(self.active_view, "get_view_range"))
+        ) or hasattr(self.active_view, "ax")
+
+        self.grp_multitrace.setVisible(in_view and is_mt)
+        self.grp_singletrace.setVisible(in_view and is_st)
+        self.grp_fixed.setVisible(in_view and is_fix)
+        self.grp_unit.setVisible(in_view and is_unit)
+        if has_custom:
+            self._custom_plugin_grp.setVisible(in_view)
+        self.placeholder.setVisible(in_view and not has_any_view_grp)
+        self.grp_unit_selector.setVisible(in_channels)
+        self.grp_active_unit_info.setVisible(in_unit)
+        self.grp_navigation.setVisible(in_nav and has_nav)
+        self.grp_streaming.setVisible(in_stream)
+
+    def _find_live_view(self):
+        mdi = self._find_mdi_view()
+        if mdi is not None and hasattr(mdi, "dock_manager") and mdi.dock_manager is not None:
+            for dw in mdi.dock_manager.dockWidgets():
+                w = dw.widget() if hasattr(dw, "widget") else None
+                if w is not None and w.__class__.__name__ == "OpenEphysLiveView":
+                    return w
+        return None
+
+    def _on_stream_toggle_clicked(self):
+        live_view = self._find_live_view()
+        if live_view is not None and hasattr(live_view, "toggle_stream"):
+            live_view.toggle_stream()
+        else:
+            mdi = self._find_mdi_view()
+            if mdi is not None and hasattr(mdi, "newWindow"):
+                live_view = mdi.newWindow("OpenEphysLive")
+                if live_view is not None and hasattr(live_view, "toggle_stream"):
+                    live_view.toggle_stream()
+            elif self.state is not None:
+                if getattr(self.state, "is_streaming", False):
+                    if hasattr(self.state, "stop_live_session"):
+                        self.state.stop_live_session()
+                elif hasattr(self.state, "start_live_session"):
+                    self.state.start_live_session()
+        self._sync_streaming_controls_from_state()
+
+    def _on_open_live_cockpit_clicked(self):
+        mdi = self._find_mdi_view()
+        if mdi is not None and hasattr(mdi, "newWindow"):
+            mdi.newWindow("OpenEphysLive")
+
+    def _on_stream_follow_live_toggled(self, checked: bool):
+        if self._syncing_streaming:
+            return
+        self.set_follow_live_events(checked)
+
+    def _on_streaming_ui_changed(self, *args):
+        if self._syncing_streaming or self.state is None:
+            return
+        if hasattr(self.state, "update_live_config"):
+            trig_src = self.combo_stream_trig_source.currentData() or "ttl"
+            stream_mode = self.combo_stream_mode.currentData() or "zmq_raw"
+            self.state.update_live_config(
+                rec_chan=self.spin_stream_rec_chan.value(),
+                active_channels=self.edit_stream_active_chans.text(),
+                window_ms=self.spin_stream_window_ms.value(),
+                pre_ms=self.spin_stream_pre_ms.value(),
+                trigger_source=trig_src,
+                adc_trigger_chan=self.spin_stream_adc_chan.value(),
+                ttl_threshold_v=self.spin_stream_ttl_thresh.value(),
+                ttl_refractory_ms=self.spin_stream_ttl_refrac.value(),
+                auto_align_clock=self.chk_stream_auto_align.isChecked(),
+                online_filter=self.chk_stream_filter.isChecked(),
+                filter_low_hz=self.spin_stream_filter_low.value(),
+                filter_high_hz=self.spin_stream_filter_high.value(),
+                live_disk_cache=self.chk_stream_disk_cache.isChecked(),
+                ui_refresh_rate_ms=self.spin_stream_refresh_ms.value(),
+                host=self.edit_stream_host.text().strip(),
+                data_port=self.spin_stream_data_port.value(),
+                event_port=self.spin_stream_event_port.value(),
+                http_port=self.spin_stream_http_port.value(),
+                stream_mode=stream_mode,
+            )
+        self.settingsChanged.emit()
+
+    def _sync_streaming_controls_from_state(self, *args):
+        if not hasattr(self, "grp_streaming") or self.state is None:
+            return
+        self._syncing_streaming = True
+        try:
+            is_streaming = bool(getattr(self.state, "is_streaming", False))
+            if is_streaming:
+                self.lbl_stream_status.setText("● LIVE")
+                self.lbl_stream_status.setStyleSheet("color: #166534; font-weight: bold;")
+                self.btn_stream_toggle.setText("Stop Live Stream")
+            else:
+                self.lbl_stream_status.setText("○ Offline")
+                self.lbl_stream_status.setStyleSheet("color: #475569; font-weight: bold;")
+                self.btn_stream_toggle.setText("Start Live Stream")
+
+            following = bool(getattr(self.state, "follow_live", True))
+            with QSignalBlocker(self.chk_stream_follow_live):
+                self.chk_stream_follow_live.setChecked(following)
+
+            cfg = (
+                self.state.get_live_config()
+                if hasattr(self.state, "get_live_config")
+                else getattr(self.state, "live_config", {})
+            )
+            if not isinstance(cfg, dict):
+                return
+
+            widgets = [
+                self.spin_stream_rec_chan,
+                self.edit_stream_active_chans,
+                self.spin_stream_window_ms,
+                self.spin_stream_pre_ms,
+                self.combo_stream_trig_source,
+                self.spin_stream_adc_chan,
+                self.spin_stream_ttl_thresh,
+                self.spin_stream_ttl_refrac,
+                self.chk_stream_auto_align,
+                self.chk_stream_filter,
+                self.spin_stream_filter_low,
+                self.spin_stream_filter_high,
+                self.chk_stream_disk_cache,
+                self.spin_stream_refresh_ms,
+                self.edit_stream_host,
+                self.spin_stream_data_port,
+                self.spin_stream_event_port,
+                self.spin_stream_http_port,
+                self.combo_stream_mode,
+            ]
+            blockers = [QSignalBlocker(w) for w in widgets]
+            try:
+                if "rec_chan" in cfg:
+                    self.spin_stream_rec_chan.setValue(int(cfg["rec_chan"]))
+                if "active_channels" in cfg:
+                    self.edit_stream_active_chans.setText(str(cfg["active_channels"]))
+                if "window_ms" in cfg:
+                    self.spin_stream_window_ms.setValue(float(cfg["window_ms"]))
+                if "pre_ms" in cfg:
+                    self.spin_stream_pre_ms.setValue(float(cfg["pre_ms"]))
+                if "trigger_source" in cfg:
+                    idx = self.combo_stream_trig_source.findData(str(cfg["trigger_source"]))
+                    if idx >= 0:
+                        self.combo_stream_trig_source.setCurrentIndex(idx)
+                if "adc_trigger_chan" in cfg:
+                    self.spin_stream_adc_chan.setValue(int(cfg["adc_trigger_chan"]))
+                if "ttl_threshold_v" in cfg:
+                    self.spin_stream_ttl_thresh.setValue(float(cfg["ttl_threshold_v"]))
+                if "ttl_refractory_ms" in cfg:
+                    self.spin_stream_ttl_refrac.setValue(float(cfg["ttl_refractory_ms"]))
+                if "auto_align_clock" in cfg:
+                    self.chk_stream_auto_align.setChecked(bool(cfg["auto_align_clock"]))
+                if "online_filter" in cfg:
+                    self.chk_stream_filter.setChecked(bool(cfg["online_filter"]))
+                if "filter_low_hz" in cfg:
+                    self.spin_stream_filter_low.setValue(float(cfg["filter_low_hz"]))
+                if "filter_high_hz" in cfg:
+                    self.spin_stream_filter_high.setValue(float(cfg["filter_high_hz"]))
+                if "live_disk_cache" in cfg:
+                    self.chk_stream_disk_cache.setChecked(bool(cfg["live_disk_cache"]))
+                if "ui_refresh_rate_ms" in cfg:
+                    self.spin_stream_refresh_ms.setValue(int(cfg["ui_refresh_rate_ms"]))
+                if "host" in cfg:
+                    self.edit_stream_host.setText(str(cfg["host"]))
+                if "data_port" in cfg:
+                    self.spin_stream_data_port.setValue(int(cfg["data_port"]))
+                if "event_port" in cfg:
+                    self.spin_stream_event_port.setValue(int(cfg["event_port"]))
+                if "http_port" in cfg:
+                    self.spin_stream_http_port.setValue(int(cfg["http_port"]))
+                if "stream_mode" in cfg:
+                    idx = self.combo_stream_mode.findData(str(cfg["stream_mode"]))
+                    if idx >= 0:
+                        self.combo_stream_mode.setCurrentIndex(idx)
+            finally:
+                del blockers
+        finally:
+            self._syncing_streaming = False
+
     def show_channel_groups_editor(self, open_pane: bool = True, target_bar: Optional[ChannelGroupBar] = None):
         """Shows or hides the Channel Groups editor pane inside the View Settings panel."""
-        self.grp_unit_selector.setVisible(True)
+        if open_pane and self._current_page not in ("channels", "all"):
+            self.set_settings_page("channels")
+        self.grp_unit_selector.setVisible(self._current_page in ("channels", "all") or bool(open_pane))
         with QSignalBlocker(self.btn_channel_settings):
             self.btn_channel_settings.setChecked(bool(open_pane))
         self.channel_groups_editor.setVisible(bool(open_pane))
@@ -747,12 +1480,20 @@ class ViewSettingsPanel(QWidget):
         if hasattr(self.state, "onFollowLiveChanged"):
             self._state_connections.append((self.state.onFollowLiveChanged, self._sync_follow_events_checkbox))
             self.state.onFollowLiveChanged.connect(self._sync_follow_events_checkbox)
+            self._state_connections.append((self.state.onFollowLiveChanged, self._sync_streaming_controls_from_state))
+            self.state.onFollowLiveChanged.connect(self._sync_streaming_controls_from_state)
         if hasattr(self.state, "onStimNoChange"):
             self._state_connections.append((self.state.onStimNoChange, self._sync_follow_events_checkbox))
             self.state.onStimNoChange.connect(self._sync_follow_events_checkbox)
         if hasattr(self.state, "onNewSweep"):
             self._state_connections.append((self.state.onNewSweep, self._sync_follow_events_checkbox))
             self.state.onNewSweep.connect(self._sync_follow_events_checkbox)
+        if hasattr(self.state, "onLiveConfigChanged"):
+            self._state_connections.append((self.state.onLiveConfigChanged, self._sync_streaming_controls_from_state))
+            self.state.onLiveConfigChanged.connect(self._sync_streaming_controls_from_state)
+        if hasattr(self.state, "onStreamStateChanged"):
+            self._state_connections.append((self.state.onStreamStateChanged, self._sync_streaming_controls_from_state))
+            self.state.onStreamStateChanged.connect(self._sync_streaming_controls_from_state)
 
     def _find_parent_container(self, view: Optional[QWidget]) -> Optional[Any]:
         if view is None:
@@ -1273,20 +2014,27 @@ class ViewSettingsPanel(QWidget):
             return None
         return None
 
-    def setActiveView(self, view: Optional[QWidget]):
+    def setActiveView(self, view: Optional[QWidget], force: bool = False):
         """Sets the active view to display/edit in this settings panel.
         Retains the latest valid configurable visualizer when non-configurable panels are clicked.
         """
+        if self.is_pinned and not force:
+            if not self._is_view_alive(self.pinned_view):
+                self.is_pinned = False
+                self.pinned_view = None
+                with QSignalBlocker(self.btn_pin_view):
+                    self.btn_pin_view.setChecked(False)
+                self.refresh_target_views()
+                self.pinStateChanged.emit(False, None)
+            else:
+                candidate = self._resolve_view(view) if view is not None else None
+                if candidate is not self.pinned_view:
+                    return
+
         if view is None:
             self._disconnect_current_view()
             self.lbl_view_title.setText("<b>No View Selected</b>")
             self.lbl_view_sub.setText("Click any view window to edit its settings.")
-            self.grp_unit_selector.setVisible(False)
-            self.grp_multitrace.setVisible(False)
-            self.grp_singletrace.setVisible(False)
-            self.grp_fixed.setVisible(False)
-            self.grp_unit.setVisible(False)
-            self.grp_navigation.setVisible(False)
             if (
                 hasattr(self, "_custom_plugin_grp")
                 and self._custom_plugin_grp is not None
@@ -1294,9 +2042,9 @@ class ViewSettingsPanel(QWidget):
                 self._custom_plugin_grp.setVisible(False)
                 self._custom_plugin_grp.deleteLater()
                 self._custom_plugin_grp = None
-            self.placeholder.setVisible(True)
             if hasattr(self, "unit_info_widget") and self.unit_info_widget is not None:
                 self.unit_info_widget.set_target_unit(None)
+            self._update_page_visibility()
             self._block_updates = False
             return
 
@@ -1323,7 +2071,10 @@ class ViewSettingsPanel(QWidget):
             else:
                 return
 
-        if self.active_view == resolved and self._is_view_alive(self.active_view):
+        if force and self.is_pinned and view is not None:
+            self.pinned_view = resolved
+
+        if not force and self.active_view == resolved and self._is_view_alive(self.active_view):
             return
 
         self.active_view = resolved
@@ -1349,11 +2100,9 @@ class ViewSettingsPanel(QWidget):
             if view is None:
                 self.lbl_view_title.setText("<b>No View Selected</b>")
                 self.lbl_view_sub.setText("Click any view window to edit its settings.")
-                self.grp_unit_selector.setVisible(False)
-                self.placeholder.setVisible(True)
+                self._update_page_visibility()
                 return
 
-            self.grp_unit_selector.setVisible(True)
             bound_unit = self._resolve_active_view_bound_unit(view)
 
             with QSignalBlocker(self.combo_unit):
@@ -1389,26 +2138,25 @@ class ViewSettingsPanel(QWidget):
 
             c_name = view.__class__.__name__
             self.lbl_view_title.setText(f"<b>{c_name}</b>")
-            self.lbl_view_sub.setText("Settings follow this active view.")
+            if self.is_pinned and self.pinned_view is view:
+                self.lbl_view_sub.setText("📌 Pinned to window (fixed)")
+            else:
+                self.lbl_view_sub.setText("Settings follow this active view.")
 
             # Detect MultiTrace (Matplotlib or PG)
             if "MultiTraceView" in c_name or "MultiTracePGView" in c_name:
-                self.grp_multitrace.setVisible(True)
                 self._populate_multitrace(view)
 
             # Detect SingleTrace (Matplotlib or PG)
             elif "SingleTraceView" in c_name or "SingleTracePGView" in c_name:
-                self.grp_singletrace.setVisible(True)
                 self._populate_singletrace(view)
 
             # Detect MultiTraceFixed (Matplotlib or PG)
             elif "MultiTraceFixed" in c_name:
-                self.grp_fixed.setVisible(True)
                 self._populate_fixed(view)
 
             # Detect UnitView / UnitFootprint (Matplotlib or PG)
             elif "UnitView" in c_name or "UnitFootprint" in c_name or "UnitPG" in c_name:
-                self.grp_unit.setVisible(True)
                 self._populate_unit(view)
 
             elif hasattr(view, "populate_settings_panel") and callable(
@@ -1420,23 +2168,63 @@ class ViewSettingsPanel(QWidget):
                 self.container_layout.insertWidget(
                     self.container_layout.count() - 1, self._custom_plugin_grp
                 )
-                self._custom_plugin_grp.setVisible(True)
 
             else:
                 self.placeholder.setText(
                     f"{c_name} has no view-specific visual parameters."
                 )
-                self.placeholder.setVisible(True)
 
-            # Show Navigation & Limits group if supported
+            # Populate Navigation & Limits group if supported
             if (
                 hasattr(view, "get_view_range")
                 and callable(getattr(view, "get_view_range"))
             ) or hasattr(view, "ax"):
-                self.grp_navigation.setVisible(True)
                 self._populate_navigation(view)
+
+            self._update_page_visibility()
         finally:
             self._block_updates = False
+
+    def get_settings(self) -> dict:
+        pinned_title = ""
+        if self.is_pinned and self._is_view_alive(self.pinned_view):
+            pinned_title = self._get_view_display_name(self.pinned_view)
+        return {
+            "current_page": self._current_page,
+            "is_pinned": bool(self.is_pinned),
+            "pinned_view_title": pinned_title,
+        }
+
+    def set_settings(self, s: dict):
+        if not isinstance(s, dict):
+            return
+        page = s.get("current_page")
+        if page in self._VALID_PAGES:
+            self.set_settings_page(page)
+        if s.get("is_pinned"):
+            pinned_title = s.get("pinned_view_title") or ""
+            target = None
+            if pinned_title:
+                mdi = self._find_mdi_view()
+                if mdi is not None and hasattr(mdi, "dock_manager") and mdi.dock_manager is not None:
+                    for dw in mdi.dock_manager.dockWidgets():
+                        w = dw.widget() if hasattr(dw, "widget") else None
+                        if w is None or isinstance(w, ViewSettingsPanel):
+                            continue
+                        if (dw.windowTitle() or w.__class__.__name__) == pinned_title:
+                            target = w
+                            break
+                        if hasattr(w, "sub_views"):
+                            for sv in getattr(w, "sub_views", []):
+                                if self._get_view_display_name(sv) == pinned_title:
+                                    target = sv
+                                    break
+                            if target is not None:
+                                break
+            if target is not None:
+                self.pin_to_view(target)
+        elif "is_pinned" in s and not s.get("is_pinned"):
+            self.unpin_view()
 
     def _populate_multitrace(self, view):
         supports_plots = hasattr(view, "get_plot_specs") and callable(

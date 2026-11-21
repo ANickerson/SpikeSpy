@@ -257,23 +257,50 @@ def notify_view_selected(view_or_child, ensure_panel_visible: bool = True):
     if mdi is None:
         app = QApplication.instance()
         if app is not None:
+            fallback_mdi = None
             for top_w in app.topLevelWidgets():
                 if not _qt_is_valid(top_w):
                     continue
                 if top_w.__class__.__name__ == "MdiView" or hasattr(top_w, "settings_panel"):
-                    mdi = top_w
-                    break
+                    if top_w.isVisible():
+                        mdi = top_w
+                        break
+                    if fallback_mdi is None:
+                        fallback_mdi = top_w
+            if mdi is None:
+                mdi = fallback_mdi
 
     if mdi is not None and _qt_is_valid(mdi):
         if getattr(mdi, "settings_panel", None) is None and hasattr(mdi, "open_or_show_view_settings_panel"):
             mdi.open_or_show_view_settings_panel()
 
+        resolved = None
         if hasattr(mdi, "settings_panel") and mdi.settings_panel is not None and _qt_is_valid(mdi.settings_panel):
             try:
                 resolved = mdi.settings_panel._resolve_view(view_or_child)
                 if resolved is not None and _qt_is_valid(resolved) and mdi.settings_panel._is_configurable_view(resolved):
-                    mdi.settings_panel.setActiveView(resolved)
+                    if not getattr(mdi.settings_panel, "is_pinned", False):
+                        mdi.settings_panel.setActiveView(resolved)
                     if ensure_panel_visible and hasattr(mdi, "open_or_show_view_settings_panel"):
                         mdi.open_or_show_view_settings_panel()
+            except RuntimeError:
+                pass
+
+        for sp in list(getattr(mdi, "extra_settings_panels", [])):
+            if sp is None or not _qt_is_valid(sp):
+                continue
+            try:
+                if hasattr(sp, "refresh_target_views"):
+                    sp.refresh_target_views()
+                if not getattr(sp, "is_pinned", False):
+                    sp_resolved = resolved
+                    if sp_resolved is None and hasattr(sp, "_resolve_view"):
+                        sp_resolved = sp._resolve_view(view_or_child)
+                    if (
+                        sp_resolved is not None
+                        and _qt_is_valid(sp_resolved)
+                        and sp._is_configurable_view(sp_resolved)
+                    ):
+                        sp.setActiveView(sp_resolved)
             except RuntimeError:
                 pass

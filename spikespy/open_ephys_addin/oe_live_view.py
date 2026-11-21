@@ -76,6 +76,7 @@ class OpenEphysLiveView(QWidget):
         self._diag_tick = 0
         self._last_synced_annotation_key = None
         self._syncing_follow_live = False
+        self._syncing_live_config = False
 
         # Replay of an already-loaded recording through the live pipeline.
         self._is_replaying = False
@@ -159,6 +160,7 @@ class OpenEphysLiveView(QWidget):
         conn_grid.setVerticalSpacing(4)
 
         self.edit_host = QLineEdit("127.0.0.1")
+        self.edit_host.editingFinished.connect(self._push_live_config_to_state)
         self.spin_data_port = QSpinBox()
         self.spin_data_port.setRange(1024, 65535)
         self.spin_data_port.setValue(5556)
@@ -168,10 +170,12 @@ class OpenEphysLiveView(QWidget):
         self.spin_event_port = QSpinBox()
         self.spin_event_port.setRange(1024, 65535)
         self.spin_event_port.setValue(5557)
+        self.spin_event_port.valueChanged.connect(self._push_live_config_to_state)
 
         self.spin_http_port = QSpinBox()
         self.spin_http_port.setRange(1024, 65535)
         self.spin_http_port.setValue(37497)
+        self.spin_http_port.valueChanged.connect(self._push_live_config_to_state)
 
         self.combo_stream_mode = QComboBox()
         self.combo_stream_mode.addItems(
@@ -179,6 +183,9 @@ class OpenEphysLiveView(QWidget):
                 "Standard OE ZMQ + Event Broadcaster",
                 "Custom SpikeSpy C++ Plugin (Pre-Sliced)",
             ]
+        )
+        self.combo_stream_mode.currentIndexChanged.connect(
+            self._push_live_config_to_state
         )
 
         conn_grid.addWidget(QLabel("Host:"), 0, 0)
@@ -253,20 +260,28 @@ class OpenEphysLiveView(QWidget):
 
         self.combo_trigger_source = QComboBox()
         self.combo_trigger_source.addItems(["Digital TTL Event", "Analog ADC Channel"])
+        self.combo_trigger_source.currentIndexChanged.connect(
+            self._push_live_config_to_state
+        )
 
         self.spin_adc_trigger_chan = QSpinBox()
         self.spin_adc_trigger_chan.setRange(0, 64)
         self.spin_adc_trigger_chan.setValue(1)
+        self.spin_adc_trigger_chan.valueChanged.connect(
+            self._push_live_config_to_state
+        )
 
         self.spin_window_ms = QDoubleSpinBox()
         self.spin_window_ms.setRange(10.0, 5000.0)
         self.spin_window_ms.setValue(500.0)
         self.spin_window_ms.setSuffix(" ms")
+        self.spin_window_ms.valueChanged.connect(self._push_live_config_to_state)
 
         self.spin_pre_ms = QDoubleSpinBox()
         self.spin_pre_ms.setRange(0.0, 500.0)
         self.spin_pre_ms.setValue(0.0)
         self.spin_pre_ms.setSuffix(" ms")
+        self.spin_pre_ms.valueChanged.connect(self._push_live_config_to_state)
 
         self.chk_online_filter = QCheckBox("Online Bandpass (500 – 7000 Hz)")
         self.chk_online_filter.setChecked(True)
@@ -298,6 +313,7 @@ class OpenEphysLiveView(QWidget):
 
         self.chk_sync_annotations = QCheckBox("Sync Annotations to MessageCenter")
         self.chk_sync_annotations.setChecked(True)
+        self.chk_sync_annotations.toggled.connect(self._push_live_config_to_state)
 
         self.spin_target_proc = QSpinBox()
         self.spin_target_proc.setRange(0, 9999)
@@ -537,6 +553,121 @@ class OpenEphysLiveView(QWidget):
         if hasattr(self.state, "onFollowLiveChanged"):
             self.state.onFollowLiveChanged.connect(self._sync_follow_live_checkbox)
         self._sync_follow_live_checkbox()
+        if self.state is not None and hasattr(self.state, "onLiveConfigChanged"):
+            self.state.onLiveConfigChanged.connect(self._on_state_live_config_changed)
+            self._on_state_live_config_changed()
+
+    @Slot()
+    def _push_live_config_to_state(self, *args):
+        if self._syncing_live_config:
+            return
+        if self.state is None or not hasattr(self.state, "update_live_config"):
+            return
+        stream_mode = (
+            "sliced_erp" if self.combo_stream_mode.currentIndex() == 1 else "zmq_raw"
+        )
+        trigger_source = (
+            "ttl" if self.combo_trigger_source.currentIndex() == 0 else "analog"
+        )
+        self.state.update_live_config(
+            host=self.edit_host.text().strip(),
+            http_port=self.spin_http_port.value(),
+            data_port=self.spin_data_port.value(),
+            event_port=self.spin_event_port.value(),
+            stream_mode=stream_mode,
+            rec_chan=self.spin_rec_chan.value(),
+            active_channels=self.edit_active_channels.text().strip(),
+            trigger_source=trigger_source,
+            adc_trigger_chan=self.spin_adc_trigger_chan.value(),
+            window_ms=self.spin_window_ms.value(),
+            pre_ms=self.spin_pre_ms.value(),
+            online_filter=self.chk_online_filter.isChecked(),
+            sync_annotations=self.chk_sync_annotations.isChecked(),
+        )
+
+    @Slot()
+    def _on_state_live_config_changed(self):
+        if self._syncing_live_config:
+            return
+        if self.state is None or not hasattr(self.state, "get_live_config"):
+            return
+        cfg = self.state.get_live_config()
+        self._syncing_live_config = True
+        try:
+            with QSignalBlocker(self.edit_host):
+                self.edit_host.setText(str(cfg.get("host", "127.0.0.1")))
+            with QSignalBlocker(self.spin_http_port):
+                self.spin_http_port.setValue(int(cfg.get("http_port", 37497)))
+            with QSignalBlocker(self.spin_data_port):
+                data_port = int(cfg.get("data_port", 5556))
+                self.spin_data_port.setValue(data_port)
+                self._prev_data_port = data_port
+            with QSignalBlocker(self.spin_event_port):
+                self.spin_event_port.setValue(int(cfg.get("event_port", 5557)))
+            with QSignalBlocker(self.combo_stream_mode):
+                mode_val = cfg.get("stream_mode", "zmq_raw")
+                mode_idx = (
+                    1
+                    if (mode_val == "sliced_erp" or mode_val == 1)
+                    else 0
+                )
+                self.combo_stream_mode.setCurrentIndex(mode_idx)
+            with QSignalBlocker(self.spin_rec_chan):
+                self.spin_rec_chan.setValue(int(cfg.get("rec_chan", 0)))
+            with QSignalBlocker(self.edit_active_channels):
+                self.edit_active_channels.setText(
+                    str(cfg.get("active_channels", "0-3"))
+                )
+            with QSignalBlocker(self.combo_trigger_source):
+                trig_val = cfg.get("trigger_source", "ttl")
+                trig_idx = 1 if (trig_val == "analog" or trig_val == 1) else 0
+                self.combo_trigger_source.setCurrentIndex(trig_idx)
+            with QSignalBlocker(self.spin_adc_trigger_chan):
+                self.spin_adc_trigger_chan.setValue(int(cfg.get("adc_trigger_chan", 1)))
+            with QSignalBlocker(self.spin_window_ms):
+                self.spin_window_ms.setValue(float(cfg.get("window_ms", 500.0)))
+            with QSignalBlocker(self.spin_pre_ms):
+                self.spin_pre_ms.setValue(float(cfg.get("pre_ms", 0.0)))
+            with QSignalBlocker(self.chk_online_filter):
+                self.chk_online_filter.setChecked(bool(cfg.get("online_filter", True)))
+                low_hz = float(cfg.get("filter_low_hz", 500.0))
+                high_hz = float(cfg.get("filter_high_hz", 7000.0))
+                self.chk_online_filter.setText(
+                    f"Online Bandpass ({low_hz:g} \u2013 {high_hz:g} Hz)"
+                )
+            with QSignalBlocker(self.chk_sync_annotations):
+                self.chk_sync_annotations.setChecked(
+                    bool(cfg.get("sync_annotations", True))
+                )
+
+            if self.worker is not None:
+                self.worker.set_rec_channel(int(cfg["rec_chan"]))
+                self.worker.set_active_channels(
+                    self._parse_active_channels(str(cfg["active_channels"]))
+                )
+                self.worker.set_filtering(bool(cfg["online_filter"]))
+                if hasattr(self.worker, "set_filter_band"):
+                    self.worker.set_filter_band(
+                        float(cfg["filter_low_hz"]),
+                        float(cfg["filter_high_hz"]),
+                    )
+                if hasattr(self.worker, "set_ttl_params"):
+                    self.worker.set_ttl_params(
+                        threshold=float(cfg["ttl_threshold_v"]),
+                        refractory_ms=float(cfg["ttl_refractory_ms"]),
+                    )
+                if hasattr(self.worker, "set_window_params"):
+                    self.worker.set_window_params(
+                        window_ms=float(cfg["window_ms"]),
+                        pre_ms=float(cfg["pre_ms"]),
+                    )
+                self.worker.auto_align_clock = bool(
+                    cfg.get("auto_align_clock", True)
+                )
+                self.worker.use_analog_trigger = cfg.get("trigger_source") == "analog"
+                self.worker.adc_trigger_chan = int(cfg.get("adc_trigger_chan", 1))
+        finally:
+            self._syncing_live_config = False
 
     @Slot(bool)
     def _on_follow_live_toggled(self, checked: bool):
@@ -560,6 +691,11 @@ class OpenEphysLiveView(QWidget):
 
     def get_settings(self) -> Dict[str, Any]:
         """Return dict of current settings for perspective persistence."""
+        cfg = (
+            self.state.get_live_config()
+            if self.state is not None and hasattr(self.state, "get_live_config")
+            else {}
+        )
         return {
             "host": self.edit_host.text(),
             "data_port": self.spin_data_port.value(),
@@ -569,8 +705,15 @@ class OpenEphysLiveView(QWidget):
             "rec_chan": self.spin_rec_chan.value(),
             "active_channels": self.edit_active_channels.text(),
             "trigger_source": self.combo_trigger_source.currentIndex(),
+            "adc_trigger_chan": self.spin_adc_trigger_chan.value(),
             "window_ms": self.spin_window_ms.value(),
+            "pre_ms": self.spin_pre_ms.value(),
             "online_filter": self.chk_online_filter.isChecked(),
+            "filter_low_hz": float(cfg.get("filter_low_hz", 500.0)),
+            "filter_high_hz": float(cfg.get("filter_high_hz", 7000.0)),
+            "ttl_threshold_v": float(cfg.get("ttl_threshold_v", 2.5)),
+            "ttl_refractory_ms": float(cfg.get("ttl_refractory_ms", 100.0)),
+            "auto_align_clock": bool(cfg.get("auto_align_clock", True)),
             "sync_annotations": self.chk_sync_annotations.isChecked(),
             "demo_stim_freq": self.spin_demo_stim_freq.value(),
             "demo_units": self.combo_demo_units.currentIndex(),
@@ -583,40 +726,87 @@ class OpenEphysLiveView(QWidget):
         """Restore settings from dict."""
         if not settings:
             return
-        if "host" in settings:
-            self.edit_host.setText(settings["host"])
-        if "data_port" in settings:
-            self.spin_data_port.setValue(int(settings["data_port"]))
-        if "event_port" in settings:
-            self.spin_event_port.setValue(int(settings["event_port"]))
-        if "http_port" in settings:
-            self.spin_http_port.setValue(int(settings["http_port"]))
-        if "stream_mode" in settings:
-            self.combo_stream_mode.setCurrentIndex(int(settings["stream_mode"]))
-        if "rec_chan" in settings:
-            self.spin_rec_chan.setValue(int(settings["rec_chan"]))
-        if "active_channels" in settings:
-            self.edit_active_channels.setText(str(settings["active_channels"]))
-        if "trigger_source" in settings:
-            self.combo_trigger_source.setCurrentIndex(int(settings["trigger_source"]))
-        if "window_ms" in settings:
-            self.spin_window_ms.setValue(float(settings["window_ms"]))
-        if "online_filter" in settings:
-            self.chk_online_filter.setChecked(bool(settings["online_filter"]))
-        if "sync_annotations" in settings:
-            self.chk_sync_annotations.setChecked(bool(settings["sync_annotations"]))
-        if "demo_stim_freq" in settings:
-            self.spin_demo_stim_freq.setValue(float(settings["demo_stim_freq"]))
-        if "demo_units" in settings:
-            self.combo_demo_units.setCurrentIndex(int(settings["demo_units"]))
-        if "replay_speed" in settings:
-            self.spin_replay_speed.setValue(float(settings["replay_speed"]))
-        if "replay_spikes" in settings:
-            self.chk_replay_spikes.setChecked(bool(settings["replay_spikes"]))
-        if "active_tab" in settings:
-            tab_idx = int(settings["active_tab"])
-            if 0 <= tab_idx < self.tabs_live.count():
-                self.tabs_live.setCurrentIndex(tab_idx)
+        self._syncing_live_config = True
+        try:
+            if "host" in settings:
+                self.edit_host.setText(settings["host"])
+            if "data_port" in settings:
+                self.spin_data_port.setValue(int(settings["data_port"]))
+            if "event_port" in settings:
+                self.spin_event_port.setValue(int(settings["event_port"]))
+            if "http_port" in settings:
+                self.spin_http_port.setValue(int(settings["http_port"]))
+            if "stream_mode" in settings:
+                sm = settings["stream_mode"]
+                idx = 1 if (sm == "sliced_erp" or sm == 1) else 0
+                self.combo_stream_mode.setCurrentIndex(idx)
+            if "rec_chan" in settings:
+                self.spin_rec_chan.setValue(int(settings["rec_chan"]))
+            if "active_channels" in settings:
+                self.edit_active_channels.setText(str(settings["active_channels"]))
+            if "trigger_source" in settings:
+                ts = settings["trigger_source"]
+                idx = 1 if (ts == "analog" or ts == 1) else 0
+                self.combo_trigger_source.setCurrentIndex(idx)
+            if "adc_trigger_chan" in settings:
+                self.spin_adc_trigger_chan.setValue(int(settings["adc_trigger_chan"]))
+            if "window_ms" in settings:
+                self.spin_window_ms.setValue(float(settings["window_ms"]))
+            if "pre_ms" in settings:
+                self.spin_pre_ms.setValue(float(settings["pre_ms"]))
+            if "online_filter" in settings:
+                self.chk_online_filter.setChecked(bool(settings["online_filter"]))
+            if "sync_annotations" in settings:
+                self.chk_sync_annotations.setChecked(bool(settings["sync_annotations"]))
+            if "demo_stim_freq" in settings:
+                self.spin_demo_stim_freq.setValue(float(settings["demo_stim_freq"]))
+            if "demo_units" in settings:
+                self.combo_demo_units.setCurrentIndex(int(settings["demo_units"]))
+            if "replay_speed" in settings:
+                self.spin_replay_speed.setValue(float(settings["replay_speed"]))
+            if "replay_spikes" in settings:
+                self.chk_replay_spikes.setChecked(bool(settings["replay_spikes"]))
+            if "active_tab" in settings:
+                tab_idx = int(settings["active_tab"])
+                if 0 <= tab_idx < self.tabs_live.count():
+                    self.tabs_live.setCurrentIndex(tab_idx)
+        finally:
+            self._syncing_live_config = False
+
+        if self.state is not None and hasattr(self.state, "update_live_config"):
+            updates: Dict[str, Any] = {
+                "host": self.edit_host.text().strip(),
+                "http_port": self.spin_http_port.value(),
+                "data_port": self.spin_data_port.value(),
+                "event_port": self.spin_event_port.value(),
+                "stream_mode": (
+                    "sliced_erp"
+                    if self.combo_stream_mode.currentIndex() == 1
+                    else "zmq_raw"
+                ),
+                "rec_chan": self.spin_rec_chan.value(),
+                "active_channels": self.edit_active_channels.text().strip(),
+                "trigger_source": (
+                    "ttl"
+                    if self.combo_trigger_source.currentIndex() == 0
+                    else "analog"
+                ),
+                "adc_trigger_chan": self.spin_adc_trigger_chan.value(),
+                "window_ms": self.spin_window_ms.value(),
+                "pre_ms": self.spin_pre_ms.value(),
+                "online_filter": self.chk_online_filter.isChecked(),
+                "sync_annotations": self.chk_sync_annotations.isChecked(),
+            }
+            for opt_key in (
+                "ttl_threshold_v",
+                "ttl_refractory_ms",
+                "filter_low_hz",
+                "filter_high_hz",
+                "auto_align_clock",
+            ):
+                if opt_key in settings:
+                    updates[opt_key] = settings[opt_key]
+            self.state.update_live_config(**updates)
 
     @Slot(float)
     def _on_demo_stim_freq_changed(self, val: float):
@@ -637,9 +827,11 @@ class OpenEphysLiveView(QWidget):
         else:
             self.start_stream()
 
-    def _parse_active_channels(self) -> List[int]:
+    def _parse_active_channels(self, text: Optional[str] = None) -> List[int]:
         """Parse comma-separated channels and ranges, e.g. '0-3, 5' -> [0, 1, 2, 3, 5]."""
-        text = self.edit_active_channels.text().strip()
+        if text is None:
+            text = self.edit_active_channels.text()
+        text = text.strip()
         chans = set()
         if text:
             for part in text.split(","):
@@ -671,6 +863,7 @@ class OpenEphysLiveView(QWidget):
             self.worker.set_active_channels(
                 active_chans, primary_channel=self.spin_rec_chan.value()
             )
+        self._push_live_config_to_state()
 
     def start_stream(self):
         if self._is_replaying:
@@ -692,6 +885,17 @@ class OpenEphysLiveView(QWidget):
         target_pid = self.spin_target_proc.value()
         self.controller.target_processor_id = target_pid if target_pid > 0 else None
 
+        cfg = (
+            self.state.get_live_config()
+            if self.state is not None and hasattr(self.state, "get_live_config")
+            else {}
+        )
+        filter_low_hz = float(cfg.get("filter_low_hz", 500.0))
+        filter_high_hz = float(cfg.get("filter_high_hz", 7000.0))
+        ttl_threshold_v = float(cfg.get("ttl_threshold_v", 2.5))
+        ttl_refractory_ms = float(cfg.get("ttl_refractory_ms", 100.0))
+        auto_align_clock = bool(cfg.get("auto_align_clock", True))
+
         hb_port = event_port if is_sliced else None
         self.worker = OpenEphysStreamWorker(
             host=host,
@@ -706,8 +910,20 @@ class OpenEphysLiveView(QWidget):
             window_ms=self.spin_window_ms.value(),
             pre_stim_ms=self.spin_pre_ms.value(),
             apply_filter=self.chk_online_filter.isChecked(),
+            filter_low=filter_low_hz,
+            filter_high=filter_high_hz,
+            ttl_threshold_v=ttl_threshold_v,
+            ttl_refractory_ms=ttl_refractory_ms,
             parent=self,
         )
+        self.worker.auto_align_clock = auto_align_clock
+        if hasattr(self.worker, "set_filter_band"):
+            self.worker.set_filter_band(filter_low_hz, filter_high_hz)
+        if hasattr(self.worker, "set_ttl_params"):
+            self.worker.set_ttl_params(
+                threshold=ttl_threshold_v,
+                refractory_ms=ttl_refractory_ms,
+            )
 
         self.worker.sweepsReady.connect(self._on_sweeps_ready)
         self.worker.spikeEventsReady.connect(self._on_spike_events_ready)
@@ -1812,8 +2028,10 @@ class OpenEphysLiveView(QWidget):
         if not hasattr(self, "_prev_data_port"):
             self._prev_data_port = 5556
         if self.spin_event_port.value() == self._prev_data_port + 1:
-            self.spin_event_port.setValue(new_data_port + 1)
+            with QSignalBlocker(self.spin_event_port):
+                self.spin_event_port.setValue(new_data_port + 1)
         self._prev_data_port = new_data_port
+        self._push_live_config_to_state()
 
     @Slot(int)
     def _on_rec_channel_changed(self, chan: int):
@@ -1824,11 +2042,13 @@ class OpenEphysLiveView(QWidget):
         ch_name = f"CH{chan}"
         if hasattr(self.state, "set_active_channel"):
             self.state.set_active_channel(ch_name)
+        self._push_live_config_to_state()
 
     @Slot(bool)
     def _on_filter_toggled(self, enabled: bool):
         if self.worker is not None:
             self.worker.set_filtering(enabled)
+        self._push_live_config_to_state()
 
     # -------------------------------------------------------------
     # Bidirectional controls

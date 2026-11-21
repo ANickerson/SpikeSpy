@@ -112,6 +112,7 @@ def test_view_settings_panel_controls_navigation_mode(qtbot, synthetic_state):
     pg_view.show()
 
     panel.setActiveView(pg_view)
+    panel.set_settings_page("nav")
     assert panel.grp_navigation.isVisible()
     assert panel.btn_nav_normal.isChecked()
 

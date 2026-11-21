@@ -66,6 +66,7 @@ def test_view_settings_panel_embeds_active_unit_info_and_tracks_bound_unit(
 
     assert isinstance(panel.unit_info_widget, ActiveUnitInfoView)
     assert panel.unit_info_widget._compact is True
+    panel.set_settings_page("unit")
     assert panel.grp_active_unit_info.isVisible() is True
 
     # Two views bound to different units

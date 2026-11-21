@@ -1458,8 +1458,9 @@ class SingleTracePGView(LiveFrameConsumerMixin, PGNavigationMixin, QMainWindow):
         else:
             display_mag = np.asarray(erp_mag)
         ylim = float(np.std(np.abs(display_mag)) * 8)
-        if ylim > 0:
-            self.main_plot.setYRange(-ylim, ylim, padding=0)
+        if ylim <= 0 or not np.isfinite(ylim):
+            ylim = 1.0
+        self.main_plot.setYRange(-ylim, ylim, padding=0)
 
         # Per-channel stacked subplots follow the same x range; scale each
         # y axis to its own displayed sweep.
