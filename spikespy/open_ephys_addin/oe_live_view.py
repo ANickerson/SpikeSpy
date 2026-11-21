@@ -896,7 +896,7 @@ class OpenEphysLiveView(QWidget):
         ttl_refractory_ms = float(cfg.get("ttl_refractory_ms", 100.0))
         auto_align_clock = bool(cfg.get("auto_align_clock", True))
 
-        hb_port = event_port if is_sliced else None
+        hb_port = event_port
         self.worker = OpenEphysStreamWorker(
             host=host,
             data_port=data_port,

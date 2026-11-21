@@ -441,4 +441,65 @@ def test_open_ephys_heartbeat_and_3part_packets(qtbot):
         ctx.term()
 
 
+def test_live_view_zmq_raw_mode_sends_heartbeat_to_oe_zmq_interface(qtbot):
+    """Regression test: OpenEphysLiveView in Standard OE ZMQ mode must send heartbeats
+    to the listening/event port so Open Ephys ZMQ Interface reports SpikeSpy as connected.
+    """
+    import threading
+    import zmq
+
+    ctx = zmq.Context()
+    rep_sock = ctx.socket(zmq.REP)
+    rep_sock.setsockopt(zmq.RCVTIMEO, 1000)
+    rep_sock.setsockopt(zmq.LINGER, 0)
+    rep_sock.bind("tcp://127.0.0.1:5617")
+
+    received_heartbeats = []
+    stop_event = threading.Event()
+
+    def rep_listener():
+        rep_poller = zmq.Poller()
+        rep_poller.register(rep_sock, zmq.POLLIN)
+        while not stop_event.is_set():
+            socks = dict(rep_poller.poll(50))
+            if rep_sock in socks:
+                try:
+                    msg = rep_sock.recv_string(zmq.NOBLOCK)
+                    received_heartbeats.append(msg)
+                    rep_sock.send_string("OK")
+                except Exception:
+                    break
+
+    t = threading.Thread(target=rep_listener, daemon=True)
+    t.start()
+
+    state = ViewerState()
+    live_view = OpenEphysLiveView(state=state)
+    qtbot.addWidget(live_view)
+
+    # Mode 0 = Standard OE ZMQ + Event Broadcaster ("zmq_raw")
+    live_view.combo_stream_mode.setCurrentIndex(0)
+    live_view.spin_data_port.setValue(5616)
+    live_view.spin_event_port.setValue(5617)
+    live_view.spin_http_port.setValue(37535)
+
+    try:
+        live_view.start_stream()
+        assert live_view.worker is not None
+        assert live_view.worker.mode == "zmq_raw"
+        assert live_view.worker.heartbeat_port == 5617
+
+        qtbot.waitUntil(lambda: len(received_heartbeats) > 0, timeout=3000)
+        hb_data = json.loads(received_heartbeats[0])
+        assert hb_data.get("type") == "heartbeat"
+        assert hb_data.get("application") == "SpikeSpy"
+        assert "uuid" in hb_data
+    finally:
+        live_view.stop_stream()
+        stop_event.set()
+        t.join(timeout=1.0)
+        rep_sock.close(linger=0)
+        ctx.term()
+
+
 
