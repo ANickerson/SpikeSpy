@@ -180,6 +180,8 @@ def apply_top_bars_visibility(widget, hide: bool):
     ):
         if hasattr(widget, "dock_manager") and widget.dock_manager is not None:
             for dw in widget.dock_manager.dockWidgets():
+                if hasattr(widget, "_is_permanent_sidebar_dock") and widget._is_permanent_sidebar_dock(dw):
+                    continue
                 w = dw.widget()
                 if w is not None and w is not getattr(widget, "settings_panel", None):
                     apply_top_bars_visibility(w, hide)
@@ -282,7 +284,12 @@ def notify_view_selected(view_or_child, ensure_panel_visible: bool = True):
                     if not getattr(mdi.settings_panel, "is_pinned", False):
                         mdi.settings_panel.setActiveView(resolved)
                     if ensure_panel_visible and hasattr(mdi, "open_or_show_view_settings_panel"):
-                        mdi.open_or_show_view_settings_panel()
+                        try:
+                            mdi.open_or_show_view_settings_panel(
+                                reveal_if_collapsed=False, switch_tab=False
+                            )
+                        except TypeError:
+                            mdi.open_or_show_view_settings_panel()
             except RuntimeError:
                 pass
 

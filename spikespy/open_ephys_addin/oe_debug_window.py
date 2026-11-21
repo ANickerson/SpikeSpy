@@ -212,10 +212,10 @@ class OpenEphysLiveDebugDialog(QDialog):
 
     def _connect_worker(self):
         worker = getattr(self.live_view, "worker", None)
-        if worker is not None and not getattr(self, "_worker_connected", False):
+        if worker is not None and getattr(self, "_connected_worker", None) is not worker:
             if hasattr(worker, "debugEventEmitted"):
                 worker.debugEventEmitted.connect(self._on_debug_event)
-            self._worker_connected = True
+            self._connected_worker = worker
 
     @Slot(dict)
     def _on_debug_event(self, evt: Dict[str, Any]):

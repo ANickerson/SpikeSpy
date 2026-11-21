@@ -1746,9 +1746,25 @@ class OpenEphysLiveView(QWidget):
         sample_rate = payload.get("sample_rate", 30000.0)
 
         if hasattr(self.state, "append_sweep"):
+            cur_sr = getattr(self.state, "sampling_rate", None)
+            try:
+                cur_sr_val = (
+                    float(cur_sr.rescale(pq.Hz).magnitude)
+                    if hasattr(cur_sr, "rescale")
+                    else float(cur_sr or 0.0)
+                )
+            except Exception:
+                cur_sr_val = 0.0
+            needs_sr_resync = (
+                self.state.event_signal is not None
+                and len(self.state.event_signal) == 0
+                and sample_rate > 0
+                and abs(cur_sr_val - float(sample_rate)) > 1.0
+            )
             if (
                 not getattr(self.state, "is_streaming", False)
                 or self.state.event_signal is None
+                or needs_sr_resync
             ):
                 active_chans = self._parse_active_channels()
                 self.state.start_live_session(

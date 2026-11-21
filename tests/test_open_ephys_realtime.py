@@ -502,4 +502,117 @@ def test_live_view_zmq_raw_mode_sends_heartbeat_to_oe_zmq_interface(qtbot):
         ctx.term()
 
 
+def test_oe_zmq_interface_v1_per_channel_nested_content_and_ttl(qtbot):
+    """Regression test matching real Open Ephys ZMQ Interface v1.0 wire format:
+    - 3-part DATA frames: [b'DATA\\x00', {"message_num": ..., "type": "data", "content": {"channel_num": k, "num_samples": ..., "sample_num": ..., "sample_rate": ...}}, float32 bytes]
+    - 3-part EVENT frames: [b'EVENT\\x00', {"message_num": ..., "type": "event", "content": {"type": 3, "sample_num": ...}, "timestamp": ms_epoch}, 10-byte TTL payload]
+    Verifies all channels populate distinct rows and rising TTL edges slice sweeps accurately.
+    """
+    worker = OpenEphysStreamWorker(
+        host="127.0.0.1",
+        data_port=5626,
+        event_port=5627,
+        heartbeat_port=5627,
+        mode="zmq_raw",
+        rec_channel=0,
+        active_channels=[0, 1, 2, 3],
+        apply_filter=False,
+        window_ms=100.0,
+        pre_stim_ms=10.0,
+        sample_rate=30000.0,
+    )
+
+    sweeps = []
+    debug_events = []
+    worker.sweepsReady.connect(sweeps.extend)
+    worker.debugEventEmitted.connect(debug_events.append)
+
+    base_sample = 77098240
+    block_len = 640
+    n_ch = 4
+
+    # Feed 10 blocks (~213 ms) of 4-channel single-channel packets, with a distinct DC level per channel
+    for b_idx in range(10):
+        start_s = base_sample + b_idx * block_len
+        for ch in range(n_ch):
+            hdr = json.dumps({
+                "message_num": 1000 + b_idx * n_ch + ch,
+                "type": "data",
+                "content": {
+                    "stream": "Data-B",
+                    "channel_num": ch,
+                    "channel_name": f"CH{ch + 1}",
+                    "num_samples": block_len,
+                    "sample_num": start_s,
+                    "sample_rate": 30000.0,
+                },
+                "data_size": block_len * 4,
+            }).encode("utf-8")
+            payload = np.full(block_len, float(ch + 1) * 10.0, dtype=np.float32).tobytes()
+            worker._parse_raw_zmq_data_packet([b"DATA\x00", hdr, payload])
+
+        # Send rising + falling TTL event during block 2 (at base_sample + 1000)
+        if b_idx == 2:
+            stim_sample = base_sample + 1000
+            evt_rise_hdr = json.dumps({
+                "message_num": 2000,
+                "type": "event",
+                "content": {
+                    "stream": "Data-B",
+                    "source_node": 111,
+                    "type": 3,
+                    "sample_num": stim_sample,
+                },
+                "data_size": 10,
+                "timestamp": 1795293815117,
+            }).encode("utf-8")
+            worker._parse_raw_zmq_data_packet([
+                b"EVENT\x00",
+                evt_rise_hdr,
+                b"\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00",
+            ])
+
+            evt_fall_hdr = json.dumps({
+                "message_num": 2001,
+                "type": "event",
+                "content": {
+                    "stream": "Data-B",
+                    "source_node": 111,
+                    "type": 3,
+                    "sample_num": stim_sample + 300,
+                },
+                "data_size": 10,
+                "timestamp": 1795293815127,
+            }).encode("utf-8")
+            worker._parse_raw_zmq_data_packet([
+                b"EVENT\x00",
+                evt_fall_hdr,
+                b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            ])
+
+    worker._check_pending_sweeps()
+    worker._flush_sweep_payloads(force=True)
+
+    # RingBuffer latest_sample must track the real sample_num, not 0-based
+    assert worker.ring_buffer.latest_sample == base_sample + 10 * block_len - 1
+
+    # Exactly 1 sweep should have been sliced from the rising edge (falling edge ignored)
+    assert len(sweeps) == 1
+    sw = sweeps[0]
+    assert np.isclose(sw["stim_timestamp_s"], (base_sample + 1000) / 30000.0)
+    assert sw["waveform"].shape == (3300,)  # 10 ms pre (300) + 100 ms window (3000)
+
+    # Every channel CH0..CH3 must contain its own distinct signal (not all shoved into CH0)
+    for ch in range(n_ch):
+        ch_wf = sw["aux_sweeps"][f"CH{ch}"]
+        assert ch_wf.shape == (3300,)
+        assert np.allclose(ch_wf, float(ch + 1) * 10.0)
+
+    statuses = [e["status"] for e in debug_events]
+    assert any("TRIGGER QUEUED" in s for s in statuses)
+    assert any("IGNORED (state=0)" in s for s in statuses)
+    assert any("SWEEP SLICED" in s for s in statuses)
+
+
+
 

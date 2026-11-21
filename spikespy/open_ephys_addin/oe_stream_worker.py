@@ -364,6 +364,13 @@ class OpenEphysStreamWorker(QThread):
             highcut=self.filter_high,
             sampling_rate=sample_rate,
         )
+        self._channel_filters: Dict[int, OnlineBandpassFilter] = {}
+        self._pending_block_start: Optional[int] = None
+        self._pending_block_len: int = 0
+        self._pending_block_time: float = 0.0
+        self._pending_block_chans: Dict[int, np.ndarray] = {}
+        self._seen_single_channels: set = set()
+        self._expected_single_ch_count: int = 0
         self.analog_ttl_detector = OnlineTTLDetector(
             threshold=self.ttl_threshold_v,
             refractory_s=self.ttl_refractory_ms / 1000.0,
@@ -431,9 +438,106 @@ class OpenEphysStreamWorker(QThread):
             with self._lock:
                 self.bandpass_filter.reset()
 
+    def _reset_pending_channel_block(self):
+        self._pending_block_start = None
+        self._pending_block_len = 0
+        self._pending_block_time = 0.0
+        self._pending_block_chans.clear()
+        self._seen_single_channels.clear()
+        self._expected_single_ch_count = 0
+
+    def _update_sample_rate(self, sr: float):
+        sr = float(sr)
+        if sr <= 0 or abs(sr - self.sample_rate) <= 1e-6:
+            return
+        self.sample_rate = sr
+        with self._lock:
+            self.bandpass_filter = OnlineBandpassFilter(
+                lowcut=self.filter_low,
+                highcut=self.filter_high,
+                sampling_rate=self.sample_rate,
+            )
+            self._channel_filters.clear()
+
+    def _flush_pending_channel_block(self):
+        if not self._pending_block_chans or self._pending_block_start is None:
+            return
+        n_samples = self._pending_block_len
+        if n_samples <= 0:
+            self._pending_block_chans.clear()
+            self._pending_block_start = None
+            self._pending_block_len = 0
+            return
+        max_ch = max(
+            max(self._pending_block_chans.keys()),
+            max(self._seen_single_channels, default=0),
+        )
+        n_ch = max_ch + 1
+        block = np.zeros((n_ch, n_samples), dtype=np.float32)
+        for ch_i, arr in self._pending_block_chans.items():
+            m = min(len(arr), n_samples)
+            block[ch_i, :m] = arr[:m]
+        start_samp = self._pending_block_start
+        self._pending_block_chans.clear()
+        self._pending_block_start = None
+        self._pending_block_len = 0
+        self.ring_buffer.append(block, start_samp)
+
+    def _ingest_single_channel_chunk(
+        self, ch_idx: int, ch_data: np.ndarray, start_sample: int
+    ):
+        """Ingest a single-channel continuous block (standard Open Ephys ZMQ Interface format)."""
+        if ch_idx < 0 or ch_data.size == 0:
+            return
+
+        # Analog TTL detection must run on unfiltered samples
+        if self.trigger_source == "analog" and ch_idx == self.analog_trigger_channel:
+            with self._lock:
+                triggers = self.analog_ttl_detector.process_chunk(ch_data, start_sample)
+            for t_sample in triggers:
+                self.queue_sweep_trigger(t_sample, t_sample / self.sample_rate)
+
+        if self.apply_filter:
+            with self._lock:
+                filt = self._channel_filters.get(ch_idx)
+                if filt is None:
+                    filt = OnlineBandpassFilter(
+                        lowcut=self.filter_low,
+                        highcut=self.filter_high,
+                        sampling_rate=self.sample_rate,
+                    )
+                    self._channel_filters[ch_idx] = filt
+                ch_data = filt.process(ch_data)
+
+        if (
+            self._pending_block_start is not None
+            and start_sample != self._pending_block_start
+        ):
+            self._expected_single_ch_count = max(
+                self._expected_single_ch_count, len(self._pending_block_chans)
+            )
+            self._flush_pending_channel_block()
+
+        if self._pending_block_start is None:
+            self._pending_block_start = start_sample
+            self._pending_block_len = len(ch_data)
+            self._pending_block_time = time.time()
+
+        self._pending_block_chans[ch_idx] = ch_data
+        if len(ch_data) > self._pending_block_len:
+            self._pending_block_len = len(ch_data)
+        self._seen_single_channels.add(ch_idx)
+
+        if (
+            self._expected_single_ch_count > 0
+            and len(self._pending_block_chans) >= self._expected_single_ch_count
+        ):
+            self._flush_pending_channel_block()
+
     def set_filtering(self, enabled: bool):
         if enabled != self.apply_filter:
             # Never mix filtered and unfiltered samples inside one pending sweep.
+            self._reset_pending_channel_block()
             self.ring_buffer.clear()
             with self._pending_lock:
                 self._pending_sweeps.clear()
@@ -441,6 +545,7 @@ class OpenEphysStreamWorker(QThread):
         if not enabled:
             with self._lock:
                 self.bandpass_filter.reset()
+                self._channel_filters.clear()
 
     def set_filter_band(self, low_hz: float, high_hz: float):
         low_hz = float(low_hz)
@@ -464,6 +569,7 @@ class OpenEphysStreamWorker(QThread):
                 highcut=self.filter_high,
                 sampling_rate=self.sample_rate,
             )
+            self._channel_filters.clear()
 
     def set_ttl_params(
         self,
@@ -683,6 +789,13 @@ class OpenEphysStreamWorker(QThread):
                 if event_sub is not None and event_sub in socks and socks[event_sub] == zmq.POLLIN:
                     self._handle_event_socket(event_sub)
 
+                # Flush any stalled single-channel block (e.g. 1-ch stream or pause)
+                if (
+                    self._pending_block_start is not None
+                    and (now - self._pending_block_time) >= 0.05
+                ):
+                    self._flush_pending_channel_block()
+
                 # Check pending sweeps
                 self._check_pending_sweeps()
                 self._flush_sweep_payloads()
@@ -851,64 +964,91 @@ class OpenEphysStreamWorker(QThread):
         """Parse continuous multi-channel raw stream or events from Open Ephys ZMQ Interface."""
         try:
             # Open Ephys ZMQ Interface protocol sends:
-            # Case A (3 frames): [Envelope (e.g. b'data'), Header JSON, Binary Buffer]
-            # Case B (2 frames): [Header JSON, Binary Buffer]
+            # Case A (3 frames): [Envelope (b'DATA\0' / b'EVENT\0' or JSON envelope), Header JSON, Binary Buffer]
+            # Case B (2 frames): [Header JSON, Binary Buffer] or [Topic, Header JSON]
             # Case C (1 frame):  [Header JSON]
-            meta = None
-            meta_idx = -1
-            buf = None
-            envelope = ""
-
+            json_parts: List[Tuple[int, Dict[str, Any]]] = []
             for i, p in enumerate(parts):
                 cleaned_p = p.strip(b"\x00 \r\n\t")
                 if cleaned_p.startswith(b"{") and cleaned_p.endswith(b"}"):
                     try:
-                        meta = json.loads(cleaned_p.decode("utf-8"))
-                        meta_idx = i
-                        if i > 0:
-                            envelope = parts[0].decode("utf-8", errors="ignore").strip("\x00 \r\n\t").lower()
-                        if i + 1 < len(parts):
-                            buf = parts[i + 1]
-                        break
+                        parsed = json.loads(cleaned_p.decode("utf-8"))
+                        if isinstance(parsed, dict):
+                            json_parts.append((i, parsed))
                     except Exception:
                         pass
 
-            if meta is None:
-                if len(parts) >= 2 and parts[0].strip(b"\x00 \r\n\t").startswith(b"{"):
-                    try:
-                        meta = json.loads(parts[0].strip(b"\x00 \r\n\t").decode("utf-8"))
-                        buf = parts[1]
-                    except Exception:
-                        pass
-                elif len(parts) == 1 and parts[0].strip(b"\x00 \r\n\t").startswith(b"{"):
+            if not json_parts:
+                if len(parts) == 1 and parts[0].strip(b"\x00 \r\n\t").startswith(b"{"):
                     self._handle_event_json(parts[0])
-                    return
-                else:
-                    return
-
-            if meta is None:
                 return
 
-            msg_type = (envelope or meta.get("type", meta.get("stream", "continuous"))).lower()
+            envelope = ""
+            if len(json_parts) >= 2 and json_parts[0][0] == 0:
+                # Both frame 0 (envelope JSON) and frame 1 (header JSON) are JSON dicts
+                env_dict = json_parts[0][1]
+                hdr_idx, hdr_dict = json_parts[1]
+                envelope = str(env_dict.get("type", "")).lower()
+                meta = {**env_dict, **hdr_dict}
+                buf = parts[hdr_idx + 1] if (hdr_idx + 1 < len(parts)) else None
+            else:
+                meta_idx, meta = json_parts[0]
+                if meta_idx > 0:
+                    envelope = parts[0].decode("utf-8", errors="ignore").strip("\x00 \r\n\t").lower()
+                buf = parts[meta_idx + 1] if (meta_idx + 1 < len(parts)) else None
+
+            if len(parts) == 1:
+                self._handle_event_json(parts[0])
+                return
+
+            # Flatten Open Ephys ZMQ Interface nested "content" object while keeping raw meta
+            content = meta.get("content")
+            fields = {**meta, **content} if isinstance(content, dict) else meta
+
+            msg_type = (
+                envelope
+                or str(meta.get("type", fields.get("type", fields.get("stream", "continuous"))))
+            ).lower()
 
             # Check if this packet is an Event or Spike broadcast on the data socket
-            if "event" in msg_type or meta.get("type") == "ttl" or "line" in meta or (isinstance(meta.get("data"), dict) and "line" in meta["data"]):
-                line = None
-                state = None
-                if "line" in meta or "state" in meta:
-                    line = meta.get("line")
-                    state = meta.get("state")
-                elif isinstance(meta.get("data"), dict):
-                    line = meta["data"].get("line")
-                    state = meta["data"].get("state")
+            if (
+                "event" in msg_type
+                or str(meta.get("type", "")).lower() in ("event", "ttl")
+                or str(fields.get("type", "")).lower() == "ttl"
+                or "line" in fields
+                or "event_line" in fields
+                or (isinstance(fields.get("data"), dict) and "line" in fields["data"])
+            ):
+                line = fields.get("line", fields.get("event_line"))
+                state = fields.get("state", fields.get("event_state"))
+                if (line is None or state is None) and isinstance(fields.get("data"), dict):
+                    if line is None:
+                        line = fields["data"].get("line")
+                    if state is None:
+                        state = fields["data"].get("state")
 
                 if (line is None or state is None) and buf is not None and len(buf) >= 2:
                     line = int(buf[0])
                     state = int(buf[1])
 
                 if line is not None or state is not None:
-                    sample_num = int(meta.get("sample_num", meta.get("sample_number", meta.get("sampleIndex", 0))))
-                    ts = float(meta.get("timestamp", sample_num / self.sample_rate if self.sample_rate else time.time()))
+                    raw_sn = fields.get("sample_num")
+                    if raw_sn is None:
+                        raw_sn = fields.get("sample_number")
+                    if raw_sn is None:
+                        raw_sn = fields.get("sampleIndex")
+                    sample_num = int(raw_sn) if raw_sn is not None else 0
+
+                    if raw_sn is not None and self.sample_rate:
+                        ts = float(sample_num) / float(self.sample_rate)
+                    else:
+                        raw_ts = fields.get("timestamp")
+                        if raw_ts is not None:
+                            ts = float(raw_ts)
+                            if ts > 1e11:
+                                ts /= 1000.0
+                        else:
+                            ts = time.time()
 
                     is_rising = False
                     if isinstance(state, (int, float, bool)):
@@ -916,17 +1056,24 @@ class OpenEphysStreamWorker(QThread):
                     elif isinstance(state, str):
                         is_rising = state.strip().lower() in ("1", "true", "high", "rising", "on")
 
-                    action_status = "TRIGGER QUEUED" if is_rising else f"IGNORED (state={state})"
+                    if not is_rising:
+                        action_status = f"IGNORED (state={state})"
+                    elif self.trigger_source != "ttl":
+                        action_status = f"IGNORED (trigger_source={self.trigger_source})"
+                    else:
+                        action_status = "TRIGGER QUEUED"
+
+                    latest_buf = self.ring_buffer.latest_sample
                     if hasattr(self, "debugEventEmitted"):
                         self.debugEventEmitted.emit({
                             "timestamp": time.time(),
                             "topic": envelope or "DATA_SOCK_EVENT",
-                            "type": meta.get("type", "ttl"),
+                            "type": fields.get("type", "ttl"),
                             "line": line,
                             "state": state,
                             "sample_number": sample_num,
-                            "buffer_latest_sample": self.ring_buffer.latest_sample,
-                            "clock_skew": (sample_num - self.ring_buffer.latest_sample) if self.ring_buffer.latest_sample else 0,
+                            "buffer_latest_sample": latest_buf,
+                            "clock_skew": (sample_num - latest_buf) if latest_buf is not None else 0,
                             "status": action_status,
                             "raw_meta": meta,
                         })
@@ -934,26 +1081,79 @@ class OpenEphysStreamWorker(QThread):
                     if is_rising and self.trigger_source == "ttl":
                         self.queue_sweep_trigger(sample_num, ts, source_info=f"TTL_Line{line if line is not None else 1}")
                 else:
-                    self._handle_event_json(json.dumps(meta).encode("utf-8"))
+                    self._handle_event_json(json.dumps(fields).encode("utf-8"))
                 return
 
-            if "spike" in msg_type or meta.get("type") == "spike":
-                self._handle_event_json(json.dumps(meta).encode("utf-8"))
+            if "spike" in msg_type or str(meta.get("type", "")).lower() == "spike":
+                self._handle_event_json(json.dumps(fields).encode("utf-8"))
                 return
 
             # Continuous data handling
             if buf is None:
                 return
 
-            n_chans = int(meta.get("channel_count", meta.get("channels", 1)))
-            n_samples = int(meta.get("num_samples", meta.get("sample_count", len(buf) // (4 * n_chans))))
-            start_sample = int(meta.get("sample_number", meta.get("start_sample", meta.get("sample_num", 0))))
-            sr = float(meta.get("sample_rate", self.sample_rate))
-            self.sample_rate = sr
+            sr = float(fields.get("sample_rate", self.sample_rate))
+            if sr > 0:
+                self._update_sample_rate(sr)
 
-            dtype_str = meta.get("dtype", "float32")
+            raw_start = fields.get("sample_number")
+            if raw_start is None:
+                raw_start = fields.get("start_sample")
+            if raw_start is None:
+                raw_start = fields.get("sample_num")
+            if raw_start is None:
+                raw_start = fields.get("sampleIndex")
+            if raw_start is not None:
+                start_sample = int(raw_start)
+            else:
+                latest_buf = self.ring_buffer.latest_sample
+                start_sample = (latest_buf + 1) if latest_buf is not None else 0
+
+            dtype_str = str(fields.get("dtype", "float32")).lower()
             dt = np.float32 if "float" in dtype_str else np.int16
+            itemsize = np.dtype(dt).itemsize
+
+            channel_num = fields.get(
+                "channel_num", fields.get("channel_index", fields.get("channel"))
+            )
+            has_channel_count = any(
+                k in fields for k in ("channel_count", "channels", "n_channels")
+            )
+            n_chans = int(
+                fields.get(
+                    "channel_count",
+                    fields.get("channels", fields.get("n_channels", 1)),
+                )
+            )
+            n_samples = int(
+                fields.get(
+                    "num_samples",
+                    fields.get(
+                        "n_samples",
+                        fields.get(
+                            "sample_count",
+                            len(buf) // (itemsize * max(1, n_chans)),
+                        ),
+                    ),
+                )
+            )
+            n_real_samples = int(fields.get("n_real_samples", n_samples))
+
             arr = np.frombuffer(buf, dtype=dt)
+
+            # Standard Open Ephys ZMQ Interface: one channel per message ("channel_num")
+            if channel_num is not None and (not has_channel_count or n_chans == 1):
+                if arr.size < n_real_samples or n_real_samples <= 0:
+                    return
+                ch_data = arr[:n_real_samples]
+                if dt == np.int16:
+                    ch_data = ch_data.astype(np.float32)
+                    if "bit_volts" in fields:
+                        ch_data *= float(fields["bit_volts"])
+                else:
+                    ch_data = np.array(ch_data, dtype=np.float32, copy=True)
+                self._ingest_single_channel_chunk(int(channel_num), ch_data, start_sample)
+                return
 
             if arr.size == n_chans * n_samples:
                 data = arr.reshape((n_chans, n_samples))
@@ -968,9 +1168,9 @@ class OpenEphysStreamWorker(QThread):
                 return
 
             # Convert int16 to microvolts if needed (single allocation, then in-place scale)
-            if dt == np.int16 and "bit_volts" in meta:
+            if dt == np.int16 and "bit_volts" in fields:
                 data = data.astype(np.float32)
-                data *= float(meta["bit_volts"])
+                data *= float(fields["bit_volts"])
             if transposed:
                 data = data.T
 
